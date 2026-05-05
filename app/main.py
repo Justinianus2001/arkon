@@ -48,25 +48,6 @@ async def seed_default_admin():
             session.add(admin)
             await session.flush()
 
-            # Create global scope membership for admin
-            from app.database.models import ScopeMembership, ScopeRole, ScopeType
-            global_membership = ScopeMembership(
-                employee_id=admin.id,
-                scope_type=ScopeType.GLOBAL.value,
-                scope_id=None,
-                role=ScopeRole.ADMIN.value,
-            )
-            session.add(global_membership)
-
-            # Create department scope membership
-            dept_membership = ScopeMembership(
-                employee_id=admin.id,
-                scope_type=ScopeType.DEPARTMENT.value,
-                scope_id=dept.id,
-                role=ScopeRole.ADMIN.value,
-            )
-            session.add(dept_membership)
-
             await session.commit()
             logger.success(f"Default admin created: {settings.default_admin_email}")
     except Exception as e:
@@ -124,7 +105,7 @@ app.add_middleware(
 app.mount("/mcp", mcp_server.http_app(stateless_http=True))
 
 # --- REST API Routers ---
-from app.routers import sources, notes, auth, admin_settings, rbac, knowledge_types, projects, roles, wiki, scopes, audit  # noqa: E402
+from app.routers import sources, notes, auth, admin_settings, rbac, knowledge_types, projects, roles, wiki, audit  # noqa: E402
 
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(sources.router, prefix="/api", tags=["sources"])
@@ -135,7 +116,6 @@ app.include_router(rbac.router, prefix="/api", tags=["rbac"])
 app.include_router(knowledge_types.router, prefix="/api", tags=["knowledge-types"])
 app.include_router(projects.router, prefix="/api", tags=["projects"])
 app.include_router(roles.router, prefix="/api", tags=["roles"])
-app.include_router(scopes.router, prefix="/api", tags=["scopes"])
 app.include_router(audit.router, prefix="/api", tags=["audit"])
 
 

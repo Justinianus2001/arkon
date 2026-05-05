@@ -1,4 +1,10 @@
-"""Sources router — CRUD + upload + arq ingestion pipeline (compiles into wiki)."""
+"""Sources router — CRUD + upload + arq ingestion pipeline (compiles into wiki).
+
+Permission model v2:
+  - doc:read:own_dept → only own department + global docs
+  - doc:read:all → all docs
+  - Upload creates source_departments M2M entries
+"""
 
 import uuid
 from typing import Optional
@@ -7,14 +13,19 @@ from arq.connections import ArqRedis, create_pool
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import delete as sql_delete, func, select
+from sqlalchemy import delete as sql_delete, func, select, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Employee, Source, ScopeType, WikiPage
+from app.database.models import Employee, Source, SourceDepartment, ScopeType, WikiPage
 from app.database.repository import Repository
-from app.services.auth_service import require_admin, require_permission
+from app.services.auth_service import require_admin, require_permission, get_current_user
+from app.services.permission_engine import (
+    _get_user_permissions,
+    get_scope_level,
+)
+from app.services.audit_service import log_audit
 
 router = APIRouter()
 
@@ -46,8 +57,9 @@ class SourceResponse(BaseModel):
     knowledge_type_id: Optional[uuid.UUID] = None
     knowledge_type_name: Optional[str] = None
     knowledge_type_color: Optional[str] = None
-    department_id: Optional[uuid.UUID] = None
-    department_name: Optional[str] = None
+    # Multi-department (v2)
+    department_ids: list[str] = []
+    department_names: list[str] = []
     contributed_by_employee_id: Optional[uuid.UUID] = None
     contributed_by_name: Optional[str] = None
     scope_type: str = "global"
@@ -68,13 +80,13 @@ class SourceCreateURL(BaseModel):
     url: str
     title: Optional[str] = None
     knowledge_type_id: Optional[uuid.UUID] = None
-    department_id: Optional[uuid.UUID] = None
+    department_ids: list[uuid.UUID] = []
 
 
 class SourceUpdate(BaseModel):
     title: Optional[str] = None
     knowledge_type_id: Optional[uuid.UUID] = None
-    department_id: Optional[uuid.UUID] = None
+    department_ids: Optional[list[uuid.UUID]] = None
     scope_type: Optional[str] = None
     scope_id: Optional[uuid.UUID] = None
 
@@ -86,6 +98,15 @@ async def _wiki_page_count(session: AsyncSession, source_id: uuid.UUID) -> int:
 
 
 def _to_response(source: Source, wiki_page_count: int = 0) -> SourceResponse:
+    # Extract departments from M2M relationship
+    dept_ids = []
+    dept_names = []
+    if hasattr(source, 'departments') and source.departments:
+        for sd in source.departments:
+            dept_ids.append(str(sd.department_id))
+            if hasattr(sd, 'department') and sd.department:
+                dept_names.append(sd.department.name)
+
     return SourceResponse(
         id=source.id,
         title=source.title,
@@ -102,8 +123,8 @@ def _to_response(source: Source, wiki_page_count: int = 0) -> SourceResponse:
         knowledge_type_id=source.knowledge_type_id,
         knowledge_type_name=source.knowledge_type.name if source.knowledge_type else None,
         knowledge_type_color=source.knowledge_type.color if source.knowledge_type else None,
-        department_id=source.department_id,
-        department_name=source.department.name if source.department else None,
+        department_ids=dept_ids,
+        department_names=dept_names,
         contributed_by_employee_id=source.contributed_by_employee_id,
         contributed_by_name=source.contributor.name if source.contributor else None,
         scope_type=source.scope_type or "global",
@@ -113,6 +134,15 @@ def _to_response(source: Source, wiki_page_count: int = 0) -> SourceResponse:
     )
 
 
+def _source_load_options():
+    """Common selectinload options for Source queries."""
+    return [
+        selectinload(Source.knowledge_type),
+        selectinload(Source.departments).selectinload(SourceDepartment.department),
+        selectinload(Source.contributor),
+    ]
+
+
 @router.get("/sources")
 async def list_sources(
     knowledge_type_id: Optional[uuid.UUID] = Query(None),
@@ -120,26 +150,59 @@ async def list_sources(
     status: Optional[str] = Query(None),
     search: Optional[str] = Query(None),
     page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    page_size: int = Query(20, ge=1, le=500),
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("documents.read"),
+    user: Employee = Depends(get_current_user),
 ):
-    base = (
-        select(Source)
-        .options(
-            selectinload(Source.knowledge_type),
-            selectinload(Source.department),
-            selectinload(Source.contributor),
-        )
-    )
+    """List sources with scoped filtering based on user permissions."""
+    # Check user has at least some doc:read permission
+    perms = _get_user_permissions(user)
+    if user.role != "admin" and not any(p.startswith("doc:read:") for p in perms):
+        raise HTTPException(403, "Permission required: doc:read")
+
+    base = select(Source).options(*_source_load_options())
     count_base = select(func.count(Source.id))
 
+    # --- Scope filtering ---
+    scope_level = "all" if user.role == "admin" else get_scope_level(list(perms), "doc", "read")
+
+    if scope_level == "own_dept":
+        # Only show: global docs (no departments) OR docs in user's department
+        dept_filter = or_(
+            # Source has no departments → global
+            ~exists(
+                select(SourceDepartment.source_id)
+                .where(SourceDepartment.source_id == Source.id)
+            ),
+            # Source has user's department
+            exists(
+                select(SourceDepartment.source_id)
+                .where(
+                    SourceDepartment.source_id == Source.id,
+                    SourceDepartment.department_id == user.department_id,
+                )
+            ),
+        )
+        base = base.where(dept_filter)
+        count_base = count_base.where(dept_filter)
+    elif scope_level is None:
+        # No doc:read permission at all
+        return {"items": [], "total": 0, "page": page, "page_size": page_size, "total_pages": 1}
+
+    # --- Additional filters ---
     if knowledge_type_id:
         base = base.where(Source.knowledge_type_id == knowledge_type_id)
         count_base = count_base.where(Source.knowledge_type_id == knowledge_type_id)
     if department_id:
-        base = base.where(Source.department_id == department_id)
-        count_base = count_base.where(Source.department_id == department_id)
+        dept_exists = exists(
+            select(SourceDepartment.source_id)
+            .where(
+                SourceDepartment.source_id == Source.id,
+                SourceDepartment.department_id == department_id,
+            )
+        )
+        base = base.where(dept_exists)
+        count_base = count_base.where(dept_exists)
     if status:
         base = base.where(Source.status == status)
         count_base = count_base.where(Source.status == status)
@@ -171,27 +234,30 @@ async def list_sources(
 async def get_source(
     source_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("documents.read"),
+    user: Employee = Depends(get_current_user),
 ):
     source = (await db.execute(
         select(Source)
-        .options(
-            selectinload(Source.knowledge_type),
-            selectinload(Source.department),
-            selectinload(Source.contributor),
-        )
+        .options(*_source_load_options())
         .where(Source.id == source_id)
     )).scalar_one_or_none()
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
 
-    wiki_count = await _wiki_page_count(db, source_id)
+    # Check access using permission engine
+    from app.services.permission_engine import can_access_document
+    if not await can_access_document(db, user, source, "read"):
+        raise HTTPException(403, "Access denied")
 
+    wiki_count = await _wiki_page_count(db, source_id)
     download_url = None
     if source.minio_key:
         try:
             from app.services.storage_service import storage_service
-            download_url = storage_service.get_presigned_url(source.minio_key)
+            download_url = storage_service.get_download_url(
+                source.minio_key,
+                expires_seconds=3600,
+            )
         except Exception:
             pass
 
@@ -208,7 +274,7 @@ async def get_source(
 async def get_source_progress(
     source_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("documents.read"),
+    _user: Employee = require_permission("doc:read"),
 ):
     source = await db.get(Source, source_id)
     if not source:
@@ -229,14 +295,34 @@ async def upload_source(
     file: UploadFile = File(...),
     title: Optional[str] = Form(None),
     knowledge_type_id: Optional[str] = Form(None),
-    department_id: Optional[str] = Form(None),
+    department_ids: Optional[str] = Form(None),  # comma-separated UUIDs
     scope_type: Optional[str] = Form(None),
     scope_id: Optional[str] = Form(None),
     db: AsyncSession = Depends(get_db),
-    user: Employee = require_permission("documents.create"),
+    user: Employee = require_permission("doc:create"),
 ):
     file_data = await file.read()
     file_name = file.filename or "unknown"
+
+    # Parse department_ids
+    dept_uuids: list[uuid.UUID] = []
+    if department_ids:
+        for d in department_ids.split(","):
+            d = d.strip()
+            if d:
+                try:
+                    dept_uuids.append(uuid.UUID(d))
+                except ValueError:
+                    raise HTTPException(400, f"Invalid department_id: {d}")
+
+    # Scope validation: own_dept users can only assign their own department
+    perms = _get_user_permissions(user)
+    if user.role != "admin" and "doc:create:all" not in perms:
+        # User only has doc:create:own_dept
+        for did in dept_uuids:
+            if did != user.department_id:
+                raise HTTPException(403, "You can only assign documents to your own department")
+
     repo = Repository(db)
     source = Source(
         title=title or file.filename,
@@ -247,18 +333,23 @@ async def upload_source(
         progress=0,
         progress_message="Queued for ingestion...",
         knowledge_type_id=uuid.UUID(knowledge_type_id) if knowledge_type_id else None,
-        department_id=uuid.UUID(department_id) if department_id else None,
         contributed_by_employee_id=user.id,
         scope_type=scope_type or ScopeType.GLOBAL.value,
         scope_id=uuid.UUID(scope_id) if scope_id else None,
     )
     source = await repo.create(source)
+    await db.flush()
+
+    # Create M2M department links
+    for did in dept_uuids:
+        db.add(SourceDepartment(source_id=source.id, department_id=did))
+    await db.flush()
+
+    await log_audit(db, user, "create", "source", str(source.id), reason=source.title)
     await db.commit()
     await db.refresh(source)
 
     # Upload to MinIO before enqueuing so the worker downloads from storage
-    # rather than receiving raw bytes through Redis (msgpack has size limits
-    # and large binaries get corrupted in transit).
     from app.services.storage_service import storage_service
     from app.services.kb_service import _guess_content_type
     minio_key = f"sources/{source.id}/original/{file_name}"
@@ -280,11 +371,7 @@ async def upload_source(
 
     source = (await db.execute(
         select(Source)
-        .options(
-            selectinload(Source.knowledge_type),
-            selectinload(Source.department),
-            selectinload(Source.contributor),
-        )
+        .options(*_source_load_options())
         .where(Source.id == source.id)
     )).scalar_one()
 
@@ -296,7 +383,7 @@ async def upload_source(
 async def add_url_source(
     req: SourceCreateURL,
     db: AsyncSession = Depends(get_db),
-    user: Employee = require_permission("documents.create"),
+    user: Employee = require_permission("doc:create"),
 ):
     repo = Repository(db)
     source = Source(
@@ -307,13 +394,18 @@ async def add_url_source(
         progress=0,
         progress_message="Queued for ingestion...",
         knowledge_type_id=req.knowledge_type_id,
-        department_id=req.department_id,
         contributed_by_employee_id=user.id,
-        # Auto-set scope based on department
-        scope_type=ScopeType.DEPARTMENT.value if req.department_id else ScopeType.GLOBAL.value,
-        scope_id=req.department_id if req.department_id else None,
+        scope_type=ScopeType.GLOBAL.value,
     )
     source = await repo.create(source)
+    await db.flush()
+
+    # Create M2M department links
+    for did in req.department_ids:
+        db.add(SourceDepartment(source_id=source.id, department_id=did))
+    await db.flush()
+
+    await log_audit(db, user, "create", "source", str(source.id), reason=source.title)
     await db.commit()
     await db.refresh(source)
 
@@ -324,11 +416,7 @@ async def add_url_source(
 
     source = (await db.execute(
         select(Source)
-        .options(
-            selectinload(Source.knowledge_type),
-            selectinload(Source.department),
-            selectinload(Source.contributor),
-        )
+        .options(*_source_load_options())
         .where(Source.id == source.id)
     )).scalar_one()
 
@@ -341,7 +429,7 @@ async def update_source(
     source_id: uuid.UUID,
     body: SourceUpdate,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("documents.edit"),
+    _user: Employee = require_permission("doc:edit"),
 ):
     source = await db.get(Source, source_id)
     if not source:
@@ -350,23 +438,26 @@ async def update_source(
         source.title = body.title
     if body.knowledge_type_id is not None:
         source.knowledge_type_id = body.knowledge_type_id
-    if body.department_id is not None:
-        source.department_id = body.department_id
     if body.scope_type is not None:
         source.scope_type = body.scope_type
-        source.scope_id = body.scope_id  # None for global
-        # Auto-sync department_id when scoped to department
-        if body.scope_type == "department" and body.scope_id:
-            source.department_id = body.scope_id
+        source.scope_id = body.scope_id
+
+    # Update department M2M
+    if body.department_ids is not None:
+        # Delete existing
+        await db.execute(
+            sql_delete(SourceDepartment).where(SourceDepartment.source_id == source_id)
+        )
+        # Insert new
+        for did in body.department_ids:
+            db.add(SourceDepartment(source_id=source_id, department_id=did))
+
+    await log_audit(db, _user, "update", "source", str(source.id), reason=source.title)
     await db.flush()
 
     source = (await db.execute(
         select(Source)
-        .options(
-            selectinload(Source.knowledge_type),
-            selectinload(Source.department),
-            selectinload(Source.contributor),
-        )
+        .options(*_source_load_options())
         .where(Source.id == source_id)
     )).scalar_one()
     return _to_response(source, await _wiki_page_count(db, source_id))
@@ -377,7 +468,7 @@ async def recompile_source(
     source_id: uuid.UUID,
     force: bool = Query(False, description="If true, detach this source from existing wiki pages first"),
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("documents.edit"),
+    _user: Employee = require_permission("doc:edit"),
 ):
     """
     Re-run the wiki compiler for this source. Without `force`, the compiler
@@ -387,11 +478,7 @@ async def recompile_source(
     """
     source = (await db.execute(
         select(Source)
-        .options(
-            selectinload(Source.knowledge_type),
-            selectinload(Source.department),
-            selectinload(Source.contributor),
-        )
+        .options(*_source_load_options())
         .where(Source.id == source_id)
     )).scalar_one_or_none()
     if not source:
@@ -419,11 +506,7 @@ async def recompile_source(
 
     source = (await db.execute(
         select(Source)
-        .options(
-            selectinload(Source.knowledge_type),
-            selectinload(Source.department),
-            selectinload(Source.contributor),
-        )
+        .options(*_source_load_options())
         .where(Source.id == source_id)
     )).scalar_one()
     logger.info(f"Queued recompile job {job.job_id} for source {source_id} (force={force})")
@@ -434,7 +517,7 @@ async def recompile_source(
 async def delete_source(
     source_id: uuid.UUID,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("documents.delete"),
+    _user: Employee = require_permission("doc:delete"),
 ):
     repo = Repository(db)
     source = await repo.get_by_id(Source, source_id)
@@ -452,5 +535,6 @@ async def delete_source(
     await wiki_service.detach_source_from_wiki(db, source_id)
     await wiki_service.regenerate_index(db)
 
+    await log_audit(db, _user, "delete", "source", str(source.id), reason=source.title)
     await repo.delete_by_id(Source, source_id)
     return {"deleted": True}

@@ -1,19 +1,21 @@
 """
 Auth router — login, logout, profile, change password.
 
-Two roles:
-  - admin: Full access to admin portal (settings, RBAC, KB management)
-  - employee: View scoped knowledge, get MCP token for Claude Desktop
+Two system roles:
+  - admin: Full access (bypasses all permission checks)
+  - employee: Access governed by custom_role scoped permissions
 """
 
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Employee
+from app.database.models import Employee, ProjectMember
 from app.services.auth_service import (
     authenticate_employee,
     create_access_token,
@@ -21,26 +23,9 @@ from app.services.auth_service import (
     hash_password,
     verify_password,
 )
-from app.services.permissions import ALL_PERMISSIONS
+from app.services.permission_engine import get_effective_permissions
 
 router = APIRouter()
-
-
-def _get_effective_permissions(employee: Employee) -> list[str]:
-    """Return the effective permission list for an employee, auto-migrating legacy names."""
-    if employee.role == "admin":
-        return sorted(ALL_PERMISSIONS)
-    if not employee.custom_role:
-        return []
-    stored = employee.custom_role.permissions or []
-    from app.routers.roles import _LEGACY_MAP
-    effective: set[str] = set()
-    for p in stored:
-        if p in _LEGACY_MAP:
-            effective.update(_LEGACY_MAP[p])
-        else:
-            effective.add(p)
-    return sorted(p for p in effective if p in ALL_PERMISSIONS)
 
 
 # ---------------------------------------------------------------------------
@@ -50,6 +35,12 @@ def _get_effective_permissions(employee: Employee) -> list[str]:
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class WorkspaceMembershipOut(BaseModel):
+    workspace_id: str
+    workspace_name: str
+    role: str
 
 
 class LoginResponse(BaseModel):
@@ -73,6 +64,43 @@ class ProfileResponse(BaseModel):
     is_active: bool
     has_mcp_token: bool
     permissions: list[str] = []
+    workspace_memberships: list[WorkspaceMembershipOut] = []
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+async def _get_workspace_memberships(db, employee_id) -> list[WorkspaceMembershipOut]:
+    """Get all workspace memberships for an employee."""
+    from app.database.models import Project
+    result = await db.execute(
+        select(ProjectMember, Project.name)
+        .join(Project, ProjectMember.project_id == Project.id)
+        .where(ProjectMember.employee_id == employee_id)
+    )
+    return [
+        WorkspaceMembershipOut(
+            workspace_id=str(pm.project_id),
+            workspace_name=name,
+            role=pm.role,
+        )
+        for pm, name in result.all()
+    ]
+
+
+def _build_user_dict(employee: Employee, permissions: list[str], workspace_memberships: list = None) -> dict:
+    """Build user dict for login/me responses."""
+    return {
+        "id": str(employee.id),
+        "name": employee.name,
+        "email": employee.email,
+        "role": employee.role,
+        "department_id": str(employee.department_id),
+        "department_name": employee.department.name if employee.department else "",
+        "permissions": permissions,
+        "workspace_memberships": workspace_memberships or [],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -95,23 +123,24 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
         name=employee.name,
     )
 
+    permissions = get_effective_permissions(employee)
+    workspace_memberships = await _get_workspace_memberships(db, employee.id)
+
     return LoginResponse(
         access_token=token,
-        user={
-            "id": str(employee.id),
-            "name": employee.name,
-            "email": employee.email,
-            "role": employee.role,
-            "department_id": str(employee.department_id),
-            "department_name": employee.department.name if employee.department else "",
-            "permissions": _get_effective_permissions(employee),
-        },
+        user=_build_user_dict(employee, permissions, [m.model_dump() for m in workspace_memberships]),
     )
 
 
 @router.get("/auth/me", response_model=ProfileResponse)
-async def get_profile(current_user: Employee = Depends(get_current_user)):
+async def get_profile(
+    current_user: Employee = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
     """Get current user profile. Validates the JWT is still valid."""
+    permissions = get_effective_permissions(current_user)
+    workspace_memberships = await _get_workspace_memberships(db, current_user.id)
+
     return ProfileResponse(
         id=str(current_user.id),
         name=current_user.name,
@@ -121,7 +150,8 @@ async def get_profile(current_user: Employee = Depends(get_current_user)):
         department_name=current_user.department.name if current_user.department else "",
         is_active=current_user.is_active,
         has_mcp_token=bool(current_user.mcp_token),
-        permissions=_get_effective_permissions(current_user),
+        permissions=permissions,
+        workspace_memberships=workspace_memberships,
     )
 
 

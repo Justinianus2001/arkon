@@ -6,6 +6,7 @@ Handles:
   - JWT token generation and verification
   - Login / logout (stateless JWT)
   - Role-based access (admin vs employee)
+  - Scoped permission checks (v2: resource:action:scope format)
 """
 
 import uuid
@@ -135,6 +136,15 @@ async def get_current_user(
             detail="Account not found or deactivated",
         )
 
+    # Auto-attach the "Employee" system role if no custom role assigned
+    if employee.role == "employee" and not employee.custom_role:
+        from app.database.models import Role
+        sys_role = (await db.execute(
+            select(Role).where(Role.name == "Employee", Role.is_system == True)
+        )).scalar_one_or_none()
+        if sys_role:
+            employee.custom_role = sys_role
+
     return employee
 
 
@@ -157,25 +167,42 @@ def require_permission(permission: str):
     """
     FastAPI dependency factory — checks a specific permission on the employee's custom role.
     Admins bypass all permission checks.
-    Legacy permission names are auto-migrated during the check.
+    
+    Supports both new scoped format (doc:read:own_dept) and org permissions (org:settings:read).
+    
+    For scoped resource permissions (doc/wiki), this only checks that the user
+    has SOME variant (own_dept or all). Actual scope filtering (which documents
+    they can see) is handled by the permission engine at query time.
 
-    Usage: Depends(require_permission("kb.read"))
+    Usage: Depends(require_permission("doc:read"))  — checks for doc:read:own_dept OR doc:read:all
+           Depends(require_permission("org:settings:read"))  — exact match
     """
     async def _check(current_user: Employee = Depends(get_current_user)) -> Employee:
         if current_user.role == "admin":
             return current_user
-        if current_user.custom_role:
-            # Auto-migrate legacy permission names stored in the DB
-            stored = current_user.custom_role.permissions or []
-            from app.routers.roles import _LEGACY_MAP
-            effective: set[str] = set()
-            for p in stored:
-                if p in _LEGACY_MAP:
-                    effective.update(_LEGACY_MAP[p])
-                else:
-                    effective.add(p)
+
+        from app.services.permission_engine import _get_user_permissions, has_any_permission
+        effective = _get_user_permissions(current_user)
+
+        # Check exact match first (for org: permissions)
+        if permission in effective:
+            return current_user
+
+        # Check as resource:action (matches either :own_dept or :all)
+        parts = permission.split(":")
+        if len(parts) == 2:
+            resource, action = parts
+            if has_any_permission(list(effective), resource, action):
+                return current_user
+        elif len(parts) == 3:
+            # Exact scoped permission check
             if permission in effective:
                 return current_user
+            # Also check if user has the :all version when :own_dept is required
+            resource, action, scope = parts
+            if scope == "own_dept" and f"{resource}:{action}:all" in effective:
+                return current_user
+
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail=f"Permission required: {permission}",

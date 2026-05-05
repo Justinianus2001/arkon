@@ -1,5 +1,6 @@
 """
 Department & Employee router — RBAC management for admin portal.
+Permission model v2: uses scoped permission format.
 """
 
 import uuid
@@ -12,9 +13,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Department, Employee, KnowledgeScope, Role, ScopeMembership, ScopeRole, ScopeType
+from app.database.models import Department, Employee, Role
 from app.services.mcp_auth_service import MCPAuthService
 from app.services.auth_service import get_current_user, require_admin, require_permission, hash_password
+from app.services.audit_service import log_audit
 
 router = APIRouter()
 
@@ -70,14 +72,6 @@ class TokenResponse(BaseModel):
     instructions: str
 
 
-class ScopeCreate(BaseModel):
-    department_id: Optional[str] = None
-    employee_id: Optional[str] = None
-    scope_type: str = "grant"
-    knowledge_type_slugs: Optional[list[str]] = None  # e.g. ["sop", "product"]
-    source_ids: Optional[list[str]] = None
-
-
 # ---------------------------------------------------------------------------
 # Department CRUD
 # ---------------------------------------------------------------------------
@@ -85,7 +79,7 @@ class ScopeCreate(BaseModel):
 @router.get("/departments")
 async def list_departments(
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("departments.read"),
+    _user: Employee = require_permission("org:departments:read"),
 ):
     """List all departments with employee counts."""
     stmt = select(Department).options(selectinload(Department.employees))
@@ -107,11 +101,12 @@ async def list_departments(
 async def create_department(
     body: DepartmentCreate,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("departments.create"),
+    _user: Employee = require_permission("org:departments:manage"),
 ):
     """Create a new department."""
     dept = Department(name=body.name, description=body.description)
     db.add(dept)
+    await log_audit(db, _user, "create", "department", str(dept.id), reason=dept.name)
     await db.flush()
     return {"id": str(dept.id), "name": dept.name}
 
@@ -121,13 +116,14 @@ async def update_department(
     dept_id: str,
     body: DepartmentCreate,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("departments.edit"),
+    _user: Employee = require_permission("org:departments:manage"),
 ):
     dept = await db.get(Department, uuid.UUID(dept_id))
     if not dept:
         raise HTTPException(404, "Department not found")
     dept.name = body.name
     dept.description = body.description
+    await log_audit(db, _user, "update", "department", str(dept.id), reason=dept.name)
     await db.flush()
     return {"id": str(dept.id), "name": dept.name}
 
@@ -136,11 +132,12 @@ async def update_department(
 async def delete_department(
     dept_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("departments.delete"),
+    _user: Employee = require_permission("org:departments:manage"),
 ):
     dept = await db.get(Department, uuid.UUID(dept_id))
     if not dept:
         raise HTTPException(404, "Department not found")
+    await log_audit(db, _user, "delete", "department", str(dept.id), reason=dept.name)
     await db.delete(dept)
     return {"deleted": True}
 
@@ -156,7 +153,7 @@ async def list_employees(
     page: int = 1,
     page_size: int = 20,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("employees.read"),
+    _user: Employee = require_permission("org:employees:read"),
 ):
     """List employees with pagination, optionally filtered by department or search."""
     from sqlalchemy import func as sa_func
@@ -211,9 +208,9 @@ async def list_employees(
 async def create_employee(
     body: EmployeeCreate,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("employees.create"),
+    _user: Employee = require_permission("org:employees:manage"),
 ):
-    """Create a new employee (admin only)."""
+    """Create a new employee."""
     dept = await db.get(Department, uuid.UUID(body.department_id))
     if not dept:
         raise HTTPException(400, "Department not found")
@@ -234,26 +231,7 @@ async def create_employee(
         custom_role_id=uuid.UUID(body.custom_role_id) if body.custom_role_id else None,
     )
     db.add(emp)
-    await db.flush()
-
-    # Auto-create scope memberships
-    # Global scope: admin gets admin role, employee gets reader
-    global_role = ScopeRole.ADMIN.value if body.role == "admin" else ScopeRole.READER.value
-    db.add(ScopeMembership(
-        employee_id=emp.id,
-        scope_type=ScopeType.GLOBAL.value,
-        scope_id=None,
-        role=global_role,
-        granted_by_id=_user.id,
-    ))
-    # Department scope: contributor by default
-    db.add(ScopeMembership(
-        employee_id=emp.id,
-        scope_type=ScopeType.DEPARTMENT.value,
-        scope_id=uuid.UUID(body.department_id),
-        role=ScopeRole.CONTRIBUTOR.value,
-        granted_by_id=_user.id,
-    ))
+    await log_audit(db, _user, "create", "employee", str(emp.id), reason=emp.email)
     await db.flush()
 
     return {"id": str(emp.id), "name": emp.name, "email": emp.email}
@@ -264,7 +242,7 @@ async def update_employee(
     emp_id: str,
     body: EmployeeCreate,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("employees.edit"),
+    _user: Employee = require_permission("org:employees:manage"),
 ):
     emp = await db.get(Employee, uuid.UUID(emp_id))
     if not emp:
@@ -276,6 +254,7 @@ async def update_employee(
     emp.custom_role_id = uuid.UUID(body.custom_role_id) if body.custom_role_id else None
     if body.password:
         emp.password_hash = hash_password(body.password)
+    await log_audit(db, _user, "update", "employee", str(emp.id), reason=emp.email)
     await db.flush()
     return {"id": str(emp.id), "name": emp.name}
 
@@ -284,11 +263,14 @@ async def update_employee(
 async def delete_employee(
     emp_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("employees.delete"),
+    _user: Employee = require_permission("org:employees:manage"),
 ):
     emp = await db.get(Employee, uuid.UUID(emp_id))
     if not emp:
         raise HTTPException(404, "Employee not found")
+    if emp.role == "admin":
+        raise HTTPException(400, "Cannot delete an admin account")
+    await log_audit(db, _user, "delete", "employee", str(emp.id), reason=emp.email)
     await db.delete(emp)
     return {"deleted": True}
 
@@ -297,13 +279,14 @@ async def delete_employee(
 async def toggle_employee(
     emp_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("employees.edit"),
+    _user: Employee = require_permission("org:employees:manage"),
 ):
     """Activate or deactivate an employee."""
     emp = await db.get(Employee, uuid.UUID(emp_id))
     if not emp:
         raise HTTPException(404, "Employee not found")
     emp.is_active = not emp.is_active
+    await log_audit(db, _user, "update", "employee", str(emp.id), reason=f"toggle active={emp.is_active}")
     await db.flush()
     return {"id": str(emp.id), "is_active": emp.is_active}
 
@@ -316,7 +299,7 @@ async def toggle_employee(
 async def generate_mcp_token(
     emp_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("employees.edit"),
+    _user: Employee = require_permission("org:employees:manage"),
 ):
     """Generate (or regenerate) an MCP token for an employee."""
     emp = await db.get(Employee, uuid.UUID(emp_id))
@@ -341,7 +324,7 @@ async def generate_mcp_token(
 async def revoke_mcp_token(
     emp_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("employees.edit"),
+    _user: Employee = require_permission("org:employees:manage"),
 ):
     """Revoke an employee's MCP token."""
     auth_svc = MCPAuthService(db)
@@ -349,91 +332,6 @@ async def revoke_mcp_token(
     if not revoked:
         raise HTTPException(404, "Employee not found or has no token")
     return {"revoked": True}
-
-
-# ---------------------------------------------------------------------------
-# Knowledge Scope Management
-# ---------------------------------------------------------------------------
-
-@router.get("/departments/{dept_id}/scopes")
-async def get_department_scopes(
-    dept_id: str,
-    db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("scopes.read"),
-):
-    """Get knowledge scopes for a department."""
-    stmt = select(KnowledgeScope).where(
-        KnowledgeScope.department_id == uuid.UUID(dept_id),
-        KnowledgeScope.employee_id == None,
-    )
-    result = await db.execute(stmt)
-    scopes = result.scalars().all()
-
-    return [
-        {
-            "id": str(s.id),
-            "scope_type": s.scope_type,
-            "knowledge_type_slugs": s.knowledge_type_slugs,
-            "source_ids": s.source_ids,
-        }
-        for s in scopes
-    ]
-
-
-@router.get("/employees/{emp_id}/scopes")
-async def get_employee_scopes(
-    emp_id: str,
-    db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("scopes.read"),
-):
-    """Get personal knowledge scopes for an employee."""
-    stmt = select(KnowledgeScope).where(
-        KnowledgeScope.employee_id == uuid.UUID(emp_id),
-    )
-    result = await db.execute(stmt)
-    scopes = result.scalars().all()
-    return [
-        {
-            "id": str(s.id),
-            "scope_type": s.scope_type,
-            "knowledge_type_slugs": s.knowledge_type_slugs,
-            "source_ids": s.source_ids,
-        }
-        for s in scopes
-    ]
-
-
-@router.post("/scopes", status_code=201)
-async def create_scope(
-    body: ScopeCreate,
-    db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("scopes.manage"),
-):
-    """Create a new knowledge scope."""
-    scope = KnowledgeScope(
-        department_id=uuid.UUID(body.department_id) if body.department_id else None,
-        employee_id=uuid.UUID(body.employee_id) if body.employee_id else None,
-        scope_type=body.scope_type,
-        knowledge_type_slugs=body.knowledge_type_slugs,
-        source_ids=body.source_ids,
-    )
-    db.add(scope)
-    await db.flush()
-    return {"id": str(scope.id)}
-
-
-@router.delete("/scopes/{scope_id}")
-async def delete_scope(
-    scope_id: str,
-    db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("scopes.manage"),
-):
-    """Delete a knowledge scope."""
-    scope = await db.get(KnowledgeScope, uuid.UUID(scope_id))
-    if not scope:
-        raise HTTPException(404, "Scope not found")
-    await db.delete(scope)
-    return {"deleted": True}
 
 
 # ---------------------------------------------------------------------------

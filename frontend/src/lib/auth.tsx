@@ -10,6 +10,12 @@ import {
 } from "react";
 import { api, setToken, clearToken, ApiError } from "@/lib/api";
 
+export type WorkspaceMembership = {
+  workspace_id: string;
+  workspace_name: string;
+  role: string;
+};
+
 export type User = {
   id: string;
   name: string;
@@ -18,6 +24,7 @@ export type User = {
   department_id: string;
   department_name: string;
   permissions: string[];
+  workspace_memberships: WorkspaceMembership[];
 };
 
 type AuthState = {
@@ -27,6 +34,10 @@ type AuthState = {
   logout: () => void;
   refresh: () => Promise<void>;
   hasPermission: (perm: string) => boolean;
+  /** Check if user can perform resource:action (matches :own_dept or :all) */
+  canAccess: (resource: string, action: string) => boolean;
+  /** Get workspace role for a specific workspace */
+  getWorkspaceRole: (workspaceId: string) => string | null;
 };
 
 const AuthContext = createContext<AuthState | null>(null);
@@ -45,6 +56,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         department_id: string;
         department_name: string;
         permissions: string[];
+        workspace_memberships: WorkspaceMembership[];
       }>("/api/auth/me");
       setUser(data);
     } catch (err) {
@@ -92,8 +104,36 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     [user]
   );
 
+  const canAccess = useCallback(
+    (resource: string, action: string) => {
+      if (!user) return false;
+      if (user.role === "admin") return true;
+      const all = `${resource}:${action}:all`;
+      const own = `${resource}:${action}:own_dept`;
+      return (
+        (user.permissions?.includes(all) ?? false) ||
+        (user.permissions?.includes(own) ?? false)
+      );
+    },
+    [user]
+  );
+
+  const getWorkspaceRole = useCallback(
+    (workspaceId: string): string | null => {
+      if (!user) return null;
+      if (user.role === "admin") return "admin";
+      const membership = user.workspace_memberships?.find(
+        (m) => m.workspace_id === workspaceId
+      );
+      return membership?.role ?? null;
+    },
+    [user]
+  );
+
   return (
-    <AuthContext.Provider value={{ user, loading, login, logout, refresh, hasPermission }}>
+    <AuthContext.Provider
+      value={{ user, loading, login, logout, refresh, hasPermission, canAccess, getWorkspaceRole }}
+    >
       {children}
     </AuthContext.Provider>
   );

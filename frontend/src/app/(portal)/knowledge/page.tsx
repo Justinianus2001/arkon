@@ -39,8 +39,8 @@ export type Source = {
   knowledge_type_id?: string;
   knowledge_type_name?: string;
   knowledge_type_color?: string;
-  department_id?: string;
-  department_name?: string;
+  department_ids?: string[];
+  department_names?: string[];
   contributed_by_name?: string;
   scope_type?: string;
   scope_id?: string;

@@ -68,8 +68,7 @@ regulations, procedures, names, and edge cases — not just a high-level recap.
 - Prose that just rephrases what was already said.
 
 # Language rule
-Write every page in the SAME LANGUAGE as the source document. If Vietnamese, write
-Vietnamese. If English, write English. Never translate body content.
+Write every page in the SAME LANGUAGE as the source document. Never translate body content.
 (Slugs are always in Latin characters — see slug rules.)
 
 # Page types

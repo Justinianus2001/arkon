@@ -16,8 +16,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Employee, Project, ProjectMember, ProjectSource, ScopeMembership, ScopeRole, ScopeType, Source
+from app.database.models import Employee, Project, ProjectMember, ProjectSource, ScopeType, Source, WorkspaceRole
 from app.services.auth_service import get_current_user, require_admin, require_permission
+from app.services.permission_engine import can_access_workspace, get_workspace_role, workspace_role_can
 
 router = APIRouter()
 
@@ -163,8 +164,12 @@ async def list_projects(
 async def create_project(
     body: ProjectCreate,
     db: AsyncSession = Depends(get_db),
-    current_user: Employee = require_permission("workspaces.create"),
+    current_user: Employee = Depends(get_current_user),
 ):
+    # Only admin can create workspaces
+    if current_user.role != "admin":
+        raise HTTPException(403, "Admin access required to create workspaces")
+
     ws_type = body.workspace_type or "project"
     if ws_type not in ("project", "customer"):
         raise HTTPException(400, "workspace_type must be 'project' or 'customer'")
@@ -179,15 +184,13 @@ async def create_project(
     db.add(project)
     await db.flush()
 
-    # Auto-create scope membership for creator as owner
-    scope_membership = ScopeMembership(
+    # Creator becomes workspace admin member
+    member = ProjectMember(
+        project_id=project.id,
         employee_id=current_user.id,
-        scope_type=ScopeType.PROJECT.value,
-        scope_id=project.id,
-        role=ScopeRole.OWNER.value,
-        granted_by_id=current_user.id,
+        role=WorkspaceRole.ADMIN.value,
     )
-    db.add(scope_membership)
+    db.add(member)
     await db.flush()
 
     return _project_out(project)
@@ -198,7 +201,7 @@ async def update_project(
     project_id: str,
     body: ProjectUpdate,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("workspaces.edit"),
+    _user: Employee = Depends(get_current_user),
 ):
     project = await _get_project_or_404(db, project_id)
 
@@ -223,7 +226,7 @@ async def update_project(
 async def delete_project(
     project_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("workspaces.delete"),
+    _user: Employee = Depends(get_current_user),
 ):
     project = await _get_project_or_404(db, project_id)
     await db.delete(project)
@@ -236,7 +239,7 @@ async def delete_project(
 
 class AddMemberBody(BaseModel):
     employee_id: str
-    role: str = "member"
+    role: str = "viewer"
 
 
 @router.get("/projects/{project_id}/members", response_model=list[MemberOut])
@@ -269,9 +272,14 @@ async def add_member(
     project_id: str,
     body: AddMemberBody,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("workspaces.edit"),
+    _user: Employee = Depends(get_current_user),
 ):
     await _get_project_or_404(db, project_id)
+
+    # Check user has admin role in workspace (or is system admin)
+    ws_role = await get_workspace_role(db, _user, uuid.UUID(project_id))
+    if not ws_role or not workspace_role_can(ws_role, WorkspaceRole.ADMIN.value):
+        raise HTTPException(403, "Workspace admin access required to manage members")
 
     emp = await db.get(Employee, uuid.UUID(body.employee_id))
     if not emp:
@@ -284,8 +292,9 @@ async def add_member(
     if existing:
         raise HTTPException(409, "Employee is already a member")
 
-    if body.role not in ("owner", "member"):
-        raise HTTPException(400, "Role must be 'owner' or 'member'")
+    valid_roles = {r.value for r in WorkspaceRole}
+    if body.role not in valid_roles:
+        raise HTTPException(400, f"Role must be one of: {valid_roles}")
 
     member = ProjectMember(
         project_id=uuid.UUID(project_id),
@@ -293,32 +302,6 @@ async def add_member(
         role=body.role,
     )
     db.add(member)
-
-    # Sync: create or update scope membership for the project
-    scope_role = ScopeRole.OWNER.value if body.role == "owner" else ScopeRole.CONTRIBUTOR.value
-    
-    scope_stmt = (
-        select(ScopeMembership)
-        .where(
-            ScopeMembership.employee_id == uuid.UUID(body.employee_id),
-            ScopeMembership.scope_type == ScopeType.PROJECT.value,
-            ScopeMembership.scope_id == uuid.UUID(project_id),
-        )
-    )
-    scope_membership = (await db.execute(scope_stmt)).scalar_one_or_none()
-    
-    if scope_membership:
-        scope_membership.role = scope_role
-    else:
-        scope_membership = ScopeMembership(
-            employee_id=uuid.UUID(body.employee_id),
-            scope_type=ScopeType.PROJECT.value,
-            scope_id=uuid.UUID(project_id),
-            role=scope_role,
-            granted_by_id=_user.id,
-        )
-        db.add(scope_membership)
-
     await db.flush()
     return {"added": True}
 
@@ -328,8 +311,13 @@ async def remove_member(
     project_id: str,
     employee_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("workspaces.edit"),
+    _user: Employee = Depends(get_current_user),
 ):
+    # Check user has admin role in workspace
+    ws_role = await get_workspace_role(db, _user, uuid.UUID(project_id))
+    if not ws_role or not workspace_role_can(ws_role, WorkspaceRole.ADMIN.value):
+        raise HTTPException(403, "Workspace admin access required")
+
     member = await db.get(
         ProjectMember,
         (uuid.UUID(project_id), uuid.UUID(employee_id)),
@@ -337,20 +325,6 @@ async def remove_member(
     if not member:
         raise HTTPException(404, "Member not found")
     await db.delete(member)
-
-    # Sync: remove scope membership for the project
-    scope_stmt = (
-        select(ScopeMembership)
-        .where(
-            ScopeMembership.employee_id == uuid.UUID(employee_id),
-            ScopeMembership.scope_type == ScopeType.PROJECT.value,
-            ScopeMembership.scope_id == uuid.UUID(project_id),
-        )
-    )
-    scope_membership = (await db.execute(scope_stmt)).scalar_one_or_none()
-    if scope_membership:
-        await db.delete(scope_membership)
-
     return {"removed": True}
 
 
@@ -426,7 +400,7 @@ async def add_project_source(
     project_id: str,
     body: AddSourceBody,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("workspaces.edit"),
+    _user: Employee = Depends(get_current_user),
 ):
     await _get_project_or_404(db, project_id)
 
@@ -455,7 +429,7 @@ async def remove_project_source(
     project_id: str,
     source_id: str,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("workspaces.edit"),
+    _user: Employee = Depends(get_current_user),
 ):
     pid = uuid.UUID(project_id)
     sid = uuid.UUID(source_id)
@@ -499,7 +473,7 @@ async def upload_workspace_source(
     title: str | None = Form(None),
     knowledge_type_id: str | None = Form(None),
     db: AsyncSession = Depends(get_db),
-    user: Employee = require_permission("workspaces.edit"),
+    user: Employee = Depends(get_current_user),
 ):
     """Upload a file directly into a workspace. Sets scope to project."""
     project = await _get_project_or_404(db, project_id)
@@ -563,7 +537,7 @@ async def add_workspace_url_source(
     project_id: str,
     body: WorkspaceURLBody,
     db: AsyncSession = Depends(get_db),
-    user: Employee = require_permission("workspaces.edit"),
+    user: Employee = Depends(get_current_user),
 ):
     """Add a URL source directly into a workspace."""
     project = await _get_project_or_404(db, project_id)

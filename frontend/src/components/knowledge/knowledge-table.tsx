@@ -62,8 +62,8 @@ type Source = {
   knowledge_type_id?: string;
   knowledge_type_name?: string;
   knowledge_type_color?: string;
-  department_id?: string;
-  department_name?: string;
+  department_ids?: string[];
+  department_names?: string[];
   contributed_by_name?: string;
   scope_type?: string;
   scope_id?: string;
@@ -257,12 +257,18 @@ export function KnowledgeTable({
                     <ScopeBadge scopeType={source.scope_type} scopeId={source.scope_id} />
                   </TableCell>
 
-                  {/* Department */}
+                  {/* Department(s) */}
                   <TableCell>
-                    {source.department_name ? (
-                      <span className="text-sm text-foreground">{source.department_name}</span>
+                    {source.department_names && source.department_names.length > 0 ? (
+                      <div className="flex flex-wrap gap-1">
+                        {source.department_names.map((name, i) => (
+                          <span key={i} className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-secondary text-secondary-foreground">
+                            {name}
+                          </span>
+                        ))}
+                      </div>
                     ) : (
-                      <span className="text-xs text-muted-foreground/50">—</span>
+                      <span className="text-xs text-muted-foreground/50 italic">Global</span>
                     )}
                   </TableCell>
 
@@ -458,7 +464,7 @@ function EditSourceDialog({
 }) {
   const [title, setTitle] = React.useState(source.title);
   const [typeId, setTypeId] = React.useState(source.knowledge_type_id || "");
-  const [deptId, setDeptId] = React.useState(source.department_id || "");
+  const [selectedDepts, setSelectedDepts] = React.useState<string[]>(source.department_ids || []);
   const [scopeType, setScopeType] = React.useState(source.scope_type || "global");
   const [scopeId, setScopeId] = React.useState(source.scope_id || "");
   const [projects, setProjects] = React.useState<{ id: string; name: string }[]>([]);
@@ -472,6 +478,12 @@ function EditSourceDialog({
       .catch(() => setProjects([]));
   }, []);
 
+  const toggleDept = (deptId: string) => {
+    setSelectedDepts((prev) =>
+      prev.includes(deptId) ? prev.filter((d) => d !== deptId) : [...prev, deptId]
+    );
+  };
+
   const handleSave = async () => {
     setSaving(true);
     setError("");
@@ -481,7 +493,7 @@ function EditSourceDialog({
         body: {
           title: title || undefined,
           knowledge_type_id: typeId || null,
-          department_id: deptId || null,
+          department_ids: selectedDepts,
           scope_type: scopeType,
           scope_id: scopeType === "global" ? null : (scopeId || null),
         },
@@ -536,7 +548,55 @@ function EditSourceDialog({
             </Select>
           </div>
 
-
+          {/* Multi-department selection */}
+          <div className="flex flex-col gap-1.5">
+            <Label>Departments</Label>
+            <p className="text-xs text-muted-foreground">
+              Select which departments can access this document. Leave empty for global access.
+            </p>
+            <div className="border rounded-lg p-2 max-h-40 overflow-y-auto bg-background">
+              {departments.length === 0 ? (
+                <span className="text-xs text-muted-foreground">No departments available</span>
+              ) : (
+                departments.map((d) => (
+                  <label
+                    key={d.id}
+                    className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedDepts.includes(d.id)}
+                      onChange={() => toggleDept(d.id)}
+                      className="rounded border-border"
+                    />
+                    <span className="text-sm">{d.name}</span>
+                  </label>
+                ))
+              )}
+            </div>
+            {selectedDepts.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-1">
+                {selectedDepts.map((id) => {
+                  const name = departments.find((d) => d.id === id)?.name ?? id;
+                  return (
+                    <span
+                      key={id}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-primary/10 text-primary"
+                    >
+                      {name}
+                      <button
+                        type="button"
+                        onClick={() => toggleDept(id)}
+                        className="hover:text-destructive"
+                      >
+                        ×
+                      </button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </div>
 
           {/* Visibility / Scope */}
           <div className="flex flex-col gap-1.5">
@@ -549,7 +609,7 @@ function EditSourceDialog({
               <SelectTrigger className="bg-background">
                 <div className="flex items-center gap-2">
                   <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
-                    {scopeType === "global" ? "public" : scopeType === "department" ? "domain" : "folder_special"}
+                    {scopeType === "global" ? "public" : "folder_special"}
                   </span>
                   <span className="capitalize">{scopeType === "project" ? "Workspace" : scopeType}</span>
                 </div>
@@ -561,12 +621,6 @@ function EditSourceDialog({
                     Global
                   </div>
                 </SelectItem>
-                <SelectItem value="department">
-                  <div className="flex items-center gap-2">
-                    <span className="material-symbols-outlined" style={{ fontSize: 14 }}>domain</span>
-                    Department
-                  </div>
-                </SelectItem>
                 <SelectItem value="project">
                   <div className="flex items-center gap-2">
                     <span className="material-symbols-outlined" style={{ fontSize: 14 }}>folder_special</span>
@@ -576,25 +630,6 @@ function EditSourceDialog({
               </SelectContent>
             </Select>
           </div>
-
-          {/* Scope entity picker */}
-          {scopeType === "department" && (
-            <div className="flex flex-col gap-1.5">
-              <Label>Target Department</Label>
-              <Select value={scopeId} onValueChange={(v) => setScopeId(v ?? "")}>
-                <SelectTrigger className="bg-background">
-                  <span>{scopeId ? (departments.find(d => d.id === scopeId)?.name ?? "Select...") : "Select department..."}</span>
-                </SelectTrigger>
-                <SelectContent>
-                  {departments.map((d) => (
-                    <SelectItem key={d.id} value={d.id}>
-                      {d.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
 
           {scopeType === "project" && (
             <div className="flex flex-col gap-1.5">
@@ -640,3 +675,4 @@ function EditSourceDialog({
     </Dialog>
   );
 }
+

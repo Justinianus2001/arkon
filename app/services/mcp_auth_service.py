@@ -6,6 +6,8 @@ This service is called by the MCP server to:
 2. Resolve the employee's department
 3. Compute the effective knowledge scope (what docs they can access)
 4. Generate and revoke tokens
+
+Permission model v2: uses source_departments M2M and scoped permissions.
 """
 
 import secrets
@@ -15,11 +17,14 @@ from datetime import datetime, timezone
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import select, update
+from sqlalchemy import select, update, or_, exists
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.database.models import Department, Employee, KnowledgeScope, ProjectMember, ProjectSource, ScopeMembership, Source
+from app.database.models import (
+    Department, Employee, ProjectMember, ProjectSource, Source,
+    SourceDepartment,
+)
 
 
 @dataclass
@@ -33,8 +38,7 @@ class ResolvedIdentity:
     allowed_source_ids: Optional[list[str]] = None       # None = all
     project_source_ids: list[str] = field(default_factory=list)  # always granted via projects
     is_admin: bool = False
-    # Scope-based RBAC (Phase 1)
-    scope_memberships: list[ScopeMembership] = field(default_factory=list)
+    permissions: list[str] = field(default_factory=list)
 
 
 class MCPAuthService:
@@ -51,7 +55,10 @@ class MCPAuthService:
         stmt = (
             select(Employee)
             .where(Employee.mcp_token == token, Employee.is_active == True)
-            .options(selectinload(Employee.department))
+            .options(
+                selectinload(Employee.department),
+                selectinload(Employee.custom_role),
+            )
         )
         result = await self.db.execute(stmt)
         employee = result.scalar_one_or_none()
@@ -63,93 +70,95 @@ class MCPAuthService:
         employee.last_connected = datetime.now(timezone.utc)
         await self.db.flush()
 
-        # Resolve knowledge scope (including project memberships)
+        # Resolve knowledge scope
         identity = await self._resolve_scope(employee)
         return identity
 
     async def _resolve_scope(self, employee: Employee) -> ResolvedIdentity:
         """
         Compute effective knowledge scope for an employee.
-
-        Resolution order:
-        1. Check scope_memberships (new system)
-        2. Fall back to knowledge_scopes (legacy, for backward compatibility)
-        3. If no scopes defined → access all knowledge (open policy)
+        Uses new permission model v2 (scoped permissions + source_departments).
         """
-        # Load scope memberships (new system)
-        scope_stmt = select(ScopeMembership).where(
-            ScopeMembership.employee_id == employee.id
-        )
-        scope_result = await self.db.execute(scope_stmt)
-        scope_memberships = list(scope_result.scalars().all())
+        from app.services.permission_engine import get_effective_permissions, get_scope_level
 
+        permissions = get_effective_permissions(employee)
         project_source_ids = await self._resolve_project_sources(employee.id)
 
-        # If we have scope memberships, use them (new system)
-        if scope_memberships:
+        # Admin gets unrestricted access
+        if employee.role == "admin":
             return ResolvedIdentity(
                 employee_id=employee.id,
                 employee_name=employee.name,
                 department_id=employee.department_id,
                 department_name=employee.department.name if employee.department else "",
                 project_source_ids=project_source_ids,
-                is_admin=(employee.role == "admin"),
-                scope_memberships=scope_memberships,
+                is_admin=True,
+                permissions=permissions,
             )
 
-        # Legacy fallback: use knowledge_scopes
-        # 1. Personal scopes first
-        stmt = select(KnowledgeScope).where(
-            KnowledgeScope.employee_id == employee.id
-        )
-        result = await self.db.execute(stmt)
-        personal_scopes = result.scalars().all()
+        # Determine doc:read scope
+        scope = get_scope_level(permissions, "doc", "read")
 
-        # 2. Department scopes
-        stmt = select(KnowledgeScope).where(
-            KnowledgeScope.department_id == employee.department_id,
-            KnowledgeScope.employee_id == None,
-        )
-        result = await self.db.execute(stmt)
-        dept_scopes = result.scalars().all()
-
-        # Merge scopes: personal overrides department
-        effective_scopes = personal_scopes if personal_scopes else dept_scopes
-
-        if not effective_scopes:
-            # No scopes defined → open access (default permissive)
+        if scope == "all":
+            # Can read all documents
             return ResolvedIdentity(
                 employee_id=employee.id,
                 employee_name=employee.name,
                 department_id=employee.department_id,
                 department_name=employee.department.name if employee.department else "",
                 project_source_ids=project_source_ids,
+                permissions=permissions,
             )
 
-        # Collect grant types
-        allowed_types: set[str] = set()
-        allowed_sources: set[str] = set()
-        has_type_filter = False
-        has_source_filter = False
+        if scope == "own_dept":
+            # Can only read: global docs + docs in own department
+            # Build list of allowed source IDs
+            allowed_ids = await self._get_department_source_ids(employee.department_id)
+            return ResolvedIdentity(
+                employee_id=employee.id,
+                employee_name=employee.name,
+                department_id=employee.department_id,
+                department_name=employee.department.name if employee.department else "",
+                allowed_source_ids=allowed_ids,
+                project_source_ids=project_source_ids,
+                permissions=permissions,
+            )
 
-        for scope in effective_scopes:
-            if scope.scope_type == "grant":
-                if scope.knowledge_type_slugs:
-                    has_type_filter = True
-                    allowed_types.update(scope.knowledge_type_slugs)
-                if scope.source_ids:
-                    has_source_filter = True
-                    allowed_sources.update(str(s) for s in scope.source_ids)
-
+        # No doc:read permission at all
         return ResolvedIdentity(
             employee_id=employee.id,
             employee_name=employee.name,
             department_id=employee.department_id,
             department_name=employee.department.name if employee.department else "",
-            allowed_knowledge_types=list(allowed_types) if has_type_filter else None,
-            allowed_source_ids=list(allowed_sources) if has_source_filter else None,
+            allowed_source_ids=[],  # empty = no access
             project_source_ids=project_source_ids,
+            permissions=permissions,
         )
+
+    async def _get_department_source_ids(self, department_id: uuid.UUID) -> list[str]:
+        """Get IDs of sources that are global (no departments) or in the given department."""
+        # Sources with no department entries (global)
+        global_stmt = (
+            select(Source.id)
+            .where(
+                ~exists(
+                    select(SourceDepartment.source_id)
+                    .where(SourceDepartment.source_id == Source.id)
+                )
+            )
+        )
+        global_result = await self.db.execute(global_stmt)
+        global_ids = [str(r[0]) for r in global_result.all()]
+
+        # Sources in this department
+        dept_stmt = (
+            select(SourceDepartment.source_id)
+            .where(SourceDepartment.department_id == department_id)
+        )
+        dept_result = await self.db.execute(dept_stmt)
+        dept_ids = [str(r[0]) for r in dept_result.all()]
+
+        return global_ids + dept_ids
 
     async def _resolve_project_sources(self, employee_id: uuid.UUID) -> list[str]:
         """Collect source IDs from all active projects the employee is a member of."""
@@ -217,15 +226,10 @@ def apply_scope_filter(query, identity: ResolvedIdentity):
         stmt = select(Source).where(Source.status == "ready")
         stmt = apply_scope_filter(stmt, identity)
     """
-    from sqlalchemy import or_
-
     project_uuids = [uuid.UUID(s) for s in identity.project_source_ids]
 
     if identity.allowed_source_ids is None and identity.allowed_knowledge_types is None:
-        # Open access — only restrict to project sources if projects exist
-        if project_uuids:
-            # Open org-level access is already granted; project sources are additive, no filter needed
-            pass
+        # Open access
         return query
 
     conditions = []

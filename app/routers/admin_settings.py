@@ -13,6 +13,7 @@ from app.database import get_db
 from app.database.models import Source, Department, Employee
 from app.database.repository import Repository
 from app.services.auth_service import get_current_user, require_permission
+from app.services.audit_service import log_audit
 
 router = APIRouter()
 
@@ -69,13 +70,18 @@ async def get_settings(
 async def update_settings(
     body: SettingsUpdate,
     db: AsyncSession = Depends(get_db),
-    _user: Employee = require_permission("settings.edit"),
+    _user: Employee = require_permission("org:settings:manage"),
 ):
     """Update config values in database."""
     from app.services.config_service import ConfigService
 
     svc = ConfigService(db)
     results = await svc.set_batch(body.settings)
+    
+    # Audit log
+    keys_updated = list(body.settings.keys())
+    await log_audit(db, _user, "update", "settings", "global", reason=f"Updated keys: {', '.join(keys_updated)}")
+    await db.commit()
     return {"updated": results}
 
 

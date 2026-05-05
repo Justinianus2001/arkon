@@ -1,5 +1,6 @@
 """
 Roles router — CRUD for custom permission roles.
+Uses scoped permission format: resource:action:scope
 """
 
 import uuid
@@ -11,9 +12,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.database.models import Role
+from app.database.models import Role, Employee
 from app.services.auth_service import require_admin, require_permission
-from app.services.permissions import ALL_PERMISSIONS, PERMISSION_GROUPS, PERMISSION_LABELS
+from app.services.audit_service import log_audit
+from app.services.permissions import (
+    ALL_PERMISSIONS,
+    PERMISSION_GROUPS,
+    PERMISSION_LABELS,
+    PERMISSION_DESCRIPTIONS,
+    LEGACY_PERMISSION_MAP,
+)
 
 router = APIRouter(prefix="/roles", tags=["roles"])
 
@@ -48,35 +56,23 @@ class PermissionInfo(BaseModel):
     key: str
     label: str
     group: str
+    description: str = ""
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-# Map old permission names → new granular equivalents
-_LEGACY_MAP: dict[str, list[str]] = {
-    "kb.upload":          ["documents.create"],
-    "kb.manage":          ["kb.read", "kb.create", "kb.edit", "kb.delete",
-                           "documents.read", "documents.edit", "documents.delete"],
-    "departments.manage": ["departments.read", "departments.create", "departments.edit", "departments.delete"],
-    "employees.manage":   ["employees.read", "employees.create", "employees.edit", "employees.delete"],
-    "projects.manage":    ["workspaces.read", "workspaces.create", "workspaces.edit", "workspaces.delete"],
-    "projects.read":      ["workspaces.read"],
-    "projects.create":    ["workspaces.create"],
-    "projects.edit":      ["workspaces.edit"],
-    "projects.delete":    ["workspaces.delete"],
-    "settings.manage":    ["settings.read", "settings.edit"],
-    "scopes.manage":      ["scopes.read", "scopes.manage"],
-}
+# Legacy map reference for auth_service backward compatibility
+_LEGACY_MAP = LEGACY_PERMISSION_MAP
 
 
 def _migrate_permissions(perms: list[str]) -> list[str]:
-    """Convert legacy permission names to their new granular equivalents."""
+    """Convert legacy permission names to their new scoped equivalents."""
     migrated: set[str] = set()
     for p in perms:
-        if p in _LEGACY_MAP:
-            migrated.update(_LEGACY_MAP[p])
+        if p in LEGACY_PERMISSION_MAP:
+            migrated.update(LEGACY_PERMISSION_MAP[p])
         else:
             migrated.add(p)
     return sorted(migrated)
@@ -103,7 +99,7 @@ def _to_out(role: Role) -> RoleOut:
 # ---------------------------------------------------------------------------
 
 @router.get("/permissions", response_model=list[PermissionInfo])
-async def list_permissions(_user=require_permission("roles.read")):
+async def list_permissions(_user=require_permission("org:roles:read")):
     """Return all defined permission strings with labels and groups."""
     key_to_group = {
         perm: group
@@ -111,14 +107,19 @@ async def list_permissions(_user=require_permission("roles.read")):
         for perm in perms
     }
     return [
-        PermissionInfo(key=k, label=PERMISSION_LABELS[k], group=key_to_group[k])
+        PermissionInfo(
+            key=k,
+            label=PERMISSION_LABELS[k],
+            group=key_to_group[k],
+            description=PERMISSION_DESCRIPTIONS.get(k, ""),
+        )
         for k in ALL_PERMISSIONS
     ]
 
 
 @router.get("", response_model=list[RoleOut])
 async def list_roles(
-    _user=require_permission("roles.read"),
+    _user=require_permission("org:roles:read"),
     db: AsyncSession = Depends(get_db),
 ):
     result = await db.execute(select(Role).order_by(Role.is_system.desc(), Role.name))
@@ -128,7 +129,7 @@ async def list_roles(
 @router.post("", response_model=RoleOut, status_code=201)
 async def create_role(
     body: RoleCreate,
-    _user=require_permission("roles.create"),
+    _user=require_permission("org:roles:manage"),
     db: AsyncSession = Depends(get_db),
 ):
     migrated = _migrate_permissions(body.permissions)
@@ -141,6 +142,7 @@ async def create_role(
         is_system=False,
     )
     db.add(role)
+    await log_audit(db, _user, "create", "role", str(role.id), reason=role.name)
     await db.flush()
     await db.refresh(role)
     return _to_out(role)
@@ -150,7 +152,7 @@ async def create_role(
 async def update_role(
     role_id: uuid.UUID,
     body: RoleUpdate,
-    _user=require_permission("roles.edit"),
+    _user=require_permission("org:roles:manage"),
     db: AsyncSession = Depends(get_db),
 ):
     role = await db.get(Role, role_id)
@@ -169,6 +171,7 @@ async def update_role(
     if body.name is not None and not role.is_system:
         role.name = body.name.strip()
 
+    await log_audit(db, _user, "update", "role", str(role.id), reason=role.name)
     await db.flush()
     await db.refresh(role)
     return _to_out(role)
@@ -177,7 +180,7 @@ async def update_role(
 @router.delete("/{role_id}", status_code=204)
 async def delete_role(
     role_id: uuid.UUID,
-    _user=require_permission("roles.delete"),
+    _user=require_permission("org:roles:manage"),
     db: AsyncSession = Depends(get_db),
 ):
     role = await db.get(Role, role_id)
@@ -185,4 +188,5 @@ async def delete_role(
         raise HTTPException(404, "Role not found")
     if role.is_system:
         raise HTTPException(400, "Cannot delete system roles")
+    await log_audit(db, _user, "delete", "role", str(role.id), reason=role.name)
     await db.delete(role)

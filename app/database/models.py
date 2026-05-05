@@ -1,5 +1,9 @@
 """
 SQLAlchemy ORM models for all database tables.
+
+Permission Architecture v2 — Dual-Realm:
+  - Global Realm: scoped permissions (doc:read:own_dept, doc:read:all, etc.)
+  - Workspace Realm: membership-gated (viewer / contributor / editor / admin)
 """
 
 import uuid
@@ -25,60 +29,30 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
 # ---------------------------------------------------------------------------
-# Scope-based RBAC Enums & Constants
+# Enums
 # ---------------------------------------------------------------------------
 
 class ScopeType(str, PyEnum):
-    """Types of knowledge scopes."""
+    """Scope for sources/wiki: global or project (workspace).
+    Department visibility is handled via source_departments M2M.
+    """
     GLOBAL = "global"
     PROJECT = "project"
-    DEPARTMENT = "department"
-    TEAM = "team"
 
 
-class ScopeRole(str, PyEnum):
-    """Role within a scope (ordered by privilege level)."""
-    READER = "reader"
+class WorkspaceRole(str, PyEnum):
+    """Role within a workspace (ordered by privilege level)."""
+    VIEWER = "viewer"
     CONTRIBUTOR = "contributor"
-    OWNER = "owner"
+    EDITOR = "editor"
     ADMIN = "admin"
 
 
-ROLE_HIERARCHY: dict["ScopeRole", int] = {
-    ScopeRole.READER: 0,
-    ScopeRole.CONTRIBUTOR: 1,
-    ScopeRole.OWNER: 2,
-    ScopeRole.ADMIN: 3,
-}
-
-
-class Action(str, PyEnum):
-    """Atomic actions on resources (SRS §4.2)."""
-    READ = "read"
-    LIST = "list"
-    COMMENT = "comment"
-    PROPOSE_EDIT = "propose_edit"
-    APPROVE_EDIT = "approve_edit"
-    WRITE_DIRECT = "write_direct"
-    DELETE = "delete"
-    CREATE_LINK = "create_link"
-    MANAGE_MEMBERS = "manage_members"
-    MANAGE_SETTINGS = "manage_settings"
-
-
-# Role × Action permission matrix (SRS §4.3)
-ROLE_PERMISSIONS: dict["ScopeRole", set["Action"]] = {
-    ScopeRole.READER: {Action.READ, Action.LIST},
-    ScopeRole.CONTRIBUTOR: {
-        Action.READ, Action.LIST, Action.COMMENT,
-        Action.PROPOSE_EDIT, Action.CREATE_LINK,
-    },
-    ScopeRole.OWNER: {
-        Action.READ, Action.LIST, Action.COMMENT,
-        Action.PROPOSE_EDIT, Action.APPROVE_EDIT,
-        Action.CREATE_LINK, Action.DELETE, Action.MANAGE_MEMBERS,
-    },
-    ScopeRole.ADMIN: set(Action),
+WORKSPACE_ROLE_HIERARCHY: dict[WorkspaceRole, int] = {
+    WorkspaceRole.VIEWER: 0,
+    WorkspaceRole.CONTRIBUTOR: 1,
+    WorkspaceRole.EDITOR: 2,
+    WorkspaceRole.ADMIN: 3,
 }
 
 
@@ -100,21 +74,17 @@ class Source(Base):
     title: Mapped[Optional[str]] = mapped_column(String(500))
     full_text: Mapped[Optional[str]] = mapped_column(Text)
     source_type: Mapped[Optional[str]] = mapped_column(String(50))  # "file", "url"
-    # --- Scope-based access control ---
+    # --- Scope: global or project (workspace) ---
     scope_type: Mapped[str] = mapped_column(
         String(20), default=ScopeType.GLOBAL.value,
-        comment="Scope type: global, project, department, team",
+        comment="Scope type: global or project",
     )
     scope_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), nullable=True,
-        comment="Scope entity ID. Null for global scope.",
+        comment="Project/workspace ID when scope_type=project. Null for global.",
     )
     knowledge_type_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("knowledge_types.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    department_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="SET NULL"),
         nullable=True,
     )
     contributed_by_employee_id: Mapped[Optional[uuid.UUID]] = mapped_column(
@@ -146,11 +116,33 @@ class Source(Base):
     )
 
     # Relationships
-    department: Mapped[Optional["Department"]] = relationship(back_populates="sources")
+    departments: Mapped[list["SourceDepartment"]] = relationship(
+        back_populates="source", cascade="all, delete-orphan"
+    )
     knowledge_type: Mapped[Optional["KnowledgeType"]] = relationship()
     contributor: Mapped[Optional["Employee"]] = relationship(
         foreign_keys=[contributed_by_employee_id]
     )
+
+
+class SourceDepartment(Base):
+    """Many-to-many: Source ↔ Department.
+    A source with NO rows here is considered Global (visible to all).
+    """
+    __tablename__ = "source_departments"
+
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+    # Relationships
+    source: Mapped["Source"] = relationship(back_populates="departments")
+    department: Mapped["Department"] = relationship(back_populates="source_departments")
 
 
 # ---------------------------------------------------------------------------
@@ -172,14 +164,14 @@ class WikiPage(Base):
     page_type: Mapped[str] = mapped_column(String(30), nullable=False)
     content_md: Mapped[str] = mapped_column(Text, nullable=False, default="")
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # --- Scope-based access control ---
+    # --- Scope: global or project (workspace) ---
     scope_type: Mapped[str] = mapped_column(
         String(20), default=ScopeType.GLOBAL.value,
-        comment="Scope type: global, project, department, team",
+        comment="Scope type: global or project",
     )
     scope_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), nullable=True,
-        comment="Scope entity ID. Null for global scope.",
+        comment="Project/workspace ID. Null for global scope.",
     )
     knowledge_type_slugs: Mapped[list[str]] = mapped_column(
         ARRAY(String), nullable=False, default=list,
@@ -205,7 +197,6 @@ class WikiLink(Base):
     """
     Derived edge between two wiki pages, parsed from `[[slug]]` patterns in content_md.
     Refreshed after every page upsert by wiki_service.refresh_links().
-    Replaces a dedicated graph DB for 1-2 hop queries (backlinks, neighborhood).
     """
     __tablename__ = "wiki_links"
 
@@ -288,12 +279,14 @@ class KnowledgeType(Base):
 
 
 # ---------------------------------------------------------------------------
-# RBAC: Roles, Departments, Employees, Knowledge Scopes
+# RBAC: Roles, Departments, Employees
 # ---------------------------------------------------------------------------
 
-
 class Role(Base):
-    """Custom permission role assignable to employees."""
+    """Custom permission role assignable to employees.
+    Permissions use scoped format: resource:action:scope
+    e.g. 'doc:read:own_dept', 'doc:read:all', 'org:settings:manage'
+    """
     __tablename__ = "roles"
 
     id: Mapped[uuid.UUID] = mapped_column(
@@ -334,17 +327,16 @@ class Department(Base):
     employees: Mapped[list["Employee"]] = relationship(
         back_populates="department", cascade="all, delete-orphan"
     )
-    knowledge_scopes: Mapped[list["KnowledgeScope"]] = relationship(
+    source_departments: Mapped[list["SourceDepartment"]] = relationship(
         back_populates="department", cascade="all, delete-orphan"
     )
-    sources: Mapped[list["Source"]] = relationship(back_populates="department")
 
 
 class Employee(Base):
     """
     Employee — authenticates via login (JWT) or MCP token.
-    Role 'admin' has full access to admin portal.
-    Role 'employee' can view their scoped knowledge and get MCP tokens.
+    Role 'admin' has full access (bypasses all permission checks).
+    Role 'employee' access is governed by custom_role permissions.
     """
     __tablename__ = "employees"
 
@@ -359,7 +351,7 @@ class Employee(Base):
     )
     role: Mapped[str] = mapped_column(
         String(20), default="employee",
-        comment="admin or employee",
+        comment="admin or employee — system-level role",
     )
     department_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE")
@@ -384,10 +376,6 @@ class Employee(Base):
     # Relationships
     department: Mapped["Department"] = relationship(back_populates="employees")
     custom_role: Mapped[Optional["Role"]] = relationship(back_populates="employees")
-    personal_scopes: Mapped[list["KnowledgeScope"]] = relationship(
-        back_populates="employee",
-        foreign_keys="KnowledgeScope.employee_id",
-    )
 
     __table_args__ = (
         Index("ix_employees_mcp_token", "mcp_token"),
@@ -396,62 +384,16 @@ class Employee(Base):
     )
 
 
-class KnowledgeScope(Base):
-    """
-    Defines what knowledge a department or individual employee can access.
-
-    Scoping rules:
-      - department_id set, employee_id null → applies to entire department
-      - employee_id set → personal override (grant or restrict)
-      - knowledge_type filter → only specific types (sop, product...)
-      - source_ids filter → only specific documents
-    """
-    __tablename__ = "knowledge_scopes"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    department_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE"),
-        nullable=True,
-    )
-    employee_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"),
-        nullable=True,
-    )
-    scope_type: Mapped[str] = mapped_column(
-        String(20), default="grant",
-        comment="grant = allow access, deny = restrict access",
-    )
-    knowledge_type_slugs: Mapped[Optional[list[str]]] = mapped_column(
-        "knowledge_types", ARRAY(String),
-        comment="Filter by KnowledgeType slugs (admin-defined). Null = all types.",
-    )
-    source_ids: Mapped[Optional[list]] = mapped_column(
-        JSONB,
-        comment="Specific source UUIDs. Null = all sources matching knowledge_types.",
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-
-    # Relationships
-    department: Mapped[Optional["Department"]] = relationship(back_populates="knowledge_scopes")
-    employee: Mapped[Optional["Employee"]] = relationship(
-        back_populates="personal_scopes",
-        foreign_keys=[employee_id],
-    )
-
-
 # ---------------------------------------------------------------------------
-# Projects — cross-functional, temporary knowledge contexts
+# Workspaces (Projects) — membership-gated realm
 # ---------------------------------------------------------------------------
 
 class Project(Base):
     """
     A named workspace grouping employees and sources across departments.
     Can represent a project, customer engagement, or any cross-functional context.
-    workspace_type distinguishes between 'project' and 'customer'.
+    Access is purely membership-based — global role does NOT grant access.
+    Admin (role='admin') can view all workspaces via workspace:view:all permission.
     """
     __tablename__ = "projects"
 
@@ -490,7 +432,9 @@ class Project(Base):
 
 
 class ProjectMember(Base):
-    """Associates an employee with a project."""
+    """Associates an employee with a project/workspace.
+    Role determines what the member can do within this workspace.
+    """
     __tablename__ = "project_members"
 
     project_id: Mapped[uuid.UUID] = mapped_column(
@@ -502,8 +446,8 @@ class ProjectMember(Base):
         primary_key=True,
     )
     role: Mapped[str] = mapped_column(
-        String(20), default="member",
-        comment="owner or member",
+        String(20), default=WorkspaceRole.VIEWER.value,
+        comment="viewer, contributor, editor, or admin",
     )
     added_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
@@ -544,73 +488,13 @@ class ProjectSource(Base):
 
 
 # ---------------------------------------------------------------------------
-# Scope-based RBAC: Membership & Audit
+# Audit Log
 # ---------------------------------------------------------------------------
-
-class ScopeMembership(Base):
-    """
-    Maps a principal (employee) to a scope with a specific role.
-    Replaces KnowledgeScope with a cleaner, per-scope-role model.
-
-    Scoping rules:
-      - scope_type='global', scope_id=None → org-wide access
-      - scope_type='project', scope_id=<project.id> → project-level access
-      - scope_type='department', scope_id=<department.id> → department-level access
-      - scope_type='team', scope_id=<team.id> → team-level access
-
-    Implements FR-10, FR-12, FR-13 from AccessControl.md.
-    """
-    __tablename__ = "scope_memberships"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    employee_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"),
-    )
-    scope_type: Mapped[str] = mapped_column(
-        String(20), nullable=False,
-        comment="Scope type: global, project, department, team",
-    )
-    scope_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), nullable=True,
-        comment="Scope entity ID. Null for global scope.",
-    )
-    role: Mapped[str] = mapped_column(
-        String(20), default=ScopeRole.READER.value,
-        comment="Role within this scope: reader, contributor, owner, admin",
-    )
-    granted_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="SET NULL"),
-        nullable=True,
-        comment="Who granted this membership (FR-11)",
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-
-    # Relationships
-    employee: Mapped["Employee"] = relationship(
-        foreign_keys=[employee_id],
-    )
-    granted_by: Mapped[Optional["Employee"]] = relationship(
-        foreign_keys=[granted_by_id],
-    )
-
-    __table_args__ = (
-        UniqueConstraint("employee_id", "scope_type", "scope_id",
-                         name="uq_scope_membership_employee_scope"),
-        Index("ix_scope_memberships_employee_id", "employee_id"),
-        Index("ix_scope_memberships_scope", "scope_type", "scope_id"),
-    )
-
 
 class AuditLog(Base):
     """
     Append-only access decision log.
-    Records every allow/deny decision for compliance and debugging.
-
-    Implements NFR-01, NFR-02 from AccessControl.md.
+    Records actions for compliance and debugging.
     """
     __tablename__ = "audit_log"
 
@@ -634,15 +518,11 @@ class AuditLog(Base):
     )
     resource_type: Mapped[str] = mapped_column(
         String(50), nullable=False,
-        comment="Type of resource: source, wiki_page, scope_membership...",
+        comment="Type of resource: source, wiki_page, etc.",
     )
     resource_id: Mapped[str] = mapped_column(
         String(100), nullable=False,
         comment="UUID or identifier of the resource",
-    )
-    scope_type: Mapped[Optional[str]] = mapped_column(String(20))
-    scope_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), nullable=True
     )
     decision: Mapped[str] = mapped_column(
         String(10), nullable=False,
@@ -650,7 +530,7 @@ class AuditLog(Base):
     )
     reason: Mapped[Optional[str]] = mapped_column(
         Text,
-        comment="Human-readable reason for the decision (FR-31)",
+        comment="Human-readable reason for the decision",
     )
     metadata_: Mapped[Optional[dict]] = mapped_column(
         "metadata", JSONB,

@@ -16,6 +16,7 @@ export type PermissionInfo = {
   key: string;
   label: string;
   group: string;
+  description?: string;
 };
 
 export type Role = {
@@ -183,7 +184,7 @@ export function RoleDialog({ open, onOpenChange, role, permissions, onSaved }: P
                       {perms.map((p) => (
                         <label
                           key={p.key}
-                          className="flex items-start gap-2.5 cursor-pointer group"
+                          className="flex items-start gap-2.5 cursor-pointer group relative"
                         >
                           <input
                             type="checkbox"
@@ -191,10 +192,26 @@ export function RoleDialog({ open, onOpenChange, role, permissions, onSaved }: P
                             onChange={() => togglePermission(p.key)}
                             className="mt-0.5 h-4 w-4 rounded border-border accent-primary cursor-pointer"
                           />
-                          <div className="min-w-0">
-                            <p className="text-sm font-medium leading-none group-hover:text-primary transition-colors">
-                              {p.label}
-                            </p>
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-center gap-1.5">
+                              <p className="text-sm font-medium leading-none group-hover:text-primary transition-colors">
+                                {p.label}
+                              </p>
+                              {p.description && (
+                                <div className="relative">
+                                  <span
+                                    className="material-symbols-outlined text-muted-foreground/50 hover:text-muted-foreground cursor-help transition-colors peer"
+                                    style={{ fontSize: 14 }}
+                                  >
+                                    info
+                                  </span>
+                                  <div className="absolute left-1/2 -translate-x-1/2 bottom-full mb-2 hidden peer-hover:block z-50 w-64 px-3 py-2 text-xs text-popover-foreground bg-popover border border-border rounded-lg shadow-lg">
+                                    <div className="absolute left-1/2 -translate-x-1/2 top-full w-0 h-0 border-x-[6px] border-x-transparent border-t-[6px] border-t-border" />
+                                    {p.description}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
                             <p className="text-[11px] text-muted-foreground mt-0.5 font-mono">
                               {p.key}
                             </p>

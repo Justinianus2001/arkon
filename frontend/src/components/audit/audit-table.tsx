@@ -17,10 +17,11 @@ export type AuditLogEntry = {
   timestamp: string;
   action: string;
   principal_id: string;
-  principal_name: string;
+  principal_name?: string;
+  principal_email?: string;
   resource_type: string;
   resource_id?: string;
-  decision: "allow" | "deny";
+  decision: string;
   reason?: string;
 };
 
@@ -72,12 +73,21 @@ export function AuditTable({ logs, loading }: Props) {
               </TableCell>
               <TableCell>
                 <div className="flex flex-col">
-                  <span className="text-sm font-medium">{log.principal_name}</span>
-                  <span className="text-xs text-muted-foreground font-mono">{log.principal_id.slice(0, 8)}...</span>
+                  <span className="text-sm font-medium">{log.principal_name || "System/Unknown"}</span>
+                  <span className="text-xs text-muted-foreground">{log.principal_email || log.principal_id.slice(0, 8) + '...'}</span>
                 </div>
               </TableCell>
               <TableCell>
-                <Badge variant="outline" className="text-xs font-mono font-normal">
+                <Badge
+                  variant="outline"
+                  className={`text-xs font-mono font-normal ${
+                    log.action.toLowerCase() === "create"
+                      ? "border-green-200 text-green-700 bg-green-50/50"
+                      : log.action.toLowerCase() === "delete"
+                      ? "border-red-200 text-red-700 bg-red-50/50"
+                      : "border-blue-200 text-blue-700 bg-blue-50/50"
+                  }`}
+                >
                   {log.action}
                 </Badge>
               </TableCell>
@@ -96,15 +106,15 @@ export function AuditTable({ logs, loading }: Props) {
                   <Badge
                     variant="outline"
                     className={`text-xs ${
-                      log.decision === "allow"
+                      log.decision.toLowerCase() === "allow"
                         ? "border-green-200 text-green-700 bg-green-50/50"
                         : "border-red-200 text-red-700 bg-red-50/50"
                     }`}
                   >
                     {log.decision.toUpperCase()}
                   </Badge>
-                  {log.reason && log.decision === "deny" && (
-                    <span className="text-xs text-muted-foreground max-w-xs truncate" title={log.reason}>
+                  {log.reason && (
+                    <span className="text-xs text-muted-foreground max-w-[200px] truncate" title={log.reason}>
                       {log.reason}
                     </span>
                   )}

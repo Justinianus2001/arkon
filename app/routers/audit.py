@@ -8,7 +8,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
-from sqlalchemy import select, desc, func
+from sqlalchemy import select, desc, func, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -27,11 +27,11 @@ class AuditEntryOut(BaseModel):
     timestamp: str
     principal_id: str
     principal_type: str
+    principal_name: Optional[str] = None
+    principal_email: Optional[str] = None
     action: str
     resource_type: str
     resource_id: str
-    scope_type: Optional[str] = None
-    scope_id: Optional[str] = None
     decision: str
     reason: Optional[str] = None
 
@@ -84,8 +84,18 @@ async def get_audit_log(
         .offset((page - 1) * page_size)
         .limit(page_size)
     )
-    result = await db.execute(stmt)
-    entries = result.scalars().all()
+    
+    # Join with Employee to get names/emails
+    join_stmt = (
+        select(AuditLog, Employee)
+        .select_from(stmt.subquery().alias("log_sub"))
+        .join(AuditLog, AuditLog.id == text("log_sub.id"))
+        .outerjoin(Employee, AuditLog.principal_id == Employee.id)
+        .order_by(desc(AuditLog.timestamp))
+    )
+    
+    result = await db.execute(join_stmt)
+    rows = result.all()
 
     return AuditListResponse(
         items=[
@@ -94,15 +104,15 @@ async def get_audit_log(
                 timestamp=e.timestamp.isoformat(),
                 principal_id=str(e.principal_id),
                 principal_type=e.principal_type,
+                principal_name=emp.name if emp else None,
+                principal_email=emp.email if emp else None,
                 action=e.action,
                 resource_type=e.resource_type,
                 resource_id=e.resource_id,
-                scope_type=e.scope_type,
-                scope_id=str(e.scope_id) if e.scope_id else None,
                 decision=e.decision,
                 reason=e.reason,
             )
-            for e in entries
+            for e, emp in rows
         ],
         total=total,
         page=page,

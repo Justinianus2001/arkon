@@ -45,27 +45,27 @@ const navSections: NavSection[] = [
     id: "org-knowledge",
     label: "Org Knowledge",
     items: [
-      { label: "Documents", href: "/knowledge", icon: "description", requiredPermissions: ["documents.read"] },
-      { label: "Wiki", href: "/wiki", icon: "auto_stories", requiredPermissions: ["kb.read"] },
+      { label: "Documents", href: "/knowledge", icon: "description", requiredPermissions: ["doc:read:own_dept", "doc:read:all"] },
+      { label: "Wiki", href: "/wiki", icon: "auto_stories", requiredPermissions: ["wiki:read:own_dept", "wiki:read:all"] },
     ],
   },
   {
     id: "organization",
     label: "Organization",
-    requiredPermissions: ["departments.read", "employees.read", "roles.read"],
+    requiredPermissions: ["org:departments:read", "org:employees:read", "org:roles:read"],
     items: [
-      { label: "Departments", href: "/departments", icon: "domain", requiredPermissions: ["departments.read"] },
-      { label: "Employees", href: "/employees", icon: "group", requiredPermissions: ["employees.read"] },
-      { label: "Roles", href: "/roles", icon: "manage_accounts", requiredPermissions: ["roles.read"] },
+      { label: "Departments", href: "/departments", icon: "domain", requiredPermissions: ["org:departments:read"] },
+      { label: "Employees", href: "/employees", icon: "group", requiredPermissions: ["org:employees:read"] },
+      { label: "Roles", href: "/roles", icon: "manage_accounts", requiredPermissions: ["org:roles:read"] },
     ],
   },
   {
     id: "system",
     label: "System",
-    requiredPermissions: ["audit.read", "settings.read"],
+    requiredPermissions: ["org:audit:read", "org:settings:read"],
     items: [
-      { label: "Audit Log", href: "/audit", icon: "policy", requiredPermissions: ["audit.read"] },
-      { label: "Settings", href: "/settings", icon: "settings", requiredPermissions: ["settings.read"] },
+      { label: "Audit Log", href: "/audit", icon: "policy", requiredPermissions: ["org:audit:read"] },
+      { label: "Settings", href: "/settings", icon: "settings", requiredPermissions: ["org:settings:read"] },
     ],
   },
 ];
@@ -394,9 +394,7 @@ export function Sidebar() {
         />
 
         {/* Workspaces — collapsible, inline list */}
-        {hasPermission("workspaces.read") && (
-          <SidebarWorkspacesSection pathname={pathname} canCreate={hasPermission("workspaces.create")} />
-        )}
+        <SidebarWorkspacesSection pathname={pathname} canCreate={hasPermission("workspace:view:all")} />
 
         {/* Static sections — no collapse */}
         {visibleSections.map((section) => (

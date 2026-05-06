@@ -20,7 +20,12 @@
       "Bash(xargs ls *)",
       "Bash(xargs grep *)",
       "Bash(rtk wc *)",
-      "Bash(rtk git *)"
+      "Bash(rtk git *)",
+      "Bash(rtk read *)",
+      "Bash(python -c \"import json,sys; p=json.load\\(sys.stdin\\); deps={**p.get\\('dependencies',{}\\), **p.get\\('devDependencies',{}\\)}; [print\\(k,v\\) for k,v in sorted\\(deps.items\\(\\)\\) if any\\(x in k.lower\\(\\) for x in ['editor','markdown','codemirror','monaco','tiptap','prose','quill','slate']\\)]\")",
+      "Bash(Find D:\\\\arkon\\\\frontend\\\\src -type f -name \"*layout.tsx\")",
+      "Bash(Get-ChildItem -Path \"D:\\\\arkon\\\\frontend\\\\src\" -Recurse -Filter \"*auth*\" -File)",
+      "Bash(rtk docker *)"
     ]
   },
   "enabledPlugins": {

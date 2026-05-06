@@ -43,7 +43,12 @@ def register_resources(mcp: FastMCP):
     async def wiki_index_resource() -> str:
         """Current wiki catalog — same content as the `read_wiki_index` tool."""
         from app.database import async_session_factory
+        from app.mcp.tools import _get_identity
         from app.services import wiki_service
+
+        identity, err = await _get_identity()
+        if err:
+            return err
 
         try:
             async with async_session_factory() as session:

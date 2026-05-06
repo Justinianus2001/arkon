@@ -90,7 +90,7 @@ NEXT_PUBLIC_API_URL=http://localhost:5055
 
 ## 6. Start Services
 
-You need **3 terminals**.
+You need **4 terminals**.
 
 ### Terminal 1: API Server
 
@@ -109,15 +109,23 @@ SUCCESS  Arkon MCP Server ready at /mcp
 SUCCESS  Arkon API started successfully
 ```
 
-### Terminal 2: Background Worker
+### Terminal 2: Wiki Worker
 
 ```bash
 python -m arq app.worker.WorkerSettings
 ```
 
-The worker processes document ingestion: text extraction, image captioning, and LLM wiki compilation. Documents will stay at `pending` status until the worker is running.
+Processes document ingestion: text extraction, image captioning, and LLM wiki compilation. Documents stay at `pending` until this is running.
 
-### Terminal 3: Frontend
+### Terminal 3: Skills Worker
+
+```bash
+python -m arq app.worker.SkillWorkerSettings
+```
+
+Handles AI skill package processing. Required if you use the Skills feature.
+
+### Terminal 4: Frontend
 
 ```bash
 cd frontend
@@ -236,8 +244,9 @@ After generating an MCP token for an employee, add to Claude Desktop config (`cl
 | `connection refused` on port 5432 | PostgreSQL is not running |
 | `pgvector extension not found` | Use `pgvector/pgvector` Docker image, or install pgvector manually |
 | `No admin created` on startup | Check `DEFAULT_ADMIN_EMAIL` / `DEFAULT_ADMIN_PASSWORD` in `.env` |
-| Documents stuck at `pending` | Worker is not running — start Terminal 2 |
+| Documents stuck at `pending` | Wiki worker not running — start Terminal 2 |
 | Wiki pages not created after upload | Check LLM provider config in Settings; check worker logs for errors |
+| Skills not processing | Skills worker not running — start Terminal 3 |
 | Frontend shows "API Error" | Backend not running, or `NEXT_PUBLIC_API_URL` incorrect in `frontend/.env.local` |
 | CORS errors in browser | Add `http://localhost:3000` to `CORS_ORIGINS` in backend `.env` |
 | `requires Python 3.11` error | Use `py -3.11 -m venv .venv` to create venv with correct version |

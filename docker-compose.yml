@@ -1,53 +1,56 @@
 version: '3.8'
 
+# Backend image built once, reused by api + workers
+x-backend: &backend
+  build:
+    context: .
+    dockerfile: Dockerfile
+  image: arkon-backend:latest
+  env_file: [.env]
+  restart: always
+
 services:
-  # 1. API Backend (FastAPI)
+  # 1. API
   api:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *backend
     container_name: arkon_api
-    restart: always
     ports:
       - "5055:5055"
-    env_file:
-      - .env
     command: python -m uvicorn app.main:app --host 0.0.0.0 --port 5055
+    healthcheck:
+      test: ["CMD", "python", "-c",
+             "import urllib.request; urllib.request.urlopen('http://localhost:5055/health')"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
 
-  # 2. Background Worker (ARQ)
+  # 2. Background worker (main queue)
   worker:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *backend
     container_name: arkon_worker
-    restart: always
-    env_file:
-      - .env
     command: python -m arq app.worker.WorkerSettings
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
-  # 2.5 Background Worker (Skills)
+  # 3. Background worker (skills queue)
   worker_skills:
-    build:
-      context: .
-      dockerfile: Dockerfile
+    <<: *backend
     container_name: arkon_worker_skills
-    restart: always
-    env_file:
-      - .env
     command: python -m arq app.worker.SkillWorkerSettings
     depends_on:
-      - api
+      api:
+        condition: service_healthy
 
-  # 3. Frontend (Next.js)
+  # 4. Frontend (Next.js standalone)
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
       args:
         NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-http://localhost:5055}
-        INTERNAL_API_URL: http://api:5055
+    image: arkon-frontend:latest
     container_name: arkon_frontend
     restart: always
     ports:
@@ -56,4 +59,5 @@ services:
       - NEXT_PUBLIC_API_URL=${NEXT_PUBLIC_API_URL:-http://localhost:5055}
       - INTERNAL_API_URL=http://api:5055
     depends_on:
-      - api
+      api:
+        condition: service_healthy

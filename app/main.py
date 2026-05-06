@@ -13,8 +13,9 @@ from app.config import settings
 from app.mcp.server import create_mcp_server
 
 
-# Create the MCP server instance (shared across the app lifecycle)
+# Create the MCP server and its HTTP app (lifespan must be composed with FastAPI)
 mcp_server = create_mcp_server()
+mcp_http_app = mcp_server.http_app(path="/", stateless_http=True)
 
 
 async def seed_default_admin():
@@ -56,32 +57,33 @@ async def seed_default_admin():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup & shutdown logic."""
-    logger.info("Starting Arkon API...")
+    """Startup & shutdown logic (composed with FastMCP lifespan)."""
+    async with mcp_http_app.lifespan(app):
+        logger.info("Starting Arkon API...")
 
-    # Ensure MinIO bucket exists
-    try:
-        from app.services.storage_service import storage_service
-        await storage_service.ensure_bucket()
-        logger.success("MinIO bucket ready")
-    except Exception as e:
-        logger.warning(f"MinIO not available yet: {e}")
+        # Ensure MinIO bucket exists
+        try:
+            from app.services.storage_service import storage_service
+            await storage_service.ensure_bucket()
+            logger.success("MinIO bucket ready")
+        except Exception as e:
+            logger.warning(f"MinIO not available yet: {e}")
 
-    # Seed default admin if no admin exists yet
-    await seed_default_admin()
+        # Seed default admin if no admin exists yet
+        await seed_default_admin()
 
-    # Warn if sensitive defaults are unchanged
-    if settings.secret_key == "change-me-to-a-random-secret-string":
-        logger.warning("⚠️  SECRET_KEY is set to the default value — change it before deploying to production!")
-    if settings.default_admin_password == "admin123":
-        logger.warning("⚠️  DEFAULT_ADMIN_PASSWORD is 'admin123' — change the admin password after first login!")
+        # Warn if sensitive defaults are unchanged
+        if settings.secret_key == "change-me-to-a-random-secret-string":
+            logger.warning("⚠️  SECRET_KEY is set to the default value — change it before deploying to production!")
+        if settings.default_admin_password == "admin123":
+            logger.warning("⚠️  DEFAULT_ADMIN_PASSWORD is 'admin123' — change the admin password after first login!")
 
-    # MCP server ready
-    logger.success("Arkon MCP Server ready at /mcp")
-    logger.success("Arkon API started successfully")
-    yield
+        # MCP server ready
+        logger.success("Arkon MCP Server ready at /mcp")
+        logger.success("Arkon API started successfully")
+        yield
 
-    logger.info("Arkon API shutdown complete")
+        logger.info("Arkon API shutdown complete")
 
 
 app = FastAPI(
@@ -103,7 +105,7 @@ app.add_middleware(
 
 # --- Mount MCP Server ---
 # Claude Desktop connects to: https://your-server/mcp
-app.mount("/mcp", mcp_server.http_app(stateless_http=True))
+app.mount("/mcp", mcp_http_app)
 
 # --- REST API Routers ---
 from app.routers import sources, notes, auth, admin_settings, rbac, knowledge_types, projects, roles, wiki, wiki_drafts, audit, skills  # noqa: E402
@@ -111,8 +113,8 @@ from app.routers import sources, notes, auth, admin_settings, rbac, knowledge_ty
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(sources.router, prefix="/api", tags=["sources"])
 app.include_router(notes.router, prefix="/api", tags=["notes"])
-app.include_router(wiki.router, prefix="/api", tags=["wiki"])
 app.include_router(wiki_drafts.router, prefix="/api", tags=["wiki-drafts"])
+app.include_router(wiki.router, prefix="/api", tags=["wiki"])
 app.include_router(admin_settings.router, prefix="/api", tags=["settings"])
 app.include_router(rbac.router, prefix="/api", tags=["rbac"])
 app.include_router(knowledge_types.router, prefix="/api", tags=["knowledge-types"])

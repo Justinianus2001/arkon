@@ -15,6 +15,7 @@ All tools verify the employee's MCP token and enforce knowledge_type scope:
 from typing import Optional
 
 from fastmcp import FastMCP
+from sqlalchemy.ext.asyncio import AsyncSession
 
 
 # ---------------------------------------------------------------------------
@@ -51,8 +52,11 @@ async def _get_identity():
     return identity, None
 
 
-async def _get_allowed_source_ids(identity) -> Optional[set[str]]:
-    """Allowed source UUID strings, or None when access is unrestricted."""
+async def _get_allowed_source_ids(identity, session: Optional[AsyncSession] = None) -> Optional[set[str]]:
+    """Allowed source UUID strings, or None when access is unrestricted.
+
+    Pass an existing session to avoid opening a second DB connection.
+    """
     if identity.is_admin:
         return None
     if identity.allowed_source_ids is None and identity.allowed_knowledge_types is None:
@@ -63,11 +67,51 @@ async def _get_allowed_source_ids(identity) -> Optional[set[str]]:
     from app.database.models import Source
     from app.services.mcp_auth_service import apply_scope_filter
 
-    async with async_session_factory() as session:
+    async def _query(s: AsyncSession) -> set[str]:
         stmt = select(Source.id).where(Source.status == "ready")
         stmt = apply_scope_filter(stmt, identity)
-        result = await session.execute(stmt)
+        result = await s.execute(stmt)
         return {str(r[0]) for r in result.all()}
+
+    if session is not None:
+        return await _query(session)
+
+    async with async_session_factory() as session:
+        return await _query(session)
+
+
+# ---------------------------------------------------------------------------
+# Permission helpers (shared across review/contribute tools)
+# ---------------------------------------------------------------------------
+
+async def _can_review_page(session: AsyncSession, employee, page) -> bool:
+    """Editor+ in the page's workspace, or wiki:write:all globally, or admin."""
+    from app.services.permission_engine import (
+        get_workspace_role, workspace_role_can, _get_user_permissions,
+    )
+    if employee.role == "admin":
+        return True
+    if page.scope_type == "project" and page.scope_id:
+        role = await get_workspace_role(session, employee, page.scope_id)
+        return bool(role) and workspace_role_can(role, "editor")
+    perms = _get_user_permissions(employee)
+    return "wiki:write:all" in perms
+
+
+async def _can_contribute_to_page(session: AsyncSession, employee, page) -> bool:
+    """Contributor+ in the page's workspace, or wiki:write globally, or admin."""
+    from app.services.permission_engine import (
+        get_workspace_role, workspace_role_can, has_any_permission, _get_user_permissions,
+    )
+    if employee.role == "admin":
+        return True
+    if page.scope_type == "project" and page.scope_id:
+        role = await get_workspace_role(session, employee, page.scope_id)
+        if not role:
+            return False
+        return workspace_role_can(role, "contributor")
+    perms = _get_user_permissions(employee)
+    return has_any_permission(list(perms), "wiki", "write")
 
 
 # ---------------------------------------------------------------------------
@@ -92,7 +136,7 @@ def register_tools(mcp: FastMCP):
 
         Args:
             query: Natural language search query.
-            top_k: Maximum number of pages to return (default: 10).
+            top_k: Maximum number of pages to return (default: 10, max: 50).
 
         Returns:
             A ranked list of page slugs with titles, summaries, and similarity.
@@ -101,6 +145,9 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
+
+        top_k = min(max(1, top_k), 50)
 
         from app.ai.registry import ProviderRegistry
         from app.database import async_session_factory
@@ -152,6 +199,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         from app.database import async_session_factory
         from app.services import wiki_service
@@ -180,6 +228,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         from app.database import async_session_factory
         from app.services import wiki_service
@@ -204,6 +253,7 @@ def register_tools(mcp: FastMCP):
         page_type: Optional[str] = None,
         knowledge_type: Optional[str] = None,
         limit: int = 50,
+        offset: int = 0,
     ) -> str:
         """
         Browse wiki pages with filters. Reserved pages (`_index`, `_log`) are excluded.
@@ -212,6 +262,7 @@ def register_tools(mcp: FastMCP):
             page_type: Filter by type — "entity", "concept", "topic", "source".
             knowledge_type: Filter by KnowledgeType slug.
             limit: Max pages to return (default: 50).
+            offset: Number of pages to skip for pagination (default: 0).
 
         Returns:
             Slug, title, summary, type, and KnowledgeType slugs for each page.
@@ -219,6 +270,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         from app.database import async_session_factory
         from app.services import wiki_service
@@ -230,6 +282,7 @@ def register_tools(mcp: FastMCP):
                 knowledge_type_slug=knowledge_type,
                 allowed_kt_slugs=identity.allowed_knowledge_types,
                 limit=limit,
+                offset=offset,
             )
 
         if not pages:
@@ -266,6 +319,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
         try:
             sid = uuid_mod.UUID(source_id)
         except ValueError:
@@ -280,7 +334,7 @@ def register_tools(mcp: FastMCP):
             if not source:
                 return f"Source not found: {source_id}"
 
-            allowed_ids = await _get_allowed_source_ids(identity)
+            allowed_ids = await _get_allowed_source_ids(identity, session)
             if allowed_ids is not None and str(sid) not in allowed_ids:
                 return "Access denied: this source is outside your knowledge scope."
 
@@ -325,6 +379,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
         try:
             sid = uuid_mod.UUID(source_id)
         except ValueError:
@@ -334,7 +389,7 @@ def register_tools(mcp: FastMCP):
             source = await session.get(Source, sid)
             if not source:
                 return f"Source not found: {source_id}"
-            allowed_ids = await _get_allowed_source_ids(identity)
+            allowed_ids = await _get_allowed_source_ids(identity, session)
             if allowed_ids is not None and str(sid) not in allowed_ids:
                 return "Access denied: this source is outside your knowledge scope."
 
@@ -376,6 +431,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
         try:
             sid = uuid_mod.UUID(source_id)
         except ValueError:
@@ -389,7 +445,7 @@ def register_tools(mcp: FastMCP):
             source = await session.get(Source, sid)
             if not source:
                 return f"Source not found: {source_id}"
-            allowed_ids = await _get_allowed_source_ids(identity)
+            allowed_ids = await _get_allowed_source_ids(identity, session)
             if allowed_ids is not None and str(sid) not in allowed_ids:
                 return "Access denied: this source is outside your knowledge scope."
 
@@ -416,6 +472,7 @@ def register_tools(mcp: FastMCP):
         status: str = "ready",
         knowledge_type: Optional[str] = None,
         limit: int = 20,
+        offset: int = 0,
     ) -> str:
         """
         List raw source documents with optional filters.
@@ -424,6 +481,7 @@ def register_tools(mcp: FastMCP):
             status: "ready", "processing", "error", or "all".
             knowledge_type: Filter by KnowledgeType slug.
             limit: Max sources to return (default: 20).
+            offset: Number of sources to skip for pagination (default: 0).
         """
         from sqlalchemy import select
         from sqlalchemy.orm import selectinload
@@ -434,6 +492,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         async with async_session_factory() as session:
             stmt = (
@@ -449,7 +508,7 @@ def register_tools(mcp: FastMCP):
                 )).scalar()
                 if kt_id:
                     stmt = stmt.where(Source.knowledge_type_id == kt_id)
-            stmt = apply_scope_filter(stmt, identity).limit(limit)
+            stmt = apply_scope_filter(stmt, identity).offset(offset).limit(limit)
             sources = (await session.execute(stmt)).scalars().all()
 
         if not sources:
@@ -484,6 +543,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         async with async_session_factory() as session:
             stmt = (
@@ -532,6 +592,7 @@ def register_tools(mcp: FastMCP):
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         if (identity.allowed_knowledge_types is not None
                 and knowledge_type_slug not in identity.allowed_knowledge_types):
@@ -585,13 +646,11 @@ def register_tools(mcp: FastMCP):
         from app.database import async_session_factory
         from app.database.models import Employee, WikiPage
         from app.services import wiki_service
-        from app.services.permission_engine import (
-            get_workspace_role, workspace_role_can, has_any_permission, _get_user_permissions,
-        )
 
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         if not slug or not content_md.strip():
             return "Error: slug and content_md are required."
@@ -611,17 +670,10 @@ def register_tools(mcp: FastMCP):
             if not employee:
                 return "Error: employee not found."
 
-            if employee.role != "admin":
+            if not await _can_contribute_to_page(session, employee, page):
                 if page.scope_type == "project" and page.scope_id:
-                    role = await get_workspace_role(session, employee, page.scope_id)
-                    if not role:
-                        return f"Error: you are not a member of the workspace for page '{slug}'."
-                    if not workspace_role_can(role, "contributor"):
-                        return f"Error: requires contributor role or above to propose edits to '{slug}'."
-                else:
-                    perms = _get_user_permissions(employee)
-                    if not has_any_permission(list(perms), "wiki", "write"):
-                        return "Error: insufficient permission to propose wiki edits."
+                    return f"Error: requires contributor role or above to propose edits to '{slug}'."
+                return "Error: insufficient permission to propose wiki edits."
 
             draft = await wiki_service.create_draft(
                 session,
@@ -659,13 +711,11 @@ def register_tools(mcp: FastMCP):
         from app.database import async_session_factory
         from app.database.models import Employee, WikiPage
         from app.services import wiki_service
-        from app.services.permission_engine import (
-            get_workspace_role, workspace_role_can, has_any_permission, _get_user_permissions,
-        )
 
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         if not slug or not content_md.strip():
             return "Error: slug and content_md are required."
@@ -683,18 +733,14 @@ def register_tools(mcp: FastMCP):
             if not employee:
                 return "Error: employee not found."
 
-            if employee.role != "admin":
+            if not await _can_review_page(session, employee, page):
                 if page.scope_type == "project" and page.scope_id:
-                    role = await get_workspace_role(session, employee, page.scope_id)
-                    if not role or not workspace_role_can(role, "editor"):
-                        return f"Error: requires editor role or above to directly edit '{slug}'."
-                else:
-                    perms = _get_user_permissions(employee)
-                    if "wiki:write:all" not in perms:
-                        return "Error: requires wiki:write:all permission to directly edit global wiki pages. Use propose_wiki_edit() instead."
+                    return f"Error: requires editor role or above to directly edit '{slug}'."
+                return "Error: requires wiki:write:all permission to directly edit global wiki pages. Use propose_wiki_edit() instead."
 
             await wiki_service.direct_edit_page(session, page, employee.id, content_md.strip(), change_note)
             await session.commit()
+            await session.refresh(page)
 
         return f"Page `{slug}` updated to v{page.version}."
 
@@ -703,57 +749,68 @@ def register_tools(mcp: FastMCP):
     # =========================================================================
 
     @mcp.tool()
-    async def list_pending_drafts(workspace_id: Optional[str] = None) -> str:
+    async def list_pending_drafts(
+        workspace_id: Optional[str] = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> str:
         """
         List pending wiki drafts awaiting editor review.
 
         Args:
             workspace_id: Optional. Filter to a specific workspace UUID.
                           Omit to see all accessible pending drafts.
+            limit: Max drafts to return (default: 50).
+            offset: Number of drafts to skip for pagination (default: 0).
         """
         from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
         from app.database import async_session_factory
-        from app.database.models import Employee, WikiPage, WikiPageDraft
-        from app.services.permission_engine import (
-            get_workspace_role, workspace_role_can, has_any_permission, _get_user_permissions,
-        )
+        from app.database.models import Employee, WikiPageDraft
 
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         async with async_session_factory() as session:
             employee = await session.get(Employee, identity.employee_id)
             if not employee:
                 return "Error: employee not found."
 
+            # Eagerly load page and author to avoid N+1 queries
             stmt = (
                 select(WikiPageDraft)
                 .where(WikiPageDraft.status == "pending")
+                .options(
+                    selectinload(WikiPageDraft.page),
+                    selectinload(WikiPageDraft.author),
+                )
                 .order_by(WikiPageDraft.created_at.asc())
-                .limit(50)
+                # Fetch a larger batch to account for permission filtering,
+                # then apply the user-requested offset/limit after filtering.
+                .limit((offset + limit) * 4)
             )
-            drafts = (await session.execute(stmt)).scalars().all()
+            all_drafts = (await session.execute(stmt)).scalars().all()
 
             lines = []
-            for draft in drafts:
-                page = await session.get(WikiPage, draft.page_id)
+            skipped = 0
+            for draft in all_drafts:
+                page = draft.page
                 if not page:
                     continue
                 if workspace_id and str(page.scope_id) != workspace_id:
                     continue
-                # Check reviewer permission
-                can_review = employee.role == "admin"
-                if not can_review and page.scope_type == "project" and page.scope_id:
-                    role = await get_workspace_role(session, employee, page.scope_id)
-                    can_review = bool(role) and workspace_role_can(role, "editor")
-                elif not can_review:
-                    perms = _get_user_permissions(employee)
-                    can_review = "wiki:write:all" in perms
-                if not can_review:
+                if not await _can_review_page(session, employee, page):
                     continue
+                # Apply offset/limit after permission filtering
+                if skipped < offset:
+                    skipped += 1
+                    continue
+                if len(lines) >= limit:
+                    break
 
-                author = await session.get(Employee, draft.author_id) if draft.author_id else None
+                author = draft.author
                 lines.append(
                     f"- **{page.slug}** | Draft `{draft.id}` | "
                     f"by {author.name if author else 'unknown'} | "
@@ -774,16 +831,16 @@ def register_tools(mcp: FastMCP):
         Args:
             draft_id: UUID of the draft (from list_pending_drafts).
         """
-        from app.database import async_session_factory
-        from app.database.models import Employee, WikiPage, WikiPageDraft
-        from app.services.permission_engine import (
-            get_workspace_role, workspace_role_can, _get_user_permissions,
-        )
         import uuid as _uuid
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        from app.database import async_session_factory
+        from app.database.models import Employee, WikiPageDraft
 
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         try:
             did = _uuid.UUID(draft_id)
@@ -791,7 +848,14 @@ def register_tools(mcp: FastMCP):
             return "Error: invalid draft ID format."
 
         async with async_session_factory() as session:
-            draft = await session.get(WikiPageDraft, did)
+            draft = (await session.execute(
+                select(WikiPageDraft)
+                .where(WikiPageDraft.id == did)
+                .options(
+                    selectinload(WikiPageDraft.page),
+                    selectinload(WikiPageDraft.author),
+                )
+            )).scalar_one_or_none()
             if not draft:
                 return f"Draft `{draft_id}` not found."
 
@@ -799,22 +863,14 @@ def register_tools(mcp: FastMCP):
             if not employee:
                 return "Error: employee not found."
 
-            page = await session.get(WikiPage, draft.page_id)
+            page = draft.page
             if not page:
                 return "Error: parent wiki page not found."
 
-            # Permission: editor+ in workspace, or wiki:write:all, or admin
-            can_review = employee.role == "admin"
-            if not can_review and page.scope_type == "project" and page.scope_id:
-                role = await get_workspace_role(session, employee, page.scope_id)
-                can_review = bool(role) and workspace_role_can(role, "editor")
-            elif not can_review:
-                perms = _get_user_permissions(employee)
-                can_review = "wiki:write:all" in perms
-            if not can_review:
+            if not await _can_review_page(session, employee, page):
                 return "Error: insufficient permission to review drafts for this page."
 
-            author = await session.get(Employee, draft.author_id) if draft.author_id else None
+            author = draft.author
 
         return (
             f"## Draft `{draft_id}`\n"
@@ -846,17 +902,17 @@ def register_tools(mcp: FastMCP):
             edited_content_md: Optional — provide this to approve with your own edits
                                instead of the author's original content.
         """
-        from app.database import async_session_factory
-        from app.database.models import Employee, WikiPage, WikiPageDraft
-        from app.services import wiki_service
-        from app.services.permission_engine import (
-            get_workspace_role, workspace_role_can, _get_user_permissions,
-        )
         import uuid as _uuid
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        from app.database import async_session_factory
+        from app.database.models import Employee, WikiPageDraft
+        from app.services import wiki_service
 
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         try:
             did = _uuid.UUID(draft_id)
@@ -864,7 +920,11 @@ def register_tools(mcp: FastMCP):
             return "Error: invalid draft ID format."
 
         async with async_session_factory() as session:
-            draft = await session.get(WikiPageDraft, did)
+            draft = (await session.execute(
+                select(WikiPageDraft)
+                .where(WikiPageDraft.id == did)
+                .options(selectinload(WikiPageDraft.page))
+            )).scalar_one_or_none()
             if not draft:
                 return f"Draft `{draft_id}` not found."
             if draft.status != "pending":
@@ -874,18 +934,11 @@ def register_tools(mcp: FastMCP):
             if not employee:
                 return "Error: employee not found."
 
-            page = await session.get(WikiPage, draft.page_id)
+            page = draft.page
             if not page:
                 return "Error: parent wiki page not found."
 
-            can_review = employee.role == "admin"
-            if not can_review and page.scope_type == "project" and page.scope_id:
-                role = await get_workspace_role(session, employee, page.scope_id)
-                can_review = bool(role) and workspace_role_can(role, "editor")
-            elif not can_review:
-                perms = _get_user_permissions(employee)
-                can_review = "wiki:write:all" in perms
-            if not can_review:
+            if not await _can_review_page(session, employee, page):
                 return "Error: insufficient permission to approve drafts for this page."
 
             await wiki_service.approve_draft(
@@ -907,17 +960,17 @@ def register_tools(mcp: FastMCP):
             draft_id: UUID of the draft to reject.
             reviewer_note: Required explanation for the author.
         """
-        from app.database import async_session_factory
-        from app.database.models import Employee, WikiPage, WikiPageDraft
-        from app.services import wiki_service
-        from app.services.permission_engine import (
-            get_workspace_role, workspace_role_can, _get_user_permissions,
-        )
         import uuid as _uuid
+        from sqlalchemy import select
+        from sqlalchemy.orm import selectinload
+        from app.database import async_session_factory
+        from app.database.models import Employee, WikiPageDraft
+        from app.services import wiki_service
 
         identity, err = await _get_identity()
         if err:
             return err
+        assert identity is not None
 
         if not reviewer_note or not reviewer_note.strip():
             return "Error: reviewer_note is required when rejecting a draft."
@@ -928,7 +981,11 @@ def register_tools(mcp: FastMCP):
             return "Error: invalid draft ID format."
 
         async with async_session_factory() as session:
-            draft = await session.get(WikiPageDraft, did)
+            draft = (await session.execute(
+                select(WikiPageDraft)
+                .where(WikiPageDraft.id == did)
+                .options(selectinload(WikiPageDraft.page))
+            )).scalar_one_or_none()
             if not draft:
                 return f"Draft `{draft_id}` not found."
             if draft.status != "pending":
@@ -938,18 +995,11 @@ def register_tools(mcp: FastMCP):
             if not employee:
                 return "Error: employee not found."
 
-            page = await session.get(WikiPage, draft.page_id)
+            page = draft.page
             if not page:
                 return "Error: parent wiki page not found."
 
-            can_review = employee.role == "admin"
-            if not can_review and page.scope_type == "project" and page.scope_id:
-                role = await get_workspace_role(session, employee, page.scope_id)
-                can_review = bool(role) and workspace_role_can(role, "editor")
-            elif not can_review:
-                perms = _get_user_permissions(employee)
-                can_review = "wiki:write:all" in perms
-            if not can_review:
+            if not await _can_review_page(session, employee, page):
                 return "Error: insufficient permission to reject drafts for this page."
 
             await wiki_service.reject_draft(session, draft, employee.id, reviewer_note.strip())

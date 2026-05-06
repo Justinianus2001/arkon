@@ -44,6 +44,24 @@ export type WikiGraphEdge = {
   target?: WikiGraphNode | string;
 };
 
+export type DraftResponse = {
+  id: string;
+  page_id: string;
+  page_slug: string;
+  page_title: string;
+  author_id: string | null;
+  author_name: string | null;
+  content_md: string;
+  note: string | null;
+  status: string;
+  source: string;
+  reviewed_by_name: string | null;
+  reviewed_at: string | null;
+  reviewer_note: string | null;
+  created_at: string;
+  updated_at: string;
+};
+
 export type WikiGraphData = {
   nodes: WikiGraphNode[];
   edges: WikiGraphEdge[];

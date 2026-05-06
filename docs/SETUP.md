@@ -47,13 +47,15 @@ NEXT_PUBLIC_API_URL=https://your-domain.com
 docker compose up -d
 ```
 
-This starts six containers:
+This starts four containers:
 | Container | Purpose |
 |---|---|
 | `arkon_api` | FastAPI backend + MCP server (port 5055) |
 | `arkon_worker` | Background worker — document ingestion + wiki compilation |
 | `arkon_worker_skills` | Background worker — AI skill processing |
 | `arkon_frontend` | Next.js admin portal (port 3119) |
+
+Workers start only after `arkon_api` passes its health check, so there is no race condition on startup.
 
 > Note: you need to separately run PostgreSQL, Redis, and MinIO, or add them to `docker-compose.yml`. The included compose file assumes they are already available via the `DATABASE_URL`, `REDIS_HOST`, and `MINIO_ENDPOINT` env vars.
 
@@ -244,7 +246,8 @@ See [MCP & Claude](MCP.md) for the connection guide.
 | `REDIS_PASSWORD` | _(empty)_ | Redis password |
 | `WORKER_MAX_JOBS` | `3` | Max concurrent background jobs |
 | `CORS_ORIGINS` | `*` | Allowed CORS origins (comma-separated) |
-| `NEXT_PUBLIC_API_URL` | `http://localhost:5055` | API URL used by the frontend |
+| `NEXT_PUBLIC_API_URL` | `http://localhost:5055` | Public API URL (used by the browser) |
+| `INTERNAL_API_URL` | `http://api:5055` | Internal API URL used by the Next.js server for proxying (Docker only) |
 
 AI provider settings (embedding, LLM, vision, API keys) are configured through the Admin Portal → Settings, not in `.env`.
 

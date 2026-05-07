@@ -25,6 +25,3 @@ frontend/
 .ruff_cache/
 *.md
 docs/
-
-# Alembic (migrations run separately)
-alembic/

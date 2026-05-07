@@ -24,6 +24,8 @@ services:
       timeout: 5s
       retries: 5
       start_period: 20s
+    networks:
+      - dokploy-network
 
   # 2. Background worker (main queue)
   worker:
@@ -33,6 +35,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    networks:
+      - dokploy-network
 
   # 3. Background worker (skills queue)
   worker_skills:
@@ -42,6 +46,8 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    networks:
+      - dokploy-network
 
   # 4. Frontend (Next.js standalone)
   frontend:
@@ -61,3 +67,9 @@ services:
     depends_on:
       api:
         condition: service_healthy
+    networks:
+      - dokploy-network
+
+networks:
+  dokploy-network:
+    external: true

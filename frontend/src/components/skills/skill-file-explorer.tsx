@@ -87,9 +87,7 @@ export function SkillFileExplorer({ skillId, version }: SkillFileExplorerProps) 
     try {
       const query = version ? `?version=${version}` : "";
       const apiUrl = `/api/skills/${skillId}/files${query}`;
-      console.log(`[FileExplorer] Fetching files from: ${apiUrl}`);
       const data = await api<SkillFile[]>(apiUrl);
-      console.log(`[FileExplorer] [DEBUG] setFiles for version: ${version || 'latest'}`);
       setFiles(data);
       setLoadedVersion(version);
       
@@ -116,7 +114,6 @@ export function SkillFileExplorer({ skillId, version }: SkillFileExplorerProps) 
     try {
       const query = version ? `&version=${version}` : "";
       const apiUrl = `/api/skills/${skillId}/files/content?path=${encodeURIComponent(path)}${query}`;
-      console.log(`[FileExplorer] [DEBUG] fetchContent: path=${path}, version=${version || 'latest'}, url=${apiUrl}`);
       const data = await api<{ content: string }>(apiUrl);
       
       // Clean up internal markers and YAML frontmatter
@@ -135,7 +132,6 @@ export function SkillFileExplorer({ skillId, version }: SkillFileExplorerProps) 
   }, [skillId, version]);
 
   useEffect(() => {
-    console.log(`[FileExplorer] [DEBUG] version changed to: ${version || 'latest'}. Clearing state.`);
     setFiles([]);
     setLoadedVersion(undefined); // Mark as not matching any version yet
     setContent(null);
@@ -157,7 +153,6 @@ export function SkillFileExplorer({ skillId, version }: SkillFileExplorerProps) 
         if (file.size > 2 * 1024 * 1024) { // 2MB limit
           setContent("__FILE_TOO_LARGE__");
         } else {
-          console.log(`[FileExplorer] [DEBUG] useEffect trigger loadContent: ${selectedPath} (version match: ${version || 'latest'})`);
           loadContent(selectedPath);
         }
       } else {

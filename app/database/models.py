@@ -648,7 +648,10 @@ class Skill(Base):
 
     # Relationships
     departments: Mapped[list["SkillDepartment"]] = relationship(
-        back_populates="skill", cascade="all, delete-orphan"
+        "SkillDepartment",
+        back_populates="skill",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
     versions: Mapped[list["SkillVersion"]] = relationship(
         back_populates="skill", cascade="all, delete-orphan"
@@ -769,7 +772,6 @@ class AuditLog(Base):
 
 
 # ---------------------------------------------------------------------------
-<<<<<<< HEAD
 # Multi-dimension wiki page embeddings
 # ---------------------------------------------------------------------------
 # One table per supported output dimension. The active embedding model spec

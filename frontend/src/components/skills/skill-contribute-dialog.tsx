@@ -30,10 +30,11 @@ type SkillContributeDialogProps = {
   skillName?: string;
   versions?: { version_number: number }[];
   onContributionCreated: (contributionId: string) => void;
-  trigger?: React.ReactNode;
+  trigger?: React.ReactElement;
+  allDepartments?: { id: string, name: string }[];
 };
 
-export function SkillContributeDialog({ skillId, skillName, versions, onContributionCreated, trigger }: SkillContributeDialogProps) {
+export function SkillContributeDialog({ skillId, skillName, versions, onContributionCreated, trigger, allDepartments: externalDepartments }: SkillContributeDialogProps) {
   const { canAccess, hasPermission } = useAuth();
   const [isOpen, setIsOpen] = useState(false);
   const [loading, setLoading] = useState(false);
@@ -54,18 +55,19 @@ export function SkillContributeDialog({ skillId, skillName, versions, onContribu
   // New Visibility State (Matching Upload Form)
   const [scopeType, setScopeType] = useState<string>("global");
   const [deptIds, setDeptIds] = useState<string[]>([]);
-  const [allDepartments, setAllDepartments] = useState<{ id: string, name: string }[]>([]);
+  const [internalDepartments, setInternalDepartments] = useState<{ id: string, name: string }[]>([]);
+  const allDepartments = externalDepartments || internalDepartments;
 
   useEffect(() => {
-    if (!skillId) {
+    if (!skillId && !externalDepartments) {
       api<any[]>("/api/departments")
-        .then(res => setAllDepartments(Array.isArray(res) ? res : []))
+        .then(res => setInternalDepartments(Array.isArray(res) ? res : []))
         .catch(err => {
           console.error("Failed to load departments:", err);
-          setAllDepartments([]);
+          setInternalDepartments([]);
         });
     }
-  }, [skillId, hasPermission]);
+  }, [skillId, externalDepartments]);
 
   const isTitleValid = mode === "fork" || /^[a-zA-Z0-9\s\-_À-ỹ]+$/.test(title);
 
@@ -178,7 +180,7 @@ export function SkillContributeDialog({ skillId, skillName, versions, onContribu
                 <div className="grid gap-2">
                   <Label>Visibility</Label>
                   <Select value={scopeType} onValueChange={(v) => {
-                    setScopeType(v);
+                    if (v) setScopeType(v);
                     setDeptIds([]);
                   }}>
                     <SelectTrigger className="bg-secondary/5 h-11">

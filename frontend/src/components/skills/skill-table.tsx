@@ -149,7 +149,7 @@ export function SkillTable({
                         <span className="material-symbols-outlined text-muted-foreground/40 text-[16px] group-hover:scale-110 transition-transform duration-300">auto_awesome</span>
                       </div>
                       <div className="flex flex-col min-w-0">
-                        <span 
+                        <span
                           className="text-sm font-medium text-foreground truncate max-w-[400px] group-hover:text-primary transition-colors font-manrope cursor-pointer hover:underline underline-offset-4 decoration-primary/30"
                           onClick={() => onClick(skill.slug)}
                         >
@@ -217,33 +217,33 @@ export function SkillTable({
                   </TableCell>
 
                   {/* Actions */}
-                    <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
-                      {(canAccess("skill", "edit") || canAccess("skill", "delete") ) && (
-                        <DropdownMenu>
-                          <DropdownMenuTrigger className="inline-flex items-center justify-center h-8 w-8 rounded-full hover:bg-secondary text-muted-foreground transition-colors focus:outline-none">
-                            <span className="material-symbols-outlined text-lg">more_vert</span>
-                          </DropdownMenuTrigger>
-                          <DropdownMenuContent align="end" className="w-40 rounded-xl shadow-xl border-border">
-                            {canAccess("skill", "edit") && (
-                              <DropdownMenuItem onClick={() => setEditSkill(skill)} className="flex items-center gap-2 py-2.5 cursor-pointer">
-                                <span className="material-symbols-outlined text-base">edit</span>
-                                Edit Skill
-                              </DropdownMenuItem>
-                            )}
-                            {(canAccess("skill", "edit") || canAccess("skill", "delete")) && <DropdownMenuSeparator className="bg-border/50" />}
-                            {canAccess("skill", "delete") && (
-                              <DropdownMenuItem
-                                onClick={() => onDelete(skill.id, skill.name)}
-                                className="flex items-center gap-2 py-2.5 text-destructive focus:text-destructive cursor-pointer"
-                              >
-                                <span className="material-symbols-outlined text-base">delete</span>
-                                Delete
-                              </DropdownMenuItem>
-                            )}
-                          </DropdownMenuContent>
-                        </DropdownMenu>
-                      )}
-                    </TableCell>
+                  <TableCell className="text-right" onClick={(e) => e.stopPropagation()}>
+                    {(canAccess("skill", "edit") || canAccess("skill", "delete")) && (
+                      <DropdownMenu>
+                        <DropdownMenuTrigger className="inline-flex items-center justify-center h-8 w-8 rounded-full hover:bg-secondary text-muted-foreground transition-colors focus:outline-none">
+                          <span className="material-symbols-outlined text-lg">more_vert</span>
+                        </DropdownMenuTrigger>
+                        <DropdownMenuContent align="end" className="w-40 rounded-xl shadow-xl border-border">
+                          {canAccess("skill", "edit") && (
+                            <DropdownMenuItem onClick={() => setEditSkill(skill)} className="flex items-center gap-2 py-2.5 cursor-pointer">
+                              <span className="material-symbols-outlined text-base">edit</span>
+                              Edit Skill
+                            </DropdownMenuItem>
+                          )}
+                          {(canAccess("skill", "edit") || canAccess("skill", "delete")) && <DropdownMenuSeparator className="bg-border/50" />}
+                          {canAccess("skill", "delete") && (
+                            <DropdownMenuItem
+                              onClick={() => onDelete(skill.id, skill.name)}
+                              className="flex items-center gap-2 py-2.5 text-destructive focus:text-destructive cursor-pointer"
+                            >
+                              <span className="material-symbols-outlined text-base">delete</span>
+                              Delete
+                            </DropdownMenuItem>
+                          )}
+                        </DropdownMenuContent>
+                      </DropdownMenu>
+                    )}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -456,13 +456,10 @@ function UploadVersionDialog({
     const formData = new FormData();
     formData.append("file", file);
 
-    console.log(`[UploadDialog] Starting upload for skill: ${skill.name}, slug: ${skill.slug}`);
     const uploadUrl = `/api/skills/${skill.slug}/reupload`;
-    console.log(`[UploadDialog] Target URL: ${uploadUrl}`);
 
     try {
       await apiUpload(uploadUrl, formData);
-      console.log(`[UploadDialog] Upload successful`);
       onUploaded();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to upload");
@@ -490,7 +487,7 @@ function UploadVersionDialog({
           </div>
 
           <div className="w-full">
-            <Button 
+            <Button
               className="w-full h-12 rounded-xl bg-primary text-primary-foreground font-bold shadow-lg shadow-primary/20 gap-2"
               onClick={() => fileInputRef.current?.click()}
               disabled={isUploading}
@@ -502,10 +499,10 @@ function UploadVersionDialog({
               )}
               {isUploading ? "Uploading..." : "Select ZIP Package"}
             </Button>
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              className="hidden" 
+            <input
+              type="file"
+              ref={fileInputRef}
+              className="hidden"
               accept=".zip"
               onChange={handleUpload}
             />

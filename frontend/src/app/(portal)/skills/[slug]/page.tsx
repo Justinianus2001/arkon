@@ -358,12 +358,12 @@ export default function SkillDetailPage() {
               </div>
             </section>
 
-            <section>
+            {/* <section>
               <h4 className="text-xs font-bold text-muted-foreground uppercase mb-4 tracking-wider">Access</h4>
               <div className="text-xs font-mono break-all bg-secondary/30 p-4 rounded-xl border border-border text-muted-foreground leading-relaxed">
                 {skill.version_hash || "N/A"}
               </div>
-            </section>
+            </section> */}
 
             {/* Removed Contribution ZIP section from here */}
           </div>

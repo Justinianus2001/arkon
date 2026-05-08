@@ -1,18 +1,34 @@
-from app.services.permission_engine import _get_user_permissions
 import uuid
 from datetime import datetime
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, File, UploadFile, Form, Body
-from sqlalchemy.ext.asyncio import AsyncSession
-from pydantic import BaseModel
+
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    HTTPException,
+    Query,
+    UploadFile,
+)
 from loguru import logger
+from pydantic import BaseModel
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from sqlalchemy import select
-from app.database.models import Employee, SkillContribution, SkillContributionStatus, Skill, SkillVersion
-from app.services.auth_service import get_current_user, require_admin, require_permission
-from app.services.skill_service import SkillService
+from app.database.models import (
+    Employee,
+    SkillContribution,
+    SkillContributionStatus,
+    SkillVersion,
+)
 from app.routers.skills import is_text_file
+from app.services.auth_service import (
+    get_current_user,
+    require_permission,
+)
+from app.services.permission_engine import _get_user_permissions
+from app.services.skill_service import SkillService
 
 router = APIRouter()
 
@@ -158,7 +174,6 @@ async def get_skill_contribution(
     if not contribution:
         raise HTTPException(404, "Contribution not found")
     
-    from loguru import logger
     if user.role != "admin" and str(contribution.contributor_id) != str(user.id) and "skill:contribution:review" not in _get_user_permissions(user):
         logger.warning(f"[Auth] Access Denied for contribution {contribution_id}. Contributor: {contribution.contributor_id}, User: {user.id}")
         raise HTTPException(403, "Access denied")
@@ -182,7 +197,7 @@ async def delete_skill_contribution(
     if user.role != "admin" and str(contribution.contributor_id) != str(user.id):
         raise HTTPException(403, "Access denied")
     
-    if user.role != "admin" and contribution.status == "approved":
+    if user.role != "admin" and contribution.status == SkillContributionStatus.APPROVED.value:
         raise HTTPException(400, "Cannot delete an approved contribution")
 
     if contribution.storage_path:
@@ -206,6 +221,9 @@ async def list_skill_contribution_files(
     
     if user.role != "admin" and str(contribution.contributor_id) != str(user.id) and "skill:contribution:review" not in _get_user_permissions(user):
         raise HTTPException(403, "Access denied")
+
+    if contribution.status == SkillContributionStatus.APPROVED.value:
+        raise HTTPException(400, f"Cannot access contribution files in status: {contribution.status}")
     
     prefix = contribution.storage_path
     if not prefix:
@@ -217,7 +235,8 @@ async def list_skill_contribution_files(
     files = []
     for obj in objects:
         rel_path = obj.object_name.replace(prefix, "", 1)
-        if not rel_path: continue
+        if not rel_path: 
+            continue
         files.append({
             "path": rel_path,
             "size": obj.size,
@@ -265,7 +284,7 @@ async def rename_skill_contribution_file(
     if user.role != "admin" and str(contribution.contributor_id) != str(user.id):
         raise HTTPException(403, "Access denied")
     
-    if contribution.status not in [SkillContributionStatus.DRAFT.value, SkillContributionStatus.PENDING.value]:
+    if contribution.status == SkillContributionStatus.APPROVED.value:
         raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
 
     parts = old_path.strip("/").split("/")
@@ -301,7 +320,7 @@ async def delete_skill_contribution_file(
     if user.role != "admin" and str(contribution.contributor_id) != str(user.id):
         raise HTTPException(403, "Access denied")
     
-    if contribution.status not in [SkillContributionStatus.DRAFT.value, SkillContributionStatus.PENDING.value]:
+    if contribution.status == SkillContributionStatus.APPROVED.value:
         raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
 
     full_path = f"{contribution.storage_path}{path.lstrip('/')}"
@@ -330,7 +349,7 @@ async def upload_skill_contribution_file(
     if current_user.role != "admin" and str(contribution.contributor_id) != str(current_user.id):
         raise HTTPException(403, "Access denied")
     
-    if contribution.status not in [SkillContributionStatus.DRAFT.value, SkillContributionStatus.PENDING.value]:
+    if contribution.status == SkillContributionStatus.APPROVED.value:
         raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
 
     file_path = path if path else file.filename
@@ -348,6 +367,7 @@ async def upload_skill_contribution_file(
     if not root_folder:
         # Fallback to skill slug if no files exist yet
         from sqlalchemy import select
+
         from app.database.models import Skill
         if contribution.skill_id:
             skill_stmt = select(Skill).where(Skill.id == contribution.skill_id)
@@ -366,7 +386,6 @@ async def upload_skill_contribution_file(
 
     full_path = f"{contribution.storage_path}{file_path.lstrip('/')}"
     
-    from loguru import logger
     try:
         if contribution.status == SkillContributionStatus.PENDING.value:
             contribution.status = SkillContributionStatus.DRAFT.value
@@ -394,6 +413,9 @@ async def put_skill_contribution_file(
     
     if current_user.role != "admin" and str(contribution.contributor_id) != str(current_user.id):
         raise HTTPException(403, "Access denied")
+
+    if contribution.status == SkillContributionStatus.APPROVED.value:
+        raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
     
     file_path = request.path
     content = request.content
@@ -411,6 +433,7 @@ async def put_skill_contribution_file(
     if not root_folder:
         # Fallback to skill slug if no files exist yet
         from sqlalchemy import select
+
         from app.database.models import Skill
         if contribution.skill_id:
             skill_stmt = select(Skill).where(Skill.id == contribution.skill_id)
@@ -443,6 +466,13 @@ async def submit_skill_contribution(
     user: Employee = Depends(get_current_user),
 ):
     """Submit skill contribution for review."""
+    contribution = await db.get(SkillContribution, contribution_id)
+    if not contribution:
+        raise HTTPException(404, "Contribution not found")
+    
+    if contribution.status == SkillContributionStatus.APPROVED.value:
+        raise HTTPException(400, "Contribution already approved")
+
     contribution = await SkillService.submit_contribution(db, contribution_id)
     return {"status": contribution.status}
 
@@ -458,6 +488,9 @@ async def approve_skill_contribution(
     Enforces department-level review for non-admin users if scope is 'department'.
     """
     contribution = await db.get(SkillContribution, contribution_id)
+    if contribution.status in [SkillContributionStatus.APPROVED.value,SkillContributionStatus.REJECTED.value,]:
+        raise HTTPException(400, "Contribution already approved")
+    
     if not contribution:
         raise HTTPException(404, "Contribution not found")
 
@@ -500,6 +533,9 @@ async def reject_skill_contribution(
 ):
     """Reject a skill contribution request (moves back to draft)."""
     contribution = await SkillService.reject_contribution(db, contribution_id)
+    if contribution.status in [SkillContributionStatus.APPROVED.value,SkillContributionStatus.REJECTED.value]:
+        raise HTTPException(400, "Contribution already approved")
+    
     return {"status": contribution.status}
 
 @router.get("/skill-contributions/{contribution_id}/diff-status")
@@ -570,7 +606,6 @@ async def get_skill_contribution_diff_status(
     # If roots match (both have it or both don't), simple comparison
     # If roots differ, we should try to match paths by stripping/adding roots
     
-    all_norm_paths = set()
     def get_norm(p, root):
         if root and (p.startswith(root + "/") or p == root):
             return p[len(root):].lstrip("/")
@@ -583,7 +618,8 @@ async def get_skill_contribution_diff_status(
     all_norms = set(norm_to_contrib.keys()) | set(norm_to_base.keys())
     
     for norm in all_norms:
-        if not norm: continue
+        if not norm: 
+            continue
         
         p_contrib = norm_to_contrib.get(norm)
         p_base = norm_to_base.get(norm)

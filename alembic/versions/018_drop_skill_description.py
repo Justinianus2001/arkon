@@ -1,7 +1,7 @@
 """skill and contribution refactor
 
-Revision ID: 014
-Revises: 013
+Revision ID: 018
+Revises: 017
 Create Date: 2026-05-08 10:00:00.000000
 
 """
@@ -9,12 +9,13 @@ Create Date: 2026-05-08 10:00:00.000000
 from typing import Sequence, Union
 
 import sqlalchemy as sa
-from alembic import op
 from sqlalchemy.dialects import postgresql
 
+from alembic import op
+
 # revision identifiers
-revision: str = '014'
-down_revision: Union[str, None] = '013'
+revision: str = '018'
+down_revision: Union[str, None] = '017'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -181,7 +182,6 @@ def upgrade() -> None:
                existing_type=sa.UUID(),
                comment='Project/workspace ID. Null for global scope.',
                existing_nullable=True)
-    op.drop_index(op.f('ix_wiki_pages_embedding_hnsw'), table_name='wiki_pages', postgresql_ops={'embedding': 'vector_cosine_ops'}, postgresql_with={'m': '16', 'ef_construction': '64'}, postgresql_using='hnsw')
     op.drop_index(op.f('ix_wiki_pages_fulltext'), table_name='wiki_pages', postgresql_using='gin')
     op.drop_index(op.f('ix_wiki_pages_kt_slugs'), table_name='wiki_pages', postgresql_using='gin')
     op.drop_index(op.f('ix_wiki_pages_source_ids'), table_name='wiki_pages', postgresql_using='gin')

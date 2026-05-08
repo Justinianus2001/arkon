@@ -54,7 +54,7 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
   const [uploadTargetPath, setUploadTargetPath] = useState<string | null>(null);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
   const [diffStatus, setDiffStatus] = useState<Record<string, string>>({});
-
+  const [error, setError] = useState<string | null>(null);
   const loadDiffStatus = useCallback(async () => {
     try {
       const data = await api<Record<string, string>>(`/api/skill-contributions/${contributionId}/diff-status`);
@@ -195,8 +195,9 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
   }, [displayFiles]);
 
 
-  const loadFiles = useCallback(async () => {
+    const loadFiles = useCallback(async () => {
     setLoading(true);
+    setError(null);
     try {
       const data = await api<SkillFile[]>(`/api/skill-contributions/${contributionId}/files`);
       setFiles(data);
@@ -205,13 +206,20 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
         if (readme) setSelectedPath(readme.path);
         else setSelectedPath(data[0].path);
       }
-    } catch (err) {
+    } catch (err: any) {
       console.error("Failed to load contribution files:", err);
+      // Kiểm tra lỗi 400 từ Backend
+      if (err.status === 400) {
+        window.location.reload();
+      } else {
+        setError("An error occurred while loading files.");
+      }
     } finally {
       setLoading(false);
       loadDiffStatus();
     }
   }, [contributionId, selectedPath, loadDiffStatus]);
+
 
   const loadContent = useCallback(async (path: string) => {
     setContentLoading(true);
@@ -240,13 +248,6 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
       const isAdmin = user?.role === "admin";
       const canReview = hasPermission("skill:contribution:review");
 
-      console.log("[Diff] Checking conditions:", {
-        isPending,
-        isAdmin,
-        canReview,
-        skill_id: contribution?.skill_id,
-        base_version: contribution?.base_version
-      });
 
       if (contribution && (isPending || isAdmin || canReview) && contribution.skill_id) {
 
@@ -256,7 +257,6 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
           normalizedPath = path.replace(rootFolderName + "/", "");
         }
 
-        console.log("[Diff] Fetching original content for:", { path, normalizedPath, rootFolderName });
 
         try {
           // Try original path first
@@ -337,7 +337,6 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
     const currentContent = contentRef.current;
     if (!selectedPath || mode !== "edit" || currentContent === null || currentContent === lastSavedContent) return;
 
-    console.log(`[AutoSave] Saving ${selectedPath}...`);
     setSaveStatus("saving");
     try {
       await api(`/api/skill-contributions/${contributionId}/files`, {
@@ -347,7 +346,6 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
           content: currentContent,
         },
       });
-      console.log(`[AutoSave] Saved ${selectedPath}`);
       setLastSavedContent(currentContent);
       setSaveStatus("saved");
       loadDiffStatus();
@@ -652,6 +650,19 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
       );
     });
   };
+  if (error) {
+    return (
+      <div className="flex flex-col items-center justify-center h-full p-8 text-center bg-card">
+        <div className="w-16 h-16 rounded-full bg-amber-100 flex items-center justify-center mb-4">
+          <span className="material-symbols-outlined text-amber-600 text-3xl">lock</span>
+        </div>
+        <h3 className="text-lg font-bold text-foreground mb-2">Read Only Mode</h3>
+        <p className="text-sm text-muted-foreground max-w-md">
+          {error}
+        </p>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -675,11 +686,7 @@ export function SkillEditor({ contributionId, onSubmitted, onStatusChange, mode 
           <div className="flex-1 overflow-y-auto p-3 no-scrollbar">
             {loading ? <div className="p-4 text-xs opacity-50">Loading...</div> : renderTree(fileTree)}
           </div>
-          <div className="p-4 border-t border-border">
-            <p className="text-[10px] text-muted-foreground text-center italic">
-              Use the "Submit" button above to finish.
-            </p>
-          </div>
+          
         </div>
 
         {/* Main Area */}

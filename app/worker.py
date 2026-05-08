@@ -16,8 +16,8 @@ from typing import Optional
 from arq import cron
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from loguru import logger
-
 from sqlalchemy import select
+
 from app.config import settings
 
 
@@ -400,7 +400,6 @@ async def ingest_skill_task(ctx: dict, skill_id: str, version_id: str, file_path
                 return
 
             import asyncio
-            import hashlib
 
             from app.services.kb_service import _guess_content_type
 
@@ -410,7 +409,6 @@ async def ingest_skill_task(ctx: dict, skill_id: str, version_id: str, file_path
 
             total_size = 0
             file_count = 0
-            readme_content = None
 
             upload_tasks = []
             semaphore = asyncio.Semaphore(10)
@@ -451,8 +449,6 @@ async def ingest_skill_task(ctx: dict, skill_id: str, version_id: str, file_path
                     if filename.lower() == target_readme or filename.lower().endswith("/skill.md"):
                         with zf.open(member) as f:
                             content = f.read()
-                            readme_content = content.decode("utf-8", errors="ignore")
-                            logger.info(f"Found SKILL.md in {filename}")
                         
                         storage_service.upload_file(
                             object_name=object_name,

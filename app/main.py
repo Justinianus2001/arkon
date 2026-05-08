@@ -118,14 +118,13 @@ from app.routers import (  # noqa: E402
     projects,
     rbac,
     roles,
-    skills,
     skill_contributions,
+    skills,
     sources,
     wiki,
     wiki_drafts,
     wiki_images,
 )
-
 
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(sources.router, prefix="/api", tags=["sources"])

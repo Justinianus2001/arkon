@@ -71,16 +71,7 @@ export function MySkillContributions({ onEdit, onRefreshNeeded, departments, ref
     loadContributions();
   }, [loadContributions]);
 
-  // Polling logic
-  useEffect(() => {
-    if (refreshInterval <= 0) return;
-
-    const interval = setInterval(() => {
-      loadContributions();
-    }, refreshInterval);
-
-    return () => clearInterval(interval);
-  }, [loadContributions, refreshInterval]);
+  // Polling logic removed by user request
 
   const handleDelete = async (id: string) => {
     if (!confirm("Are you sure you want to delete this contribution?")) return;
@@ -115,11 +106,11 @@ export function MySkillContributions({ onEdit, onRefreshNeeded, departments, ref
         <Table>
           <TableHeader className="bg-secondary/5">
             <TableRow className="hover:bg-transparent border-border/40">
-              <TableHead className="w-[30%] h-11 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/80 pl-6">Contribution Proposal</TableHead>
-              <TableHead className="w-[15%] h-11 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/80">Visibility</TableHead>
-              <TableHead className="w-[20%] h-11 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/80">Departments</TableHead>
-              <TableHead className="w-[10%] h-11 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/80">Status</TableHead>
-              <TableHead className="w-[15%] h-11 text-[10px] font-bold uppercase tracking-widest text-muted-foreground/80">Updated</TableHead>
+              <TableHead className="w-[30%] h-11 text-[11px] font-bold uppercase tracking-wider text-muted-foreground pl-6">Contribution Proposal</TableHead>
+              <TableHead className="w-[15%] h-11 text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Visibility</TableHead>
+              <TableHead className="w-[20%] h-11 text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Departments</TableHead>
+              <TableHead className="w-[10%] h-11 text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Status</TableHead>
+              <TableHead className="w-[15%] h-11 text-[11px] font-bold uppercase tracking-wider text-muted-foreground">Updated</TableHead>
               <TableHead className="w-[10%] h-11 text-right pr-6"></TableHead>
             </TableRow>
           </TableHeader>
@@ -134,8 +125,8 @@ export function MySkillContributions({ onEdit, onRefreshNeeded, departments, ref
                       </span>
                     </div>
                     <div className="flex flex-col min-w-0">
-                      <span 
-                        className="text-sm font-semibold text-foreground truncate max-w-[250px] group-hover:text-primary transition-colors font-manrope cursor-pointer hover:underline underline-offset-4 decoration-primary/30"
+                      <span
+                        className="text-sm font-medium text-foreground truncate max-w-[250px] group-hover:text-primary transition-colors font-manrope cursor-pointer hover:underline underline-offset-4 decoration-primary/30"
                         onClick={() => {
                           if (c.status === "approved") {
                             setContributions(prev => prev.filter(item => item.id !== c.id));
@@ -160,37 +151,37 @@ export function MySkillContributions({ onEdit, onRefreshNeeded, departments, ref
                       c.scope_ids.map((id) => {
                         const dept = departments.find(d => d.id === id);
                         return (
-                          <div key={id} className="flex items-center gap-1 text-[9px] text-muted-foreground font-semibold uppercase tracking-wider bg-secondary/30 px-1.5 py-0.5 rounded-md shrink-0 whitespace-nowrap">
+                          <div key={id} className="flex items-center gap-1 text-[10px] text-muted-foreground font-semibold uppercase tracking-wider bg-secondary/30 px-1.5 py-0.5 rounded-md shrink-0 whitespace-nowrap">
                             <span className="material-symbols-outlined text-[12px]">corporate_fare</span>
                             {dept?.name || "Loading..."}
                           </div>
                         );
                       })
                     ) : (
-                      <div className="flex items-center gap-1 text-[9px] text-muted-foreground font-semibold uppercase tracking-wider">
+                      <div className="flex items-center gap-1 text-[10px] text-muted-foreground font-semibold uppercase tracking-wider">
                         <span className="material-symbols-outlined text-[12px]">public</span>
                         Global
                       </div>
                     )}
                   </div>
                 </TableCell>
-                
+
                 <TableCell>
                   <div className="flex items-center gap-2">
                     <span className={cn(
                       "w-2 h-2 rounded-full",
                       c.status === "draft" ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.4)]" :
-                      c.status === "pending" ? "bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.4)]" :
-                      "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.4)]"
+                        c.status === "pending" ? "bg-blue-500 shadow-[0_0_8px_rgba(59,130,246,0.4)]" :
+                          "bg-destructive shadow-[0_0_8px_rgba(239,68,68,0.4)]"
                     )} />
-                    <span className="text-[10px] font-bold uppercase tracking-widest text-muted-foreground/70">
+                    <span className="text-[11px] font-bold uppercase tracking-widest text-muted-foreground/70">
                       {c.status}
                     </span>
                   </div>
                 </TableCell>
 
                 <TableCell>
-                  <span className="text-[10px] font-medium text-muted-foreground/60 uppercase tracking-tighter">
+                  <span className="text-xs text-muted-foreground tabular-nums font-manrope">
                     {formatDateTime(c.updated_at)}
                   </span>
                 </TableCell>
@@ -201,7 +192,7 @@ export function MySkillContributions({ onEdit, onRefreshNeeded, departments, ref
                       <span className="material-symbols-outlined text-lg">more_vert</span>
                     </DropdownMenuTrigger>
                     <DropdownMenuContent align="end" className="w-40 rounded-xl shadow-xl border-border">
-                      <DropdownMenuItem 
+                      <DropdownMenuItem
                         onClick={() => {
                           if (c.status === "approved") {
                             setContributions(prev => prev.filter(item => item.id !== c.id));
@@ -214,7 +205,7 @@ export function MySkillContributions({ onEdit, onRefreshNeeded, departments, ref
                         <span className="material-symbols-outlined text-base text-primary">edit</span>
                         Continue Editing
                       </DropdownMenuItem>
-                      <DropdownMenuItem 
+                      <DropdownMenuItem
                         onClick={() => handleDelete(c.id)}
                         className="flex items-center gap-2 py-2.5 text-destructive focus:text-destructive cursor-pointer"
                       >

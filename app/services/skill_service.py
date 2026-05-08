@@ -12,11 +12,16 @@ from sqlalchemy import and_, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.database.models import Skill, SkillVersion, Department, SkillDepartment, SkillContribution, SkillContributionStatus, Employee
+from app.database.models import (
+    Employee,
+    Skill,
+    SkillContribution,
+    SkillContributionStatus,
+    SkillDepartment,
+    SkillVersion,
+)
 from app.services.storage_service import storage_service
-
 from app.utils.text import slugify
-from app.config import settings
 from app.worker import get_arq_pool
 
 
@@ -753,7 +758,7 @@ class SkillService:
         return contribution
 
     @staticmethod
-<<<<<<< HEAD
+
     async def bulk_change_scope(
         db: AsyncSession, 
         skill_ids: List[uuid.UUID], 
@@ -778,13 +783,15 @@ class SkillService:
             for skill_id in skill_ids:
                 for d_id in dept_ids:
                     db.add(SkillDepartment(skill_id=skill_id, department_id=d_id))
-=======
+        await db.commit()
+        return len(skill_ids)
+
+    @staticmethod
     async def submit_contribution(db: AsyncSession, contribution_id: uuid.UUID):
         contribution = await db.get(SkillContribution, contribution_id)
         if not contribution:
             raise HTTPException(404, "Contribution not found")
         contribution.status = SkillContributionStatus.PENDING.value
->>>>>>> 3a0283a (update: add skill contribute)
         await db.commit()
         return contribution
 
@@ -817,7 +824,7 @@ class SkillService:
             if v_dup_res.scalars().first():
                 contribution.status = SkillContributionStatus.REJECTED.value
                 await db.commit()
-                raise HTTPException(400, f"This contribution is identical to an existing version of the skill.")
+                raise HTTPException(400, "This contribution is identical to an existing version of the skill.")
 
         # 2. Determine final scope and departments
         # Use provided final values, otherwise fallback to contribution values
@@ -848,6 +855,7 @@ class SkillService:
         # Clear existing and add new if scope is department
         if scope_type == "department" and scope_ids:
             from sqlalchemy import delete
+
             from app.database.models import SkillDepartment
             # Remove old links (if updating)
             await db.execute(delete(SkillDepartment).where(SkillDepartment.skill_id == skill.id))
@@ -860,6 +868,7 @@ class SkillService:
                 skill.scope_id = scope_ids[0]
         elif scope_type == "global":
             from sqlalchemy import delete
+
             from app.database.models import SkillDepartment
             await db.execute(delete(SkillDepartment).where(SkillDepartment.skill_id == skill.id))
             skill.scope_id = None
@@ -971,7 +980,8 @@ class SkillService:
                 has_single_root = len(first_segments) == 1 and all('/' in p for p in all_files)
                 
                 for member in zf.infolist():
-                    if member.is_dir(): continue
+                    if member.is_dir(): 
+                        continue
                     
                     # Extract content
                     with zf.open(member) as f:

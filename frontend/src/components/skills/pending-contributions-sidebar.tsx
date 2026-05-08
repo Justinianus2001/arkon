@@ -57,16 +57,7 @@ export function PendingContributionsSidebar({
     loadPending();
   }, [loadPending]);
 
-  // Polling logic
-  useEffect(() => {
-    if (refreshInterval <= 0) return;
-
-    const interval = setInterval(() => {
-      loadPending();
-    }, refreshInterval);
-
-    return () => clearInterval(interval);
-  }, [loadPending, refreshInterval]);
+  // Polling logic removed by user request
 
   if (contributions.length === 0) return null;
 
@@ -87,7 +78,6 @@ export function PendingContributionsSidebar({
           <button
             key={c.id}
             onClick={() => {
-              console.log("[DEBUG] Reviewing contribution:", c);
               onReview(c.id);
             }}
             className="group flex flex-col items-start gap-0.5 px-3 py-2.5 rounded-xl transition-all duration-300 text-left hover:bg-secondary/40 border border-transparent hover:border-border/40"

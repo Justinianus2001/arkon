@@ -8,11 +8,12 @@ Create Date: 2026-05-06 21:08:05.082274
 from typing import Sequence, Union
 
 import sqlalchemy as sa
+
 from alembic import op
 
 # revision identifiers
-revision: str = '013'
-down_revision: Union[str, None] = '012'
+revision: str = '017'
+down_revision: Union[str, None] = '016'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

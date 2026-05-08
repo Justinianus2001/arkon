@@ -335,9 +335,11 @@ async def get_skill_file_content(
         def join_paths(*parts):
             res = ""
             for p in parts:
-                if not p: continue
+                if not p: 
+                    continue
                 p = p.strip("/")
-                if not p: continue
+                if not p: 
+                    continue
                 res = f"{res}/{p}" if res else p
             return res
 

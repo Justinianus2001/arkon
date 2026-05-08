@@ -228,6 +228,7 @@ export default function SkillsPage() {
             {canAccess("skill", "create") && (
               <ContributeDialog
                 onContributionCreated={(id) => setActiveContributionId(id)}
+                allDepartments={allDepartments}
                 trigger={
                   <Button variant="outline" className="gap-2 border-primary/20 hover:bg-primary/5 text-primary">
                     <span className="material-symbols-outlined text-sm">edit_square</span>

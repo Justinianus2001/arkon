@@ -1,19 +1,38 @@
 "use client";
 
 import React from "react";
+import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
-import {
-  forceSimulation,
-  forceLink,
-  forceManyBody,
-  forceCenter,
-  forceCollide,
-  forceX,
-  forceY,
-} from "d3-force";
+import { forceX, forceY } from "d3-force";
 import { wikiTypeColor, wikiTypeGroupLabel, wikiTypeIcon } from "../wiki-type-badge";
-import { GraphNode, GraphLink, NodeInput } from "./types";
-import { convexHull, hullToPath, scopeColor, nodeRadius } from "./utils";
+import { NodeInput } from "./types";
+import { convexHull, scopeColor, nodeRadius } from "./utils";
+
+// react-force-graph-2d uses canvas APIs (no SSR).
+const ForceGraph2D = dynamic(() => import("react-force-graph-2d"), {
+  ssr: false,
+  loading: () => null,
+}) as any;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type ForceGraphInstance = any;
+
+type Node = NodeInput & {
+  id: string;
+  degree: number;
+  // Populated by d3-force runtime:
+  x?: number;
+  y?: number;
+  fx?: number;
+  fy?: number;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  __targetX?: number;
+};
+
+type Link = {
+  source: string | Node;
+  target: string | Node;
+};
 
 type Props = {
   nodes: NodeInput[];
@@ -27,6 +46,7 @@ type Props = {
 const EDGE_COLOR = "rgba(120,112,106,0.35)";
 const EDGE_HIGHLIGHT = "#c2652a";
 const LABEL_COLOR = "#3a302a";
+const BG_COLOR = "#faf5ee";
 
 export function WikiGraph({
   nodes: rawNodes,
@@ -37,12 +57,16 @@ export function WikiGraph({
   onNodeClick,
 }: Props) {
   const router = useRouter();
-  const svgRef = React.useRef<SVGSVGElement>(null);
   const containerRef = React.useRef<HTMLDivElement>(null);
+  const fgRef = React.useRef<ForceGraphInstance>(null);
   const [dimensions, setDimensions] = React.useState({ w: 800, h: height ?? 400 });
-  const [simNodes, setSimNodes] = React.useState<GraphNode[]>([]);
-  const [simLinks, setSimLinks] = React.useState<GraphLink[]>([]);
-  const [hoveredSlug, setHoveredSlug] = React.useState<string | null>(null);
+  // Hover state lives in a ref so canvas redraw callbacks can read it without
+  // re-rendering the whole component (which would otherwise reset the sim).
+  // We mirror it into a state value (`hoverVersion`) only to drive the tooltip
+  // overlay's HTML render — bumping a counter is cheaper than a string update.
+  const hoveredIdRef = React.useRef<string | null>(null);
+  const [hoverVersion, setHoverVersion] = React.useState(0);
+  const hoveredId = hoveredIdRef.current;
   const [tooltip, setTooltip] = React.useState<{
     x: number;
     y: number;
@@ -52,17 +76,8 @@ export function WikiGraph({
     scopeType?: string;
     scopeName?: string | null;
   } | null>(null);
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const simulationRef = React.useRef<any>(null);
 
-  // Zoom & pan state
-  const [zoom, setZoom] = React.useState(1);
-  const [pan, setPan] = React.useState({ x: 0, y: 0 });
-  const [settled, setSettled] = React.useState(false);
-  const isPanningRef = React.useRef(false);
-  const panStartRef = React.useRef({ x: 0, y: 0, panX: 0, panY: 0 });
-
-  // Measure container
+  // Measure container.
   React.useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -75,455 +90,444 @@ export function WikiGraph({
     return () => obs.disconnect();
   }, [height]);
 
-  // Persistent refs for simulation nodes/links (used in progressive/incremental mode)
-  const nodesRef = React.useRef<GraphNode[]>([]);
-  const linksRef = React.useRef<GraphLink[]>([]);
-  const knownSlugsRef = React.useRef<Set<string>>(new Set());
-  const prevRawNodesLenRef = React.useRef(0);
+  // Persistent map of node objects keyed by id. We mutate these in place
+  // across re-renders so react-force-graph keeps the simulation's internal
+  // state (vx, vy, x, y, alpha) intact when only the hover state changes.
+  const nodeMapRef = React.useRef<Map<string, Node>>(new Map());
 
-  // Build / update simulation
-  React.useEffect(() => {
-    if (rawNodes.length === 0) return;
-
+  // Build graph data + adjacency (memo so the simulation only re-warms when
+  // raw inputs change, not on every parent render).
+  const { nodes, links, adjacency, components, componentTargetX } = React.useMemo(() => {
     const degreeMap = new Map<string, number>();
     for (const e of rawEdges) {
       degreeMap.set(e.from, (degreeMap.get(e.from) ?? 0) + 1);
       degreeMap.set(e.to, (degreeMap.get(e.to) ?? 0) + 1);
     }
-
-    // Detect if this is a full data reset (new page / mini mode) vs incremental batch
-    const isFullReset = mini || rawNodes.length <= prevRawNodesLenRef.current;
-    if (isFullReset) {
-      // Full rebuild — clear refs
-      nodesRef.current = [];
-      linksRef.current = [];
-      knownSlugsRef.current.clear();
-    }
-    prevRawNodesLenRef.current = rawNodes.length;
-
-    // Identify new nodes not already in the simulation
-    const newInputs = rawNodes.filter((n) => !knownSlugsRef.current.has(n.slug));
-    if (newInputs.length === 0 && simulationRef.current) {
-      // Only dimension change — update forceX/Y targets and reheat slightly
-      const fx = simulationRef.current.force("x") as ReturnType<typeof forceX> | undefined;
-      const fy = simulationRef.current.force("y") as ReturnType<typeof forceY> | undefined;
-      if (fx) fx.x(dimensions.w / 2);
-      if (fy) fy.y(dimensions.h / 2);
-      simulationRef.current.alpha(0.1).restart();
-      return;
-    }
-
-    // Compute centroid of existing nodes (fallback to center)
-    const existing = nodesRef.current.filter((n) => n.x !== undefined);
-    const cx = existing.length > 0
-      ? existing.reduce((s, n) => s + n.x!, 0) / existing.length
-      : dimensions.w / 2;
-    const cy = existing.length > 0
-      ? existing.reduce((s, n) => s + n.y!, 0) / existing.length
-      : dimensions.h / 2;
-
-    // Create new GraphNode objects, positioned near neighbors or centroid
-    const nodeBySlug = new Map(nodesRef.current.map((n) => [n.slug, n]));
-    for (const n of newInputs) {
-      let spawnX = cx + (Math.random() - 0.5) * 60;
-      let spawnY = cy + (Math.random() - 0.5) * 60;
-
-      // Find a connected neighbor that already exists to spawn near it
-      for (const e of rawEdges) {
-        if (e.from === n.slug && nodeBySlug.has(e.to)) {
-          const neighbor = nodeBySlug.get(e.to)!;
-          if (neighbor.x !== undefined) {
-            spawnX = neighbor.x + (Math.random() - 0.5) * 40;
-            spawnY = neighbor.y! + (Math.random() - 0.5) * 40;
-            break;
-          }
-        }
-        if (e.to === n.slug && nodeBySlug.has(e.from)) {
-          const neighbor = nodeBySlug.get(e.from)!;
-          if (neighbor.x !== undefined) {
-            spawnX = neighbor.x + (Math.random() - 0.5) * 40;
-            spawnY = neighbor.y! + (Math.random() - 0.5) * 40;
-            break;
-          }
-        }
+    // Reuse existing Node objects when possible so simulation state persists.
+    const seen = new Set<string>();
+    const nodes: Node[] = rawNodes.map((n) => {
+      const existing = nodeMapRef.current.get(n.slug);
+      const degree = degreeMap.get(n.slug) ?? 0;
+      seen.add(n.slug);
+      if (existing) {
+        existing.title = n.title;
+        existing.page_type = n.page_type;
+        existing.scope_type = n.scope_type;
+        existing.scope_name = n.scope_name;
+        existing.degree = degree;
+        return existing;
       }
-
-      const node: GraphNode = {
-        slug: n.slug,
-        title: n.title,
-        page_type: n.page_type,
-        scope_type: n.scope_type,
-        scope_name: n.scope_name,
-        degree: degreeMap.get(n.slug) ?? 0,
-        x: spawnX,
-        y: spawnY,
-        fx: n.slug === centerSlug ? dimensions.w / 2 : undefined,
-        fy: n.slug === centerSlug ? dimensions.h / 2 : undefined,
-      };
-      nodesRef.current.push(node);
-      nodeBySlug.set(n.slug, node);
-      knownSlugsRef.current.add(n.slug);
+      const fresh: Node = { ...n, id: n.slug, degree };
+      nodeMapRef.current.set(n.slug, fresh);
+      return fresh;
+    });
+    // Drop nodes that disappeared from input.
+    for (const id of nodeMapRef.current.keys()) {
+      if (!seen.has(id)) nodeMapRef.current.delete(id);
     }
+    const ids = new Set(nodes.map((n) => n.id));
+    const links: Link[] = rawEdges
+      .filter((e) => ids.has(e.from) && ids.has(e.to))
+      .map((e) => ({ source: e.from, target: e.to }));
 
-    // Update degree for all
-    for (const n of nodesRef.current) {
-      n.degree = degreeMap.get(n.slug) ?? 0;
-    }
-
-    // Rebuild links from ALL edges, only where both endpoints exist
-    linksRef.current = rawEdges
-      .map((e) => ({ ...e, source: nodeBySlug.get(e.from)!, target: nodeBySlug.get(e.to)! }))
-      .filter((l) => l.source && l.target);
-
-    const nodes = nodesRef.current;
-    const links = linksRef.current;
-
-    // --- Detect connected components via BFS to separate clusters ---
-    const slugToComponent = new Map<string, number>();
-    let componentId = 0;
-    const adjacency = new Map<string, Set<string>>();
-    for (const n of nodes) adjacency.set(n.slug, new Set());
+    // Adjacency for hover-neighbour highlighting.
+    const adj = new Map<string, Set<string>>();
+    for (const n of nodes) adj.set(n.id, new Set());
     for (const l of links) {
-      const s = typeof l.source === "string" ? l.source : (l.source as GraphNode).slug;
-      const t = typeof l.target === "string" ? l.target : (l.target as GraphNode).slug;
-      adjacency.get(s)?.add(t);
-      adjacency.get(t)?.add(s);
+      const s = typeof l.source === "string" ? l.source : l.source.id;
+      const t = typeof l.target === "string" ? l.target : l.target.id;
+      adj.get(s)?.add(t);
+      adj.get(t)?.add(s);
     }
+
+    // Connected components → spread along X so disconnected clusters separate.
+    const compOf = new Map<string, number>();
+    let cid = 0;
     for (const n of nodes) {
-      if (slugToComponent.has(n.slug)) continue;
-      const queue = [n.slug];
-      while (queue.length > 0) {
-        const cur = queue.pop()!;
-        if (slugToComponent.has(cur)) continue;
-        slugToComponent.set(cur, componentId);
-        for (const neighbor of adjacency.get(cur) ?? []) {
-          if (!slugToComponent.has(neighbor)) queue.push(neighbor);
+      if (compOf.has(n.id)) continue;
+      const stack = [n.id];
+      while (stack.length > 0) {
+        const cur = stack.pop()!;
+        if (compOf.has(cur)) continue;
+        compOf.set(cur, cid);
+        for (const nb of adj.get(cur) ?? []) {
+          if (!compOf.has(nb)) stack.push(nb);
         }
       }
-      componentId++;
+      cid++;
     }
-
-    // Compute per-component target X positions (spread across canvas)
-    const numComponents = componentId;
-    const componentTargetX = new Map<number, number>();
-    for (let i = 0; i < numComponents; i++) {
-      const margin = dimensions.w * 0.15;
-      componentTargetX.set(
-        i,
-        numComponents <= 1
-          ? dimensions.w / 2
-          : margin + ((dimensions.w - 2 * margin) * i) / (numComponents - 1)
-      );
-    }
-    // Assign per-node target
-    for (const n of nodes) {
-      (n as any)._targetX = componentTargetX.get(slugToComponent.get(n.slug) ?? 0) ?? dimensions.w / 2;
-    }
-
-    // Stop previous simulation if any
-    if (simulationRef.current) {
-      simulationRef.current.stop();
-    }
-
-    const sim = forceSimulation<GraphNode>(nodes)
-      .force(
-        "link",
-        forceLink<GraphNode, GraphLink>(links)
-          .id((d) => (d as GraphNode).slug)
-          .distance(mini ? 40 : 80)
-          .strength(0.4)
-      )
-      .force("charge", forceManyBody().strength(mini ? -60 : -250))
-      // Per-cluster X target so disconnected clusters separate
-      .force("x", forceX<GraphNode>((d: any) => d._targetX ?? dimensions.w / 2).strength(0.05))
-      .force("y", forceY<GraphNode>(dimensions.h / 2).strength(0.03))
-      .force("collide", forceCollide<GraphNode>((d) => nodeRadius(d.degree ?? 0, mini) + 6))
-      .alphaDecay(0.05)
-      .alphaMin(0.008)
-      .velocityDecay(0.5)
-      .alpha(isFullReset ? 1 : 0.3);
-
-    sim.on("tick", () => {
-      setSimNodes([...nodes]);
-      setSimLinks([...links]);
-    });
-
-    sim.on("end", () => {
-      setSettled(true);
-    });
-
-    // Reset settled state on full reset
-    if (isFullReset) setSettled(false);
-
-    simulationRef.current = sim;
-  }, [rawNodes, rawEdges, centerSlug, dimensions.w, dimensions.h, mini]);
-
-  // Cleanup on unmount
-  React.useEffect(() => {
-    return () => {
-      simulationRef.current?.stop();
-      nodesRef.current = [];
-      linksRef.current = [];
-      knownSlugsRef.current.clear();
+    return {
+      nodes,
+      links,
+      adjacency: adj,
+      components: compOf,
+      componentTargetX: cid,
     };
+  }, [rawNodes, rawEdges]);
+
+  // Wire custom forces + pin centerSlug + cluster X spread once per dataset.
+  React.useEffect(() => {
+    const fg = fgRef.current;
+    if (!fg || nodes.length === 0) return;
+
+    // Spread components horizontally so they don't all collide into one blob.
+    const margin = dimensions.w * 0.15;
+    const usable = Math.max(dimensions.w - 2 * margin, 1);
+    for (const n of nodes) {
+      const c = components.get(n.id) ?? 0;
+      n.__targetX =
+        componentTargetX <= 1
+          ? dimensions.w / 2
+          : margin + (usable * c) / (componentTargetX - 1);
+    }
+
+    fg.d3Force(
+      "x",
+      forceX<Node>((d: Node) => d.__targetX ?? dimensions.w / 2).strength(0.05)
+    );
+    fg.d3Force("y", forceY<Node>(dimensions.h / 2).strength(0.03));
+
+    // Charge stronger for hub nodes so leaves don't pile up on top.
+    const charge = fg.d3Force("charge");
+    if (charge) {
+      charge.strength((d: Node) => (mini ? -60 : -120) * Math.sqrt((d.degree ?? 0) + 1));
+    }
+    const link = fg.d3Force("link");
+    if (link) link.distance(mini ? 35 : 70).strength(0.4);
+
+    // Pin the center node so the graph orbits around it.
+    for (const n of nodes) {
+      if (n.id === centerSlug) {
+        n.fx = dimensions.w / 2;
+        n.fy = dimensions.h / 2;
+      } else {
+        n.fx = undefined;
+        n.fy = undefined;
+      }
+    }
+
+    fg.d3ReheatSimulation();
+  }, [nodes, components, componentTargetX, centerSlug, dimensions.w, dimensions.h, mini]);
+
+  // Auto fit-to-canvas when the simulation cools down (only the first time
+  // per dataset — refitting on every reheat fights the user's manual pan/zoom).
+  const hasFitRef = React.useRef(false);
+  React.useEffect(() => {
+    hasFitRef.current = false;
+  }, [rawNodes.length, rawEdges.length]);
+  const handleEngineStop = React.useCallback(() => {
+    if (hasFitRef.current) return;
+    hasFitRef.current = true;
+    fgRef.current?.zoomToFit(400, 60);
   }, []);
 
-  // Neighbors of hovered node
-  const neighborSlugs = React.useMemo(() => {
-    if (!hoveredSlug) return null;
-    const set = new Set<string>([hoveredSlug]);
-    for (const l of simLinks) {
-      const src = typeof l.source === "object" ? (l.source as GraphNode).slug : String(l.source);
-      const tgt = typeof l.target === "object" ? (l.target as GraphNode).slug : String(l.target);
-      if (src === hoveredSlug) set.add(tgt);
-      if (tgt === hoveredSlug) set.add(src);
-    }
-    return set;
-  }, [hoveredSlug, simLinks]);
+  // Stable graphData reference — react-force-graph treats a new object literal
+  // as a data change and resets simulation state, which is what was causing
+  // nodes to drift away on every hover.
+  const graphData = React.useMemo(() => ({ nodes, links }), [nodes, links]);
 
-  // Type counts for legend
+  // Held in a ref so the canvas draw callbacks below can read it without
+  // being recreated on hover. Updated synchronously inside handleNodeHover
+  // (BEFORE refresh()) so the next canvas frame sees the up-to-date set.
+  const neighborIdsRef = React.useRef<Set<string> | null>(null);
+  // Stable ref to adjacency so handleNodeHover stays referentially stable.
+  const adjacencyRef = React.useRef(adjacency);
+  adjacencyRef.current = adjacency;
+
+  // --- Custom node draw (preserves existing colour scheme) ---------------------
+  // Callback identity intentionally changes on hoverVersion — react-force-graph
+  // diffs callback props by reference and only repaints when they change. Keeps
+  // graphData stable (so sim doesn't reset) but lets the canvas refresh.
+  const drawNode = React.useCallback(
+    (rawNode: object, ctx: CanvasRenderingContext2D, globalScale: number) => {
+      const n = rawNode as Node;
+      if (n.x === undefined || n.y === undefined) return;
+      const r = nodeRadius(n.degree ?? 0, mini);
+      const color = wikiTypeColor(n.page_type);
+      const hovered = hoveredIdRef.current;
+      const neighborSet = neighborIdsRef.current;
+      const isHovered = hovered === n.id;
+      const isDimmed = !!hovered && !neighborSet?.has(n.id);
+      const isCenter = n.id === centerSlug;
+
+      // Hover glow.
+      if (isHovered) {
+        ctx.beginPath();
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.12;
+        ctx.arc(n.x, n.y, r * 1.8, 0, 2 * Math.PI);
+        ctx.fill();
+        ctx.globalAlpha = 1;
+      }
+
+      // Background ring to occlude edges behind the node.
+      if (!isDimmed) {
+        ctx.beginPath();
+        ctx.fillStyle = BG_COLOR;
+        ctx.arc(n.x, n.y, (isHovered ? r * 1.3 : r) + 1, 0, 2 * Math.PI);
+        ctx.fill();
+      }
+
+      // Node body.
+      ctx.beginPath();
+      ctx.fillStyle = color;
+      ctx.globalAlpha = isDimmed ? 0.15 : 1;
+      ctx.arc(n.x, n.y, isHovered ? r * 1.3 : r, 0, 2 * Math.PI);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+
+      // Border.
+      ctx.lineWidth = isCenter ? 2.5 : isHovered ? 2 : 1;
+      ctx.strokeStyle = isCenter
+        ? "#3a302a"
+        : isHovered
+          ? color
+          : "rgba(255,255,255,0.85)";
+      ctx.stroke();
+
+      // Label visibility: hide in mini, hide on dimmed, hide when zoom too low
+      // (Obsidian-style declutter), always show on hover and on center.
+      const labelVisible =
+        !mini &&
+        !isDimmed &&
+        (isHovered || isCenter || globalScale >= 1.2 || (n.degree ?? 0) >= 4);
+      if (labelVisible) {
+        const fontSize = isHovered ? 12 : 11;
+        ctx.font = `${isHovered ? 600 : 400} ${fontSize}px sans-serif`;
+        ctx.fillStyle = LABEL_COLOR;
+        ctx.globalAlpha = isHovered || isCenter ? 1 : 0.7;
+        ctx.textBaseline = "middle";
+        ctx.textAlign = "left";
+        const text = n.title.length > 24 ? n.title.slice(0, 22) + "…" : n.title;
+        ctx.fillText(text, n.x + r + 5, n.y);
+        ctx.globalAlpha = 1;
+      }
+    },
+    // hoverVersion bump → callback ref changes → react-force-graph repaints.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [mini, centerSlug, hoverVersion]
+  );
+
+  // --- Custom link colour/width — also bump on hover to trigger repaint ---
+  const linkColor = React.useCallback(
+    (rawLink: object) => {
+      const hovered = hoveredIdRef.current;
+      const l = rawLink as Link;
+      if (!hovered) return EDGE_COLOR;
+      const s = typeof l.source === "string" ? l.source : l.source.id;
+      const t = typeof l.target === "string" ? l.target : l.target.id;
+      const hot = s === hovered || t === hovered;
+      return hot ? EDGE_HIGHLIGHT : "rgba(120,112,106,0.08)";
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [hoverVersion]
+  );
+  const linkWidth = React.useCallback(
+    (rawLink: object) => {
+      const hovered = hoveredIdRef.current;
+      const l = rawLink as Link;
+      if (!hovered) return 1.2;
+      const s = typeof l.source === "string" ? l.source : l.source.id;
+      const t = typeof l.target === "string" ? l.target : l.target.id;
+      return s === hovered || t === hovered ? 2.5 : 1;
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [hoverVersion]
+  );
+
+  // --- Scope hulls (workspace boundaries) drawn beneath nodes ---
+  const drawScopeHulls = React.useCallback(
+    (ctx: CanvasRenderingContext2D) => {
+      if (mini) return;
+      // Group project-scoped nodes by scope_name.
+      const groups: Record<string, Node[]> = {};
+      for (const n of nodes) {
+        if (n.scope_type !== "project" || n.x === undefined || n.y === undefined) continue;
+        const key = n.scope_name || "Workspace";
+        (groups[key] ||= []).push(n);
+      }
+      const entries = Object.entries(groups);
+      entries.forEach(([key, gnodes], idx) => {
+        const points: [number, number][] = gnodes.map((n) => [n.x!, n.y!]);
+        const hull = convexHull(points);
+        if (hull.length === 0) return;
+        const padding = 30;
+
+        // Expand hull outward and draw smooth curve via quadratic curves.
+        const cx = hull.reduce((s, p) => s + p[0], 0) / hull.length;
+        const cy = hull.reduce((s, p) => s + p[1], 0) / hull.length;
+        const expanded =
+          hull.length === 1
+            ? // For single-node groups, draw a circle.
+              null
+            : hull.map(([x, y]) => {
+                const dx = x - cx;
+                const dy = y - cy;
+                const len = Math.sqrt(dx * dx + dy * dy) || 1;
+                return [x + (dx / len) * padding, y + (dy / len) * padding] as [number, number];
+              });
+
+        const color = scopeColor(idx);
+
+        ctx.save();
+        ctx.setLineDash([6, 4]);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 1;
+        ctx.fillStyle = color + "12"; // ~7% alpha
+        ctx.globalAlpha = 0.85;
+
+        ctx.beginPath();
+        if (expanded == null) {
+          const [x, y] = hull[0];
+          ctx.arc(x, y, padding, 0, 2 * Math.PI);
+        } else if (expanded.length === 2) {
+          // Stadium shape between two points.
+          const [x1, y1] = expanded[0];
+          const [x2, y2] = expanded[1];
+          ctx.moveTo(x1, y1);
+          ctx.lineTo(x2, y2);
+        } else {
+          const n = expanded.length;
+          const start: [number, number] = [
+            (expanded[n - 1][0] + expanded[0][0]) / 2,
+            (expanded[n - 1][1] + expanded[0][1]) / 2,
+          ];
+          ctx.moveTo(start[0], start[1]);
+          for (let i = 0; i < n; i++) {
+            const curr = expanded[i];
+            const next = expanded[(i + 1) % n];
+            const mx = (curr[0] + next[0]) / 2;
+            const my = (curr[1] + next[1]) / 2;
+            ctx.quadraticCurveTo(curr[0], curr[1], mx, my);
+          }
+          ctx.closePath();
+        }
+        ctx.fill();
+        ctx.stroke();
+        ctx.setLineDash([]);
+
+        // Scope label above the hull.
+        const topY = Math.min(...points.map((p) => p[1])) - padding - 6;
+        ctx.fillStyle = color;
+        ctx.font = "600 10px sans-serif";
+        ctx.textAlign = "center";
+        ctx.globalAlpha = 0.7;
+        ctx.fillText(key, cx, topY);
+        ctx.restore();
+      });
+    },
+    [mini, nodes]
+  );
+
+  const handleNodeClick = React.useCallback(
+    (rawNode: object) => {
+      const n = rawNode as Node;
+      if (onNodeClick) onNodeClick(n.id);
+      else router.push(`/wiki/${n.id}`);
+    },
+    [onNodeClick, router]
+  );
+
+  const handleNodeHover = React.useCallback((rawNode: object | null) => {
+    const n = rawNode as Node | null;
+    const newId = n?.id ?? null;
+    if (hoveredIdRef.current === newId) return;
+    hoveredIdRef.current = newId;
+    // Compute neighbours synchronously so the next canvas frame paints with
+    // the correct dimming. Deferring this to a useEffect would lose one frame.
+    if (!newId) {
+      neighborIdsRef.current = null;
+    } else {
+      const set = new Set<string>([newId]);
+      for (const nb of adjacencyRef.current.get(newId) ?? []) set.add(nb);
+      neighborIdsRef.current = set;
+    }
+    // Bump version so the canvas callbacks (drawNode/linkColor/linkWidth)
+    // get new identities — react-force-graph picks that up and repaints.
+    setHoverVersion((v) => v + 1);
+    if (!n) {
+      setTooltip(null);
+    } else {
+      setTooltip((prev) => ({
+        ...(prev ?? { x: 0, y: 0 }),
+        title: n.title,
+        type: n.page_type,
+        degree: n.degree ?? 0,
+        scopeType: n.scope_type,
+        scopeName: n.scope_name,
+      }));
+    }
+  }, []);
+
+  // --- Legend data ---
   const typeCounts = React.useMemo(() => {
     const counts: Record<string, number> = {};
-    for (const n of rawNodes) {
-      counts[n.page_type] = (counts[n.page_type] ?? 0) + 1;
-    }
+    for (const n of rawNodes) counts[n.page_type] = (counts[n.page_type] ?? 0) + 1;
     return counts;
   }, [rawNodes]);
 
-  // Workspace scope hulls
-  const scopeHulls = React.useMemo(() => {
-    if (mini) return [];
-    const groups: Record<string, { nodes: GraphNode[]; scopeName: string }> = {};
-    for (const n of simNodes) {
-      if (n.scope_type !== "project" || n.x === undefined || n.y === undefined) continue;
-      const key = n.scope_name || "Workspace";
-      if (!groups[key]) groups[key] = { nodes: [], scopeName: key };
-      groups[key].nodes.push(n);
-    }
-    return Object.entries(groups)
-      .filter(([, g]) => g.nodes.length >= 1)
-      .map(([key, g], idx) => {
-        const points: [number, number][] = g.nodes.map((n) => [n.x!, n.y!]);
-        const hull = convexHull(points);
-        const padding = 30;
-        const path = hullToPath(hull, padding);
-        const cx = points.reduce((s, p) => s + p[0], 0) / points.length;
-        // Find topmost point for label
-        const topY = Math.min(...points.map((p) => p[1])) - padding - 6;
-        return { key, path, cx, labelY: topY, color: scopeColor(idx), scopeName: g.scopeName };
-      });
-  }, [simNodes, mini]);
-
-  // Scope counts for legend
   const scopeCounts = React.useMemo(() => {
     const counts: Record<string, number> = {};
     for (const n of rawNodes) {
-      const label = n.scope_type === "project" ? (n.scope_name || "Workspace") : "Global";
+      const label = n.scope_type === "project" ? n.scope_name || "Workspace" : "Global";
       counts[label] = (counts[label] ?? 0) + 1;
     }
     return Object.entries(counts).sort((a, b) => b[1] - a[1]);
   }, [rawNodes]);
 
-  const handleNodeClick = (slug: string) => {
-    if (onNodeClick) {
-      onNodeClick(slug);
-    } else {
-      router.push(`/wiki/${slug}`);
-    }
-  };
-
   return (
     <div
       ref={containerRef}
       className={`relative w-full overflow-hidden ${mini ? "rounded-xl border border-border" : ""}`}
-      style={{ height: height ?? "100%", background: "var(--color-background, #faf5ee)" }}
+      style={{ height: height ?? "100%", background: BG_COLOR }}
+      onMouseMove={(e) => {
+        const rect = containerRef.current?.getBoundingClientRect();
+        if (!rect) return;
+        setTooltip((prev) =>
+          prev ? { ...prev, x: e.clientX - rect.left, y: e.clientY - rect.top - 16 } : prev
+        );
+      }}
     >
-      <svg
-        ref={svgRef}
+      <ForceGraph2D
+        ref={fgRef}
         width={dimensions.w}
         height={dimensions.h}
-        style={{ display: "block", cursor: isPanningRef.current ? "grabbing" : "grab" }}
-        onWheel={(e) => {
-          if (mini) return;
-          e.preventDefault();
-          const rect = svgRef.current?.getBoundingClientRect();
-          if (!rect) return;
-          const mx = e.clientX - rect.left;
-          const my = e.clientY - rect.top;
-          const factor = e.deltaY > 0 ? 0.9 : 1.1;
-          const newZoom = Math.max(0.2, Math.min(5, zoom * factor));
-          // Zoom toward cursor
-          setPan((prev) => ({
-            x: mx - (mx - prev.x) * (newZoom / zoom),
-            y: my - (my - prev.y) * (newZoom / zoom),
-          }));
-          setZoom(newZoom);
+        graphData={graphData}
+        backgroundColor={BG_COLOR}
+        nodeId="id"
+        nodeRelSize={1}
+        nodeCanvasObject={drawNode}
+        nodePointerAreaPaint={(rawNode: object, color: string, ctx: CanvasRenderingContext2D) => {
+          const n = rawNode as Node;
+          if (n.x === undefined || n.y === undefined) return;
+          ctx.fillStyle = color;
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, nodeRadius(n.degree ?? 0, mini) + 4, 0, 2 * Math.PI);
+          ctx.fill();
         }}
-        onMouseDown={(e) => {
-          if (mini || e.button !== 0) return;
-          isPanningRef.current = true;
-          panStartRef.current = { x: e.clientX, y: e.clientY, panX: pan.x, panY: pan.y };
-        }}
-        onMouseMove={(e) => {
-          if (!isPanningRef.current) return;
-          setPan({
-            x: panStartRef.current.panX + (e.clientX - panStartRef.current.x),
-            y: panStartRef.current.panY + (e.clientY - panStartRef.current.y),
-          });
-        }}
-        onMouseUp={() => { isPanningRef.current = false; }}
-        onMouseLeave={() => { isPanningRef.current = false; }}
-      >
-        <g transform={`translate(${pan.x},${pan.y}) scale(${zoom})`}>
-        {/* Scope hull blobs — fade in after nodes settle */}
-        {!mini && settled && scopeHulls.map((hull) => (
-          <g key={`hull-${hull.key}`}>
-            <path
-              d={hull.path}
-              fill={`${hull.color}0a`}
-              stroke={hull.color}
-              strokeWidth={1}
-              strokeDasharray="6,4"
-              opacity={0.6}
-              style={{ transition: "d 300ms ease, opacity 600ms ease" }}
-            />
-            <text
-              x={hull.cx}
-              y={hull.labelY}
-              textAnchor="middle"
-              fill={hull.color}
-              fontSize={10}
-              fontWeight={600}
-              opacity={0.7}
-              style={{ pointerEvents: "none", userSelect: "none", transition: "opacity 600ms ease" }}
-            >
-              {hull.scopeName}
-            </text>
-          </g>
-        ))}
-
-        {/* Edges */}
-        <g>
-          {simLinks.map((link, i) => {
-            const src = link.source as GraphNode;
-            const tgt = link.target as GraphNode;
-            if (!src?.x || !tgt?.x) return null;
-
-            const isHighlighted =
-              hoveredSlug &&
-              (src.slug === hoveredSlug || tgt.slug === hoveredSlug);
-
-            return (
-              <line
-                key={i}
-                x1={src.x}
-                y1={src.y}
-                x2={tgt.x}
-                y2={tgt.y}
-                stroke={isHighlighted ? EDGE_HIGHLIGHT : EDGE_COLOR}
-                strokeWidth={isHighlighted ? 2.5 : 1.2}
-                opacity={hoveredSlug ? (isHighlighted ? 0.9 : 0.1) : 0.5}
-                style={{ transition: "opacity 200ms ease, stroke-width 200ms ease" }}
-              />
-            );
-          })}
-        </g>
-
-        {/* Nodes */}
-        <g>
-          {simNodes.map((node) => {
-            if (node.x === undefined || node.y === undefined) return null;
-            const r = nodeRadius(node.degree ?? 0, mini);
-            const color = wikiTypeColor(node.page_type);
-            const isDimmed = hoveredSlug && !neighborSlugs?.has(node.slug);
-            const isHovered = hoveredSlug === node.slug;
-            const isCenter = node.slug === centerSlug;
-
-            return (
-              <g
-                key={node.slug}
-                transform={`translate(${node.x},${node.y})`}
-                style={{ cursor: "pointer" }}
-                onClick={() => handleNodeClick(node.slug)}
-                onMouseEnter={(e) => {
-                  setHoveredSlug(node.slug);
-                  const rect = svgRef.current?.getBoundingClientRect();
-                  if (rect) {
-                    setTooltip({
-                      x: e.clientX - rect.left,
-                      y: e.clientY - rect.top - 16,
-                      title: node.title,
-                      type: node.page_type,
-                      degree: node.degree ?? 0,
-                      scopeType: node.scope_type,
-                      scopeName: node.scope_name,
-                    });
-                  }
-                }}
-                onMouseLeave={() => {
-                  setHoveredSlug(null);
-                  setTooltip(null);
-                }}
-              >
-                {/* Glow ring on hover */}
-                {isHovered && (
-                  <circle
-                    r={r * 1.8}
-                    fill={color}
-                    opacity={0.12}
-                    style={{ transition: "r 200ms ease" }}
-                  />
-                )}
-
-                {/* Solid background to fully occlude edges behind */}
-                <circle
-                  r={isHovered ? r * 1.3 + 1 : r + 1}
-                  fill="var(--color-background, #faf5ee)"
-                  opacity={isDimmed ? 0 : 1}
-                  style={{ transition: "r 200ms ease" }}
-                />
-
-                <circle
-                  r={isHovered ? r * 1.3 : r}
-                  fill={color}
-                  opacity={isDimmed ? 0.15 : 1}
-                  stroke={isCenter ? "#3a302a" : isHovered ? color : "rgba(255,255,255,0.8)"}
-                  strokeWidth={isCenter ? 2.5 : isHovered ? 2 : 1}
-                  style={{ transition: "r 200ms ease, opacity 200ms ease" }}
-                />
-                {!mini && !isDimmed && (
-                  <text
-                    x={r + 5}
-                    y={4}
-                    fill={LABEL_COLOR}
-                    fontSize={isHovered ? 12 : 11}
-                    fontWeight={isHovered ? 600 : 400}
-                    opacity={isHovered ? 1 : 0.6}
-                    style={{
-                      pointerEvents: "none",
-                      userSelect: "none",
-                      transition: "opacity 200ms ease, font-size 200ms ease",
-                    }}
-                  >
-                    {node.title.length > 24
-                      ? node.title.slice(0, 22) + "…"
-                      : node.title}
-                  </text>
-                )}
-              </g>
-            );
-          })}
-        </g>
-        </g>
-      </svg>
+        linkColor={linkColor}
+        linkWidth={linkWidth}
+        onNodeClick={handleNodeClick}
+        onNodeHover={handleNodeHover}
+        onRenderFramePre={drawScopeHulls}
+        cooldownTicks={mini ? 50 : 90}
+        d3AlphaDecay={0.06}
+        d3VelocityDecay={0.55}
+        onEngineStop={handleEngineStop}
+        enableZoomInteraction={!mini}
+        enablePanInteraction={!mini}
+        enableNodeDrag={!mini}
+        minZoom={0.2}
+        maxZoom={5}
+      />
 
       {/* Tooltip */}
-      {tooltip && (
+      {tooltip && hoveredId && (
         <div
           className="pointer-events-none z-50 px-3 py-2 rounded-lg text-xs shadow-lg"
           style={{
             position: "absolute",
-            left: Math.min(tooltip.x + 12, dimensions.w - 200),
+            left: Math.min(tooltip.x + 12, dimensions.w - 220),
             top: Math.max(tooltip.y - 8, 8),
             background: "var(--color-card, #fff)",
             color: "var(--color-foreground, #3a302a)",
@@ -546,7 +550,9 @@ export function WikiGraph({
                 {tooltip.scopeType === "project" ? "folder_special" : "public"}
               </span>
               <span className="truncate">
-                {tooltip.scopeType === "project" ? (tooltip.scopeName || "Workspace") : "Global"}
+                {tooltip.scopeType === "project"
+                  ? tooltip.scopeName || "Workspace"
+                  : "Global"}
               </span>
             </div>
           )}
@@ -572,7 +578,10 @@ export function WikiGraph({
                       boxShadow: `0 0 4px ${wikiTypeColor(type)}40`,
                     }}
                   />
-                  <span className="material-symbols-outlined" style={{ fontSize: 11, color: wikiTypeColor(type) }}>
+                  <span
+                    className="material-symbols-outlined"
+                    style={{ fontSize: 11, color: wikiTypeColor(type) }}
+                  >
                     {wikiTypeIcon(type)}
                   </span>
                   <span className="text-muted-foreground">{wikiTypeGroupLabel(type)}</span>
@@ -580,17 +589,21 @@ export function WikiGraph({
                 </div>
               ))}
           </div>
-          {/* Scope legend */}
           {scopeCounts.length > 0 && (
             <>
-              <div className="mt-2 pt-2 border-t border-border/50 mb-1.5 font-semibold text-foreground text-xs">Scope</div>
+              <div className="mt-2 pt-2 border-t border-border/50 mb-1.5 font-semibold text-foreground text-xs">
+                Scope
+              </div>
               <div className="flex flex-col gap-1">
                 {scopeCounts.map(([scope, count]) => (
                   <div
                     key={scope}
                     className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-accent/30 transition-colors"
                   >
-                    <span className="material-symbols-outlined text-muted-foreground" style={{ fontSize: 12 }}>
+                    <span
+                      className="material-symbols-outlined text-muted-foreground"
+                      style={{ fontSize: 12 }}
+                    >
                       {scope === "Global" ? "public" : "folder_special"}
                     </span>
                     <span className="text-muted-foreground truncate">{scope}</span>
@@ -607,29 +620,32 @@ export function WikiGraph({
       {!mini && (
         <div className="absolute bottom-3 right-3 flex flex-col items-center gap-1 rounded-xl border border-border bg-card/90 backdrop-blur-sm shadow-sm p-1">
           <button
-            onClick={() => setZoom((z) => Math.min(5, z * 1.2))}
+            onClick={() => fgRef.current?.zoom(fgRef.current.zoom() * 1.2, 200)}
             className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-accent/50 transition-colors text-muted-foreground hover:text-foreground"
             title="Zoom In"
           >
-            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>add</span>
+            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+              add
+            </span>
           </button>
-          <span className="text-[9px] text-muted-foreground/60 tabular-nums font-medium select-none">
-            {Math.round(zoom * 100)}%
-          </span>
           <button
-            onClick={() => setZoom((z) => Math.max(0.2, z / 1.2))}
+            onClick={() => fgRef.current?.zoom(fgRef.current.zoom() / 1.2, 200)}
             className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-accent/50 transition-colors text-muted-foreground hover:text-foreground"
             title="Zoom Out"
           >
-            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>remove</span>
+            <span className="material-symbols-outlined" style={{ fontSize: 16 }}>
+              remove
+            </span>
           </button>
           <div className="w-5 border-t border-border/50" />
           <button
-            onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}
+            onClick={() => fgRef.current?.zoomToFit(400, 60)}
             className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-accent/50 transition-colors text-muted-foreground hover:text-foreground"
-            title="Reset View"
+            title="Fit View"
           >
-            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>fit_screen</span>
+            <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
+              fit_screen
+            </span>
           </button>
         </div>
       )}

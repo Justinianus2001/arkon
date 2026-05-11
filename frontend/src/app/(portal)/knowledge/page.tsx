@@ -104,7 +104,7 @@ export default function KnowledgePage() {
 
   // Polling cho trạng thái tài liệu
   useEffect(() => {
-    const hasPending = sources.some((s) => s.status === "pending" || s.status === "processing");
+    const hasPending = sources.some((s) => s.status === "pending" || s.status === "processing" || s.status === "plan_ready");
     if (!hasPending) return;
 
     const interval = setInterval(() => {

@@ -26,6 +26,7 @@ import { KnowledgeType, Department, Source } from "./types";
 import { fileIcons, getFileExt } from "./utils";
 import { StatusDot } from "./status-dot";
 import { EditSourceDialog } from "./edit-source-dialog";
+import { PlanReviewDialog } from "./plan-review-dialog";
 
 type Props = {
   sources: Source[];
@@ -56,7 +57,8 @@ export function KnowledgeTable({
 }: Props) {
   const [actionError, setActionError] = React.useState<string | null>(null);
   const [editSource, setEditSource] = React.useState<Source | null>(null);
-  const [reingestingIds, setReingestingIds] = React.useState<Set<string>>(new Set());
+  const [reviewPlanSource, setReviewPlanSource] = React.useState<Source | null>(null);
+  const [retryingIds, setRetryingIds] = React.useState<Set<string>>(new Set());
   const [searchInput, setSearchInput] = React.useState(search);
 
   const handleDelete = async (id: string) => {
@@ -70,16 +72,16 @@ export function KnowledgeTable({
     }
   };
 
-  const handleReingest = async (id: string) => {
+  const handleRetry = async (id: string) => {
     setActionError(null);
-    setReingestingIds((prev) => new Set(prev).add(id));
+    setRetryingIds((prev) => new Set(prev).add(id));
     try {
-      await api(`/api/sources/${id}/recompile`, { method: "POST" });
+      await api(`/api/sources/${id}/retry`, { method: "POST" });
       onRefresh();
     } catch (err) {
-      setActionError(err instanceof Error ? err.message : "Failed to recompile");
+      setActionError(err instanceof Error ? err.message : "Failed to retry");
     } finally {
-      setReingestingIds((prev) => { const s = new Set(prev); s.delete(id); return s; });
+      setRetryingIds((prev) => { const s = new Set(prev); s.delete(id); return s; });
     }
   };
 
@@ -265,15 +267,25 @@ export function KnowledgeTable({
                           <span className="material-symbols-outlined mr-2" style={{ fontSize: 16 }}>edit</span>
                           Edit
                         </DropdownMenuItem>
-                        <DropdownMenuItem
-                          onClick={() => handleReingest(source.id)}
-                          disabled={reingestingIds.has(source.id) || source.status === "processing" || source.status === "pending"}
-                        >
-                          <span className={`material-symbols-outlined mr-2 ${reingestingIds.has(source.id) ? "animate-spin" : ""}`} style={{ fontSize: 16 }}>
-                            refresh
-                          </span>
-                          {reingestingIds.has(source.id) ? "Re-ingesting..." : "Re-ingest"}
-                        </DropdownMenuItem>
+                        {source.status === "plan_ready" && (
+                          <DropdownMenuItem onClick={() => setReviewPlanSource(source)}>
+                            <span className="material-symbols-outlined mr-2 text-blue-500" style={{ fontSize: 16 }}>
+                              fact_check
+                            </span>
+                            Review Plan
+                          </DropdownMenuItem>
+                        )}
+                        {source.status === "error" && (
+                          <DropdownMenuItem
+                            onClick={() => handleRetry(source.id)}
+                            disabled={retryingIds.has(source.id)}
+                          >
+                            <span className={`material-symbols-outlined mr-2 ${retryingIds.has(source.id) ? "animate-spin" : ""}`} style={{ fontSize: 16 }}>
+                              refresh
+                            </span>
+                            {retryingIds.has(source.id) ? "Retrying..." : "Retry"}
+                          </DropdownMenuItem>
+                        )}
                         <DropdownMenuSeparator />
                         <DropdownMenuItem
                           onClick={() => handleDelete(source.id)}
@@ -351,6 +363,14 @@ export function KnowledgeTable({
           departments={departments}
           onClose={() => setEditSource(null)}
           onSaved={() => { setEditSource(null); onRefresh(); }}
+        />
+      )}
+
+      {reviewPlanSource && (
+        <PlanReviewDialog
+          source={reviewPlanSource}
+          onClose={() => setReviewPlanSource(null)}
+          onDone={() => { setReviewPlanSource(null); onRefresh(); }}
         />
       )}
     </div>

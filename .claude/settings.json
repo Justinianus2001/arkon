@@ -25,7 +25,14 @@
       "Bash(python -c \"import json,sys; p=json.load\\(sys.stdin\\); deps={**p.get\\('dependencies',{}\\), **p.get\\('devDependencies',{}\\)}; [print\\(k,v\\) for k,v in sorted\\(deps.items\\(\\)\\) if any\\(x in k.lower\\(\\) for x in ['editor','markdown','codemirror','monaco','tiptap','prose','quill','slate']\\)]\")",
       "Bash(Find D:\\\\arkon\\\\frontend\\\\src -type f -name \"*layout.tsx\")",
       "Bash(Get-ChildItem -Path \"D:\\\\arkon\\\\frontend\\\\src\" -Recurse -Filter \"*auth*\" -File)",
-      "Bash(rtk docker *)"
+      "Bash(rtk docker *)",
+      "Bash(rtk pytest *)",
+      "Bash(rtk ruff *)",
+      "Bash(rtk npx *)",
+      "Bash(Move-Item 'd:\\\\arkon\\\\.claude\\\\skills\\\\arkon-query\\\\SKILL.md' 'd:\\\\arkon\\\\skills\\\\arkon-query\\\\SKILL.md')",
+      "Bash(Move-Item 'd:\\\\arkon\\\\.claude\\\\skills\\\\arkon-edit\\\\SKILL.md' 'd:\\\\arkon\\\\skills\\\\arkon-edit\\\\SKILL.md')",
+      "Bash(Move-Item 'd:\\\\arkon\\\\.claude\\\\skills\\\\arkon-review\\\\SKILL.md' 'd:\\\\arkon\\\\skills\\\\arkon-review\\\\SKILL.md')",
+      "Bash(Remove-Item -Recurse 'd:\\\\arkon\\\\.claude\\\\skills')"
     ]
   },
   "enabledPlugins": {

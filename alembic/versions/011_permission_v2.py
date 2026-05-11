@@ -11,10 +11,10 @@ Permission v2: Dual-realm architecture.
 Revision ID: 011_permission_v2
 """
 
-from alembic import op
 import sqlalchemy as sa
-from sqlalchemy.dialects.postgresql import UUID, JSONB
+from sqlalchemy.dialects.postgresql import UUID
 
+from alembic import op
 
 revision = "011_permission_v2"
 down_revision = "010"
@@ -104,9 +104,10 @@ def upgrade():
 
     # 3. Update ProjectMember.role values
     for old_role, new_role in ROLE_MAP.items():
-        conn.execute(sa.text(
-            f"UPDATE project_members SET role = '{new_role}' WHERE role = '{old_role}'"
-        ))
+        conn.execute(
+            sa.text("UPDATE project_members SET role = :new_role WHERE role = :old_role"),
+            {"new_role": new_role, "old_role": old_role},
+        )
 
     # 4. Migrate Role.permissions from legacy to new format
     roles = conn.execute(sa.text("SELECT id, permissions FROM roles")).fetchall()

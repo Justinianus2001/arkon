@@ -75,6 +75,7 @@ function formatFileSize(bytes: number): string {
 export function UploadDialog({ open, onOpenChange, types, departments, onUploaded }: Props) {
   const [file, setFile] = useState<File | null>(null);
   const [typeId, setTypeId] = useState("");
+  const [selectedDepts, setSelectedDepts] = useState<string[]>([]);
   const [scopeType, setScopeType] = useState("global");
   const [scopeId, setScopeId] = useState("");
   const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
@@ -82,6 +83,12 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
   const [error, setError] = useState("");
   const [dragOver, setDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const toggleDept = (deptId: string) => {
+    setSelectedDepts((prev) =>
+      prev.includes(deptId) ? prev.filter((d) => d !== deptId) : [...prev, deptId]
+    );
+  };
 
   useEffect(() => {
     if (!open) return;
@@ -134,6 +141,9 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
       formData.append("file", file);
       if (typeId) formData.append("knowledge_type_id", typeId);
       
+      if (selectedDepts.length > 0) {
+        formData.append("department_ids", selectedDepts.join(","));
+      }
       formData.append("scope_type", scopeType);
       if (scopeType !== "global" && scopeId) {
         formData.append("scope_id", scopeId);
@@ -144,6 +154,7 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
       onOpenChange(false);
       setFile(null);
       setTypeId("");
+      setSelectedDepts([]);
       setScopeType("global");
       setScopeId("");
     } catch (err) {
@@ -270,6 +281,50 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
             </Select>
           </div>
 
+          {/* Department access control */}
+          <div className="flex flex-col gap-1.5">
+            <Label>Departments</Label>
+            <p className="text-xs text-muted-foreground">
+              Select which departments can access this document. Leave empty for global access.
+            </p>
+            <div className="border rounded-lg p-2 max-h-40 overflow-y-auto bg-background">
+              {departments.length === 0 ? (
+                <span className="text-xs text-muted-foreground">No departments available</span>
+              ) : (
+                departments.map((d) => (
+                  <label
+                    key={d.id}
+                    className="flex items-center gap-2 px-2 py-1.5 rounded hover:bg-muted cursor-pointer"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={selectedDepts.includes(d.id)}
+                      onChange={() => toggleDept(d.id)}
+                      className="rounded border-border"
+                    />
+                    <span className="text-sm">{d.name}</span>
+                  </label>
+                ))
+              )}
+            </div>
+            {selectedDepts.length > 0 && (
+              <div className="flex flex-wrap gap-1 mt-1">
+                {selectedDepts.map((id) => {
+                  const name = departments.find((d) => d.id === id)?.name ?? id;
+                  return (
+                    <span
+                      key={id}
+                      className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-primary/10 text-primary"
+                    >
+                      {name}
+                      <button type="button" onClick={() => toggleDept(id)} className="hover:text-destructive">×</button>
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           {/* Visibility / Scope */}
           <div className="flex flex-col gap-2">
             <Label>Visibility</Label>
@@ -281,7 +336,7 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
               <SelectTrigger className="bg-background w-full">
                 <div className="flex items-center gap-2">
                   <span className="material-symbols-outlined" style={{ fontSize: 14 }}>
-                    {scopeType === "global" ? "public" : scopeType === "department" ? "domain" : "folder_special"}
+                    {scopeType === "global" ? "public" : "folder_special"}
                   </span>
                   <span className="capitalize">{scopeType === "project" ? "Workspace" : scopeType}</span>
                 </div>
@@ -290,13 +345,7 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
                 <SelectItem value="global">
                   <div className="flex items-center gap-2">
                     <span className="material-symbols-outlined" style={{ fontSize: 14 }}>public</span>
-                    Global (All employees)
-                  </div>
-                </SelectItem>
-                <SelectItem value="department">
-                  <div className="flex items-center gap-2">
-                    <span className="material-symbols-outlined" style={{ fontSize: 14 }}>domain</span>
-                    Department
+                    Global
                   </div>
                 </SelectItem>
                 <SelectItem value="project">
@@ -307,29 +356,13 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
                 </SelectItem>
               </SelectContent>
             </Select>
-            <p className="text-xs text-muted-foreground mt-0.5">
-              Restrict access or leave as Global to make it readable by everyone.
-            </p>
+            {scopeType === "global" && (
+              <p className="text-xs text-amber-600 dark:text-amber-400 flex items-start gap-1.5 mt-0.5">
+                <span className="material-symbols-outlined shrink-0" style={{ fontSize: 13, marginTop: 1 }}>warning</span>
+                Document content will be compiled into the shared wiki and visible to all employees — including those without access to the original file. Only upload if the content is not sensitive.
+              </p>
+            )}
           </div>
-
-          {/* Scope entity picker */}
-          {scopeType === "department" && (
-            <div className="flex flex-col gap-1.5">
-              <Label>Target Department</Label>
-              <Select value={scopeId} onValueChange={(v) => setScopeId(v ?? "")}>
-                <SelectTrigger className="bg-background">
-                  <span>{scopeId ? (departments.find(d => d.id === scopeId)?.name ?? "Select...") : "Select department..."}</span>
-                </SelectTrigger>
-                <SelectContent>
-                  {departments.map((d) => (
-                    <SelectItem key={d.id} value={d.id}>
-                      {d.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-          )}
 
           {scopeType === "project" && (
             <div className="flex flex-col gap-1.5">

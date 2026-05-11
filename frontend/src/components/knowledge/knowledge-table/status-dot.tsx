@@ -7,6 +7,11 @@ export function StatusDot({ source }: { source: Source }) {
     processing: "bg-yellow-500",
     error: "bg-destructive",
     pending: "bg-muted-foreground",
+    plan_ready: "bg-blue-500",
+  };
+
+  const labels: Record<string, string> = {
+    plan_ready: "Review Plan",
   };
 
   const status = source.status;
@@ -15,7 +20,9 @@ export function StatusDot({ source }: { source: Source }) {
     <div className="flex flex-col gap-1">
       <div className="flex items-center gap-1.5">
         <span className={`w-2 h-2 rounded-full ${colors[status] || colors.pending}`} />
-        <span className="text-xs capitalize text-muted-foreground">{status}</span>
+        <span className={`text-xs capitalize ${status === "plan_ready" ? "text-blue-500 font-medium" : "text-muted-foreground"}`}>
+          {labels[status] ?? status}
+        </span>
         {status === "processing" && source.progress !== undefined && (
           <span className="text-xs text-muted-foreground">({source.progress}%)</span>
         )}

@@ -24,7 +24,6 @@ from loguru import logger
 
 from app.ai.providers.base import LLMProvider
 
-
 ANALYSIS_CHARS = 30_000
 
 ANALYSIS_SYSTEM = """\
@@ -122,7 +121,6 @@ async def analyze_source(
         raw = await llm.generate(
             prompt=prompt,
             system=ANALYSIS_SYSTEM,
-            max_tokens=2048,
             temperature=0.1,
         )
 
@@ -130,7 +128,15 @@ async def analyze_source(
         cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
         cleaned = re.sub(r"\s*```$", "", cleaned)
 
-        result = json.loads(cleaned)
+        # If JSON was truncated, trim to last valid closing brace
+        try:
+            result = json.loads(cleaned)
+        except json.JSONDecodeError:
+            last_brace = cleaned.rfind("}")
+            if last_brace != -1:
+                result = json.loads(cleaned[: last_brace + 1])
+            else:
+                raise
         logger.debug(f"WikiAnalyzer: analysis complete for '{source_title}'")
         return result
 

@@ -13,16 +13,14 @@ import uuid
 from typing import Optional
 
 from loguru import logger
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.registry import ProviderRegistry
 from app.ai.wiki_compiler import compile_source_into_wiki
-from app.database.models import KnowledgeType, Source
+from app.database.models import KnowledgeType, Source, SourceImage
 from app.services.image_service import ImageInfo, extract_images
 from app.services.source_outline import assemble_full_text, build_outline
 from app.services.storage_service import storage_service
-
 
 # ---------------------------------------------------------------------------
 # Ingestion pipeline
@@ -79,7 +77,7 @@ async def ingest_source(
             await session.flush()
             return source
 
-        # --- Step 3: Extract & caption images, inline captions into pages ---
+        # --- Step 3: Extract & caption images, persist, inline markers ---
         images: list[ImageInfo] = []
         if file_data and file_name:
             images = extract_images(file_data, file_name, str(source_id))
@@ -89,12 +87,28 @@ async def ingest_source(
                         if idx % 5 == 0 or idx == 1 or idx == len(images):
                             logger.info(f"Vision AI analyzing image {idx}/{len(images)}...")
                         img_bytes = storage_service.download_file(img.minio_key)
-                        mime_type = "image/png" if img.minio_key.lower().endswith(".png") else "image/jpeg"
-                        img.caption = await vision_provider.analyze_image(img_bytes, mime_type)
+                        img.caption = await vision_provider.analyze_image(
+                            img_bytes, img.content_type
+                        )
                     except Exception as e:
                         logger.warning(f"Failed to analyze image {img.minio_key}: {e}")
 
-        _inline_image_captions(pages_data, images)
+            # Persist source_images rows so wiki content_md can reference by uuid.
+            for img in images:
+                row = SourceImage(
+                    source_id=source_id,
+                    minio_key=img.minio_key,
+                    page_number=img.page_number,
+                    image_index=img.image_index,
+                    caption=img.caption,
+                    content_type=img.content_type,
+                    size_bytes=img.size_bytes,
+                )
+                session.add(row)
+                await session.flush()  # populate row.id
+                img.image_id = str(row.id)
+
+        _inline_image_markers(pages_data, images)
 
         # --- Step 4: Build outline + assemble full_text ---
         source.outline_json = build_outline(pages_data)
@@ -155,32 +169,44 @@ def _guess_content_type(file_name: str) -> str:
     }.get(ext, "application/octet-stream")
 
 
-def _inline_image_captions(pages_data: list[dict], images: list[ImageInfo]) -> None:
-    """
-    Append captioned image descriptions to the page text where they originated.
-    Mutates pages_data in place. Format keeps the captions visible to the LLM
-    compiler so it can incorporate them into the wiki without separate image
-    handling downstream.
+def _sanitize_caption_for_alt(caption: str) -> str:
+    """Make a caption safe to use inside markdown image alt text."""
+    # Strip newlines + characters that would break `![alt](url)` parsing.
+    cleaned = caption.replace("\n", " ").replace("\r", " ")
+    cleaned = cleaned.replace("[", "(").replace("]", ")")
+    return cleaned.strip()
+
+
+def _inline_image_markers(pages_data: list[dict], images: list[ImageInfo]) -> None:
+    """Inject markdown image markers into per-page text.
+
+    Each image becomes `![caption](image://<uuid>)` appended at the end of the
+    page it came from. The wiki compiler is instructed to preserve these
+    markers in the most contextually-relevant wiki page, drop irrelevant ones,
+    and never invent UUIDs. Mutates pages_data in place.
     """
     if not images:
         return
+
     by_page: dict[int, list[str]] = {}
     for img in images:
-        if not img.caption:
+        if not img.image_id:
             continue
+        alt = _sanitize_caption_for_alt(img.caption or "")
+        marker = f"![{alt}](image://{img.image_id})"
         page_num = img.page_number or 1
-        by_page.setdefault(page_num, []).append(img.caption.strip())
+        by_page.setdefault(page_num, []).append(marker)
 
     if not by_page:
         return
 
     for page in pages_data:
         pnum = page.get("page_number") or 1
-        captions = by_page.get(pnum)
-        if not captions:
+        markers = by_page.get(pnum)
+        if not markers:
             continue
-        joined = "\n".join(f"- {c}" for c in captions)
-        page["content"] = (page.get("content") or "") + f"\n\n[Image descriptions on page {pnum}]\n{joined}\n"
+        joined = "\n\n".join(markers)
+        page["content"] = (page.get("content") or "") + f"\n\n{joined}\n"
 
 
 async def _extract_text_from_file(file_data: bytes, file_name: str) -> list[dict]:
@@ -191,13 +217,14 @@ async def _extract_text_from_file(file_data: bytes, file_name: str) -> list[dict
     if ext == "pdf":
         import fitz
         doc = fitz.open(stream=file_data, filetype="pdf")
-        for i, page in enumerate(doc):
+        for i, page in enumerate(doc):  # type: ignore[arg-type]
             pages_data.append({"content": (page.get_text() or "").strip(), "page_number": i + 1})
         doc.close()
         return pages_data
 
     if ext == "docx":
         import io
+
         import mammoth
         try:
             result = mammoth.extract_raw_text(io.BytesIO(file_data))
@@ -215,7 +242,7 @@ async def _extract_text_from_file(file_data: bytes, file_name: str) -> list[dict
     import tempfile
 
     try:
-        from content_core import extract_content
+        from content_core.content.extraction import extract_content
         suffix = f".{ext}" if ext else ""
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             tmp.write(file_data)
@@ -239,7 +266,7 @@ async def _extract_text_from_file(file_data: bytes, file_name: str) -> list[dict
 async def _extract_text_from_url(url: str) -> list[dict]:
     """Extract text from a URL — markdown output preferred."""
     try:
-        from content_core import extract_content
+        from content_core.content.extraction import extract_content
         result = await extract_content({"url": url, "output_format": "markdown"})
         return [{"content": result.content or "", "page_number": 1}]
     except Exception as e:

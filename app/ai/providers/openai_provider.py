@@ -48,7 +48,7 @@ class OpenAIEmbedding(EmbeddingProvider):
         return self._client
 
     async def embed(self, text: str) -> list[float]:
-        kwargs = {
+        kwargs: dict = {
             "model": self.config.model_id,
             "input": text,
         }
@@ -114,7 +114,7 @@ class OpenAILLM(LLMProvider):
         self,
         prompt: str,
         system: Optional[str] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
     ) -> str:
         messages = []
@@ -122,12 +122,15 @@ class OpenAILLM(LLMProvider):
             messages.append({"role": "system", "content": system})
         messages.append({"role": "user", "content": prompt})
 
-        response = await self.client.chat.completions.create(
-            model=self.config.model_id,
-            messages=messages,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        kwargs: dict = {
+            "model": self.config.model_id,
+            "messages": messages,
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+
+        response = await self.client.chat.completions.create(**kwargs)
         return response.choices[0].message.content or ""
 
     async def generate_with_tools(
@@ -135,7 +138,7 @@ class OpenAILLM(LLMProvider):
         messages: list[dict],
         tools: list[dict],
         system: Optional[str] = None,
-        max_tokens: int = 8192,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.2,
     ) -> AssistantTurn:
         openai_messages = []
@@ -143,13 +146,16 @@ class OpenAILLM(LLMProvider):
             openai_messages.append({"role": "system", "content": system})
         openai_messages.extend(neutral_to_openai_messages(messages))
 
-        response = await self.client.chat.completions.create(
-            model=self.config.model_id,
-            messages=openai_messages,
-            tools=tools,  # already in OpenAI format
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        kwargs: dict = {
+            "model": self.config.model_id,
+            "messages": openai_messages,
+            "tools": tools,
+            "temperature": temperature,
+        }
+        if max_tokens is not None:
+            kwargs["max_tokens"] = max_tokens
+
+        response = await self.client.chat.completions.create(**kwargs)
 
         choice = response.choices[0]
         message = choice.message
@@ -231,7 +237,6 @@ class OpenAIVision(VisionProvider):
                             ],
                         }
                     ],
-                    max_tokens=1024,
                     temperature=0.2,
                 )
                 return response.choices[0].message.content or ""
@@ -250,7 +255,7 @@ class OpenAIVision(VisionProvider):
                 b"\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00"
                 b"\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
             )
-            result = await self.analyze_image(tiny_png, "image/png", "What is this?")
+            await self.analyze_image(tiny_png, "image/png", "What is this?")
             return True, f"OK — model={self.config.model_id}"
         except Exception as e:
             return False, f"OpenAI Vision error: {e}"

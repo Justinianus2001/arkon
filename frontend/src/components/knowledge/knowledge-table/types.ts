@@ -15,7 +15,7 @@ export type Source = {
   title: string;
   file_name?: string;
   source_type?: string;
-  status: string;
+  status: "ready" | "processing" | "error" | "pending" | "plan_ready" | string;
   progress?: number;
   progress_message?: string;
   page_count?: number;
@@ -28,6 +28,8 @@ export type Source = {
   contributed_by_name?: string;
   scope_type?: string;
   scope_id?: string;
+  pipeline_strategy?: string;
+  pipeline_phase?: string;
   created_at: string;
   updated_at?: string;
 };

@@ -6,34 +6,117 @@ The Arkon wiki is the primary knowledge surface. Instead of storing raw document
 
 ## How compilation works
 
-When you upload a document, the background worker runs a two-phase process:
+When you upload a document, the background worker runs the **MRP pipeline** — a five-phase deterministic process that guarantees every section of the document is read and every claim is traceable back to its source.
 
-### Phase 1 — Pre-analysis
+```
+Phase 0: Triage   → classify document size/strategy
+Phase 1: MAP      → chunk document + parallel LLM extraction per chunk
+Phase 2: REDUCE   → entity dedup + KB reconciliation → Compilation Plan
+Phase 2.5: Review → human approves / modifies / rejects the plan
+Phase 3: REFINE   → parallel page writers (one per planned page)
+Phase 4: VERIFY   → citation check + coverage check + conflict check
+Phase 5: COMMIT   → write pages to DB + embed + regenerate index
+```
 
-A single fast LLM call reads the first ~30K characters of the document and returns a structural map:
-- Document type and primary language
-- Key entities, concepts, and themes
-- Which existing wiki pages are likely to be updated
-- Which new pages should probably be created
+### Phase 0 — Triage
 
-This map is injected into the agent's initial context, giving it a head start before the tool-calling loop begins.
+Classifies the document to choose the right processing strategy based on length:
 
-### Phase 2 — Agent loop
+| Strategy | Document size | Description |
+|---|---|---|
+| `single_pass` | < 30K chars | Entire document fits in one extraction call |
+| `standard` | 30K–200K chars | Split into ~20K-char chunks along section headings |
+| `hierarchical` | > 200K chars | Same as standard but with additional context stitching |
 
-A tool-calling LLM agent runs in a loop. It has access to:
+### Phase 1 — MAP
+
+The document is split into chunks aligned to section headings (from `outline_json`). Each chunk is ~20K characters with a 1K-char overlap prefix from the previous section. Chunks are processed in parallel (up to 6 at once).
+
+Each chunk extraction call returns structured JSON:
+
+```json
+{
+  "entities": [{ "name": "...", "type": "person|org|product|...", "local_offset": 0 }],
+  "concepts": [{ "term": "...", "definition_excerpt": "...", "local_offset": 0 }],
+  "claims":   [{ "statement": "...", "subject": "...", "local_offset": 0, "evidence_length": 200 }],
+  "relations": [{ "from": "...", "to": "...", "type": "..." }],
+  "topics":   ["..."]
+}
+```
+
+`local_offset` values are converted to `absolute_offset` (byte position in the original document) so every claim can be traced back to its exact source excerpt. Each chunk's result is saved to `source_chunk_extracts` immediately — if the worker crashes, MAP resumes from where it left off.
+
+### Phase 2 — REDUCE
+
+All chunk extracts are merged into a unified knowledge graph:
+
+1. **Exact dedup** — normalize entity names (lowercase + strip punctuation), group duplicates
+2. **Embedding dedup** — cosine similarity between entity name vectors; auto-merge above 0.90, LLM disambiguates 0.75–0.90
+3. **KB reconciliation** — semantic search against existing wiki pages per entity:
+   - sim ≥ 0.85 → `UPDATE` candidate (entity has an existing page)
+   - sim 0.60–0.85 → LLM confirms whether to merge or create new
+   - sim < 0.60 → `CREATE` candidate
+4. **Planning call** — a single LLM call produces the **Compilation Plan**: a prioritized list of pages to create or update, each with entity coverage and cross-link targets
+
+The plan is saved to `source_compilation_plans` with `status = pending_review`.
+
+### Phase 2.5 — Human plan review
+
+Before any pages are written, an editor reviews the Compilation Plan:
+
+- **Portal:** Knowledge Base → source row with "Review Plan" status → click to open the plan review dialog
+- **API:** `GET /api/sources/{id}/plan` → `POST /api/sources/{id}/plan/approve` or `/reject`
+
+The plan shows every page that will be created or updated, its type, and the entities it will cover. Editors can approve as-is, submit a modified plan (reorder, rename, remove pages), or reject with a note.
+
+**Auto-approve** is available for CI/CD or trusted pipelines: set `MRP_AUTO_APPROVE_PLAN=true` in your environment.
+
+### Phase 3 — REFINE
+
+Each planned page gets its own writer. Writers run in parallel (up to 4 at once). Every writer receives pre-assembled evidence — the relevant claims with their source excerpts — so it never needs to scan the full document.
+
+**Simple writer** (≤ 8 evidence items, existing page ≤ 3K chars): a single `llm.generate()` call.
+
+**Complex writer** (larger pages): a mini agent loop (max 10 steps) with tools:
 
 | Tool | Purpose |
 |---|---|
-| `read_wiki_index` | See the full catalog of existing pages |
-| `read_wiki_page` | Read any existing page in full |
-| `search_wiki` | Semantic search across existing pages |
-| `read_source_excerpt` | Read any portion of the source document by character offset |
-| `create_page` | Create a new wiki page |
-| `update_page` | Update an existing page with new content |
-| `append_log` | Add an entry to the wiki activity log |
-| `finish` | Signal compilation complete |
+| `read_kb_page` | Read any existing wiki page for cross-referencing |
+| `read_source_excerpt` | Read more context from the source document |
+| `finish` | Submit the completed page content |
 
-The agent decides which pages to create, which to update, and how to write the content. Pages cross-reference each other using `[[wikilinks]]`. The same wiki pages are updated as more documents are added — knowledge accumulates in place rather than creating duplicates.
+Every factual claim in the written content is marked with a `[^N]` footnote citation.
+
+### Phase 4 — VERIFY
+
+Three non-blocking checks run after REFINE:
+
+1. **Citation verification** — each `[^N]` claim is checked against its source excerpt by the LLM. Verdicts: `SUPPORTED` (no change), `PARTIAL` (caveat added), `NOT_SUPPORTED` (marked `[unverified]`), `CONTRADICTED` (flagged with warning marker).
+
+2. **Coverage check** — entities mentioned ≥ 3 times in chunk extracts but not covered by any planned page are logged as warnings.
+
+3. **Conflict check** — new page content is embedded and compared against existing KB pages. Semantically similar pages (sim > 0.80) are checked for factual contradictions by the LLM and logged.
+
+All three checks are informational — they never block the pipeline.
+
+### Phase 5 — COMMIT
+
+All verified pages are written to the database in a single atomic transaction. For each page:
+- `CREATE` → `wiki_service.apply_create()`
+- `UPDATE` → `wiki_service.apply_update()` (falls back to create if the page was deleted)
+
+After all pages are flushed, the wiki index is regenerated, an activity log entry is appended, and the source is marked `ready`.
+
+### Resume behavior
+
+The field `source.pipeline_phase` tracks which phase completed last. If the worker crashes, the next retry picks up from the right phase:
+
+| `pipeline_phase` | Behavior on retry |
+|---|---|
+| `map` | Skip chunks already extracted, process remaining |
+| `reduce` | Re-run REDUCE (all chunks already done) |
+| `plan_review` | Return existing plan — do not re-run MAP+REDUCE |
+| `refine` / `verify` / `commit` | Re-run REFINE from plan (in-memory results are regenerated) |
 
 ### Page types
 

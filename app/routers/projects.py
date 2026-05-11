@@ -17,16 +17,30 @@ Permission model:
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException
+from arq.connections import ArqRedis, create_pool
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Employee, Project, ProjectMember, ProjectSource, ScopeType, Source, WorkspaceRole
-from app.services.auth_service import get_current_user, require_admin, require_permission
-from app.services.permission_engine import can_access_workspace, get_workspace_role, workspace_role_can
+from app.database.models import (
+    Employee,
+    Project,
+    ProjectMember,
+    ProjectSource,
+    Source,
+    WorkspaceRole,
+)
+from app.services.auth_service import (
+    get_current_user,
+)
+from app.services.permission_engine import (
+    can_access_workspace,
+    get_workspace_role,
+    workspace_role_can,
+)
 
 router = APIRouter()
 
@@ -530,9 +544,6 @@ async def remove_project_source(
 # Workspace-scoped upload (owned sources)
 # ---------------------------------------------------------------------------
 
-from fastapi import File, Form, UploadFile
-from arq.connections import ArqRedis, create_pool
-
 _arq_pool_ws: ArqRedis | None = None
 
 async def _get_arq_pool() -> ArqRedis:
@@ -576,8 +587,8 @@ async def upload_workspace_source(
     db.add(source)
     await db.flush()
 
-    from app.services.storage_service import storage_service
     from app.services.kb_service import _guess_content_type
+    from app.services.storage_service import storage_service
     minio_key = f"sources/{source.id}/original/{file_name}"
     storage_service.upload_file(
         object_name=minio_key,
@@ -590,7 +601,8 @@ async def upload_workspace_source(
 
     pool = await _get_arq_pool()
     job = await pool.enqueue_job("ingest_file_task", str(source.id))
-    source.job_id = job.job_id
+    if job:
+        source.job_id = job.job_id
     await db.commit()
 
     return {
@@ -638,7 +650,8 @@ async def add_workspace_url_source(
 
     pool = await _get_arq_pool()
     job = await pool.enqueue_job("ingest_url_task", str(source.id))
-    source.job_id = job.job_id
+    if job:
+        source.job_id = job.job_id
     await db.commit()
 
     return {

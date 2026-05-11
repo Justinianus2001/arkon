@@ -52,7 +52,7 @@ class GoogleEmbedding(EmbeddingProvider):
                 output_dimensionality=self.dimensions,
             ),
         )
-        return list(result.embeddings[0].values)
+        return list(result.embeddings[0].values)  # type: ignore[index,union-attr]
 
     async def embed_batch(
         self, texts: list[str], concurrency: int = 5
@@ -129,7 +129,7 @@ class GoogleLLM(LLMProvider):
         self,
         prompt: str,
         system: Optional[str] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
     ) -> str:
         from google.genai import types
@@ -150,7 +150,7 @@ class GoogleLLM(LLMProvider):
         messages: list[dict],
         tools: list[dict],
         system: Optional[str] = None,
-        max_tokens: int = 8192,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.2,
     ) -> AssistantTurn:
         from google.genai import types as gtypes
@@ -162,9 +162,9 @@ class GoogleLLM(LLMProvider):
             system_instruction=system,
             max_output_tokens=max_tokens,
             temperature=temperature,
-            tools=gemini_tools,
+            tools=gemini_tools,  # type: ignore[arg-type]
             tool_config=gtypes.ToolConfig(
-                function_calling_config=gtypes.FunctionCallingConfig(mode="AUTO")
+                function_calling_config=gtypes.FunctionCallingConfig(mode="AUTO")  # type: ignore[arg-type]
             ),
         )
 
@@ -178,7 +178,7 @@ class GoogleLLM(LLMProvider):
         tool_calls: list[ToolCall] = []
 
         if response.candidates:
-            for part in response.candidates[0].content.parts:
+            for part in (response.candidates[0].content.parts or []):  # type: ignore[union-attr]
                 if hasattr(part, "text") and part.text:
                     text_parts.append(part.text)
                 elif hasattr(part, "function_call") and part.function_call:
@@ -186,7 +186,7 @@ class GoogleLLM(LLMProvider):
                     args = dict(fc.args) if fc.args else {}
                     # Gemini doesn't assign IDs — generate a stable one
                     tc_id = f"fc_{fc.name}_{uuid.uuid4().hex[:8]}"
-                    tool_calls.append(ToolCall(id=tc_id, name=fc.name, arguments=args))
+                    tool_calls.append(ToolCall(id=tc_id, name=fc.name or "", arguments=args))
 
         finish_reason = "tool_use" if tool_calls else "end_turn"
         if response.candidates:
@@ -253,7 +253,6 @@ class GoogleVision(VisionProvider):
                     ],
                     config=types.GenerateContentConfig(
                         temperature=0.2,
-                        max_output_tokens=1024,
                     ),
                 )
                 return response.text.strip() if response.text else ""
@@ -272,7 +271,7 @@ class GoogleVision(VisionProvider):
                 b"\x00\x00\x0cIDATx\x9cc\xf8\x0f\x00\x00\x01\x01\x00"
                 b"\x05\x18\xd8N\x00\x00\x00\x00IEND\xaeB`\x82"
             )
-            result = await self.analyze_image(tiny_png, "image/png", "What is this?")
+            await self.analyze_image(tiny_png, "image/png", "What is this?")
             return True, f"OK — model={self.config.model_id}"
         except Exception as e:
             return False, f"Google Vision error: {e}"

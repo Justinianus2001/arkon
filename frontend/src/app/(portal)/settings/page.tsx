@@ -6,12 +6,12 @@ import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { PageHeader } from "@/components/shared/page-header";
 import { ProviderConfigCard } from "@/components/settings/provider-config-card";
+import { EmbeddingSettingsCard } from "@/components/settings/embedding-settings-card";
 
-// Keys must match ALL_CONFIG_KEYS in app/services/config_service.py
+// Keys must match ALL_CONFIG_KEYS in app/services/config_service.py.
+// Embedding configuration is now driven by EmbeddingSettingsCard (catalog
+// whitelist + re-embed jobs); only LLM and Vision are still free-form here.
 type ProviderConfig = {
-  embedding_provider: string;
-  embedding_model_id: string;
-  embedding_api_key: string;
   llm_provider: string;
   llm_model_id: string;
   llm_api_key: string;
@@ -21,9 +21,6 @@ type ProviderConfig = {
 };
 
 const defaultConfig: ProviderConfig = {
-  embedding_provider: "",
-  embedding_model_id: "",
-  embedding_api_key: "",
   llm_provider: "",
   llm_model_id: "",
   llm_api_key: "",
@@ -110,17 +107,7 @@ export default function SettingsPage() {
       />
 
       <div className="flex flex-col gap-6">
-        <ProviderConfigCard
-          title="Embedding Provider"
-          description="Used to generate vector embeddings for document search"
-          icon="data_array"
-          provider={config.embedding_provider}
-          model={config.embedding_model_id}
-          apiKey={config.embedding_api_key}
-          onProviderChange={(v) => updateField("embedding_provider", v)}
-          onModelChange={(v) => updateField("embedding_model_id", v)}
-          onApiKeyChange={(v) => updateField("embedding_api_key", v)}
-        />
+        <EmbeddingSettingsCard />
 
         <ProviderConfigCard
           title="LLM Provider"

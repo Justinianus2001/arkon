@@ -31,7 +31,7 @@ Knowledge compounds. Every document you add enriches the existing wiki rather th
 ## Features
 
 ### Knowledge Wiki
-Documents are compiled into a persistent, interlinked wiki by an LLM agent - not just indexed. Each page covers a specific entity, concept, or topic. Pages cross-reference each other. The wiki grows smarter as more documents are added.
+Documents are compiled into a persistent, interlinked wiki — not just indexed. The MRP pipeline (MAP → REDUCE → PLAN → REFINE → VERIFY) reads every section of every document, traces every claim back to its source, and lets an editor review the compilation plan before any pages are written. Each page covers a specific entity, concept, or topic. Pages cross-reference each other. The wiki grows smarter as more documents are added.
 
 - Three-panel wiki browser: page tree, content, backlinks & outlinks
 - Full-text and semantic search
@@ -71,10 +71,10 @@ Fine-grained RBAC at department level plus workspace membership roles. Admins de
 ```bash
 git clone https://github.com/nduckmink/arkon.git
 cd arkon
-cp .env.example .env
+cp .env.docker.example .env.docker
 ```
 
-Edit `.env` - set at minimum:
+Edit `.env.docker` - set at minimum:
 
 ```env
 SECRET_KEY=<run: python -c "import secrets; print(secrets.token_urlsafe(32))">
@@ -83,7 +83,7 @@ DEFAULT_ADMIN_PASSWORD=your-secure-password
 ```
 
 ```bash
-docker compose up -d
+docker compose --env-file .env.docker up -d --build
 ```
 
 Open **http://localhost:3119** and log in with your admin credentials.
@@ -133,7 +133,7 @@ Add this to `claude_desktop_config.json` and restart Claude Desktop. The employe
 
 ## Roadmap
 
-- [x] LLM Wiki Agent - documents compiled into persistent, interlinked wiki
+- [x] MRP Pipeline - deterministic MAP→REDUCE→PLAN→REFINE→VERIFY compilation with full document coverage, traceable citations, and human plan review
 - [x] Wiki browser - three-panel layout with graph visualization
 - [x] MCP Server with scoped knowledge access
 - [x] Ingestion pipeline - PDF, DOCX, DOC, URLs, images with vision captions

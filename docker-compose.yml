@@ -5,7 +5,7 @@ x-backend: &backend
     context: .
     dockerfile: Dockerfile
   image: arkon-backend:latest
-  env_file: [.env]
+  env_file: [.env.docker]
   restart: always
   depends_on:
     postgres:
@@ -79,9 +79,6 @@ services:
     container_name: arkon_api
     ports:
       - "5055:5055"
-    volumes:
-      - ./alembic:/app/alembic
-      - ./alembic.ini:/app/alembic.ini
     command: python -m uvicorn app.main:app --host 0.0.0.0 --port 5055
     healthcheck:
       test: ["CMD", "python", "-c",
@@ -90,8 +87,6 @@ services:
       timeout: 5s
       retries: 5
       start_period: 30s
-    networks:
-      - dokploy-network
 
   worker:
     <<: *backend
@@ -100,8 +95,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    networks:
-      - dokploy-network
 
   worker_skills:
     <<: *backend
@@ -110,8 +103,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    networks:
-      - dokploy-network
 
   frontend:
     build:
@@ -130,12 +121,6 @@ services:
     depends_on:
       api:
         condition: service_healthy
-    networks:
-      - dokploy-network
-
-networks:
-  dokploy-network:
-    external: true
 
 volumes:
   postgres_data:

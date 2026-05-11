@@ -59,8 +59,8 @@ Be respectful, constructive, and professional. We want Arkon to be a welcoming s
 3. **Environment:**
 
    ```bash
-   cp .env.example .env
-   # Edit .env with your local values (see blob/docs/HOW_TO_RUN.md for details)
+   cp .env.local.example .env.local
+   # Edit .env.local with your local values (see docs/HOW_TO_RUN.md for details)
    ```
 
 4. **Database:**
@@ -123,8 +123,9 @@ arkon/
 │       └── lib/            # Utilities, API client, auth
 ├── blob/docs/              # Documentation
 ├── pyproject.toml          # Python dependencies & tooling config
-├── docker-compose.yml      # Docker services
-└── .env.example            # Environment template
+├── docker-compose.yml      # Docker services (Postgres, Redis, MinIO, API, workers, frontend)
+├── .env.docker.example     # Env template for `docker compose`
+└── .env.local.example      # Env template for local development
 ```
 
 ### Architecture Quick Reference

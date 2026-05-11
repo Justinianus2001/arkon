@@ -136,3 +136,38 @@ rtk init --global       # Add RTK to ~/.claude/CLAUDE.md
 
 Overall average: **60-90% token reduction** on common development operations.
 <!-- /rtk-instructions -->
+
+# Arkon MCP — Knowledge Base Access
+
+Arkon exposes a FastMCP server for Claude Desktop and Claude Code to query the enterprise knowledge base.
+
+## Setup (Claude Desktop)
+
+```json
+{
+  "mcpServers": {
+    "arkon": {
+      "url": "http://localhost:8000/mcp",
+      "headers": { "Authorization": "Bearer <your-mcp-token>" }
+    }
+  }
+}
+```
+
+Get a token from an Arkon admin. Tokens are scoped to specific knowledge types — what you can read depends on your token.
+
+## Skills
+
+| Skill | Trigger | Role needed |
+|-------|---------|------------|
+| `/arkon-query` | "what do we know about X", "find in KB", "query:" | Any (scoped by token) |
+| `/arkon-edit` | "update wiki", "propose edit", "fix this page" | Contributor+ |
+| `/arkon-review` | "review drafts", "approve draft", "check queue" | Editor/Admin |
+
+Skills live in `skills/`. Claude Code picks them up automatically when working in this repo.
+
+## Key Principles
+
+- **Wiki first, sources second.** `search_wiki` → `read_wiki_page` → source drill-down only for precise citations.
+- **Your token is your scope.** RBAC is enforced server-side; "access denied" means contact an admin.
+- **Always confirm before writing.** `propose_wiki_edit` and `edit_wiki_page` modify the live KB — get user approval first.

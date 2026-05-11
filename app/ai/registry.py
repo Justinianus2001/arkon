@@ -23,7 +23,7 @@ Usage:
         caption = await vision.analyze_image(image_bytes)
 """
 
-from typing import Any, Optional
+from typing import Optional
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -35,7 +35,6 @@ from app.ai.providers.base import (
     ProviderType,
     VisionProvider,
 )
-
 
 # ---------------------------------------------------------------------------
 # Provider class mappings — add new providers here
@@ -91,20 +90,40 @@ class ProviderRegistry:
     def __init__(self, db: AsyncSession):
         self.db = db
 
-    async def get_embedding(self, task: str = "document") -> EmbeddingProvider:
+    async def get_embedding(
+        self,
+        task: str = "document",
+        spec_id: Optional[str] = None,
+    ) -> EmbeddingProvider:
         """
-        Get the configured embedding provider.
+        Get an embedding provider for a specific catalog spec, or the active
+        one configured in app_config.
 
         Args:
-            task: Embedding task type. Some providers (Google) use this to
-                  optimize embeddings for different use cases.
-                  - "document" for document chunks during ingestion
-                  - "search_query" for user queries during search
+            task: Embedding task type (Google uses this for query vs document).
+            spec_id: Override — load this specific catalog entry instead of
+                     the system's active spec. Used by re-embed jobs that need
+                     to embed against a NEW model while the active spec is
+                     still pointing at the OLD one (atomic flip on completion).
         """
-        config = await self._load_config("embedding")
+        config = await self._load_embedding_config(spec_id=spec_id)
         config.extra["task"] = task
         cls = _get_embedding_class(config.provider)
         return cls(config)
+
+    async def get_active_embedding_spec_id(self) -> Optional[str]:
+        """Return the spec_id currently active for search, or None if unset."""
+        from app.ai.embedding_catalog import EMBEDDING_CATALOG
+        from app.services.config_service import (
+            ACTIVE_EMBEDDING_MODEL_KEY,
+            ConfigService,
+        )
+
+        svc = ConfigService(self.db)
+        spec_id = await svc.get(ACTIVE_EMBEDDING_MODEL_KEY)
+        if spec_id and spec_id in EMBEDDING_CATALOG:
+            return spec_id
+        return None
 
     async def get_llm(self) -> LLMProvider:
         """Get the configured LLM provider."""
@@ -151,8 +170,58 @@ class ProviderRegistry:
 
     # --- Internal ---
 
+    async def _load_embedding_config(
+        self, spec_id: Optional[str] = None
+    ) -> ProviderConfig:
+        """
+        Build a ProviderConfig for an embedding model from the catalog.
+
+        Resolution order:
+          1. Explicit spec_id argument (used by migration jobs).
+          2. active_embedding_model_spec_id from app_config.
+
+        API key is loaded from the per-provider key
+        (`embedding_api_key__<provider>`); falls back to the legacy single-key
+        `embedding_api_key` for in-place upgrades.
+        """
+        from app.ai.embedding_catalog import get_spec
+        from app.services.config_service import (
+            ACTIVE_EMBEDDING_MODEL_KEY,
+            ConfigService,
+            embedding_api_key_for,
+        )
+
+        svc = ConfigService(self.db)
+
+        if spec_id is None:
+            spec_id = await svc.get(ACTIVE_EMBEDDING_MODEL_KEY)
+        if not spec_id:
+            raise ValueError(
+                "No active embedding model. Pick one in Settings → Embedding."
+            )
+
+        spec = get_spec(spec_id)  # raises UnknownEmbeddingModel if catalog miss
+        api_key = (
+            await svc.get(embedding_api_key_for(spec.provider))
+            or await svc.get("embedding_api_key")  # legacy fallback
+            or ""
+        )
+        base_url = await svc.get("embedding_base_url")
+
+        return ProviderConfig(
+            provider=ProviderType(spec.provider),
+            api_key=api_key,
+            model_id=spec.model_id,
+            base_url=base_url,
+            dimensions=spec.dimension,
+            extra={"spec_id": spec.id},
+        )
+
     async def _load_config(self, capability: str) -> ProviderConfig:
-        """Load provider config from DB for a given capability."""
+        """Load provider config from DB for LLM / vision capabilities."""
+        if capability == "embedding":
+            return await self._load_embedding_config()
+
         from app.services.config_service import ConfigService
         svc = ConfigService(self.db)
 

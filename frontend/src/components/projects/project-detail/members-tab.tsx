@@ -65,6 +65,7 @@ export function MembersTab({
   onError,
 }: Props) {
   const [selectedEmpId, setSelectedEmpId] = useState("");
+  const [selectedRole, setSelectedRole] = useState("viewer");
   const [updatingRoleFor, setUpdatingRoleFor] = useState<string | null>(null);
 
   const handleAddMember = async () => {
@@ -73,7 +74,7 @@ export function MembersTab({
     try {
       await api(`/api/projects/${project.id}/members`, {
         method: "POST",
-        body: { employee_id: selectedEmpId, role: "member" },
+        body: { employee_id: selectedEmpId, role: selectedRole },
       });
       setSelectedEmpId("");
       await onChanged();
@@ -131,6 +132,16 @@ export function MembersTab({
                 <SelectItem key={e.id} value={e.id}>
                   {e.name} — {e.email}
                 </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+          <Select value={selectedRole} onValueChange={(v) => setSelectedRole(v ?? "viewer")}>
+            <SelectTrigger className="bg-background w-[130px] shrink-0">
+              <SelectValue />
+            </SelectTrigger>
+            <SelectContent>
+              {Object.keys(ROLE_DESCRIPTIONS).map((role) => (
+                <SelectItem key={role} value={role} className="capitalize">{role}</SelectItem>
               ))}
             </SelectContent>
           </Select>

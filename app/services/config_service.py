@@ -6,7 +6,7 @@ Sensitive values (API keys, tokens) are encrypted at rest with Fernet.
 
 import base64
 import hashlib
-from typing import Optional
+from typing import Any, Optional
 
 from cryptography.fernet import Fernet
 from loguru import logger
@@ -14,7 +14,6 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import AppConfig
-
 
 # ---------------------------------------------------------------------------
 # Encryption helpers
@@ -26,21 +25,39 @@ def _derive_fernet_key(secret: str) -> bytes:
     return base64.urlsafe_b64encode(digest)
 
 
-# Keys that contain sensitive data and must be encrypted in DB
+def _is_sensitive(key: str) -> bool:
+    """A key is sensitive if it stores raw credentials/API keys."""
+    return (
+        key in {"embedding_api_key", "llm_api_key", "vision_api_key"}
+        or key.startswith("embedding_api_key__")  # per-provider keys
+    )
+
+
+# Backward-compat alias: code that compared `key in SENSITIVE_KEYS` should now
+# call `_is_sensitive(key)`. Kept for any external callers.
 SENSITIVE_KEYS = frozenset({
     "embedding_api_key",
     "llm_api_key",
     "vision_api_key",
 })
 
+# Active embedding model selection (canonical spec_id from EMBEDDING_CATALOG)
+ACTIVE_EMBEDDING_MODEL_KEY = "active_embedding_model_spec_id"
+
+# Per-provider embedding API keys: `embedding_api_key__<provider>`. We store
+# one key per provider so admins can switch provider without losing the
+# previously configured key. Encrypted at rest.
+def embedding_api_key_for(provider: str) -> str:
+    return f"embedding_api_key__{provider}"
+
+
 # All config keys that can be managed via UI
 ALL_CONFIG_KEYS = [
-    # --- Embedding provider ---
-    "embedding_provider",       # "google" | "openai" | "voyage" | "ollama" | "cohere"
-    "embedding_model_id",       # e.g. "gemini-embedding-2", "text-embedding-3-small"
-    "embedding_api_key",        # Provider API key
-    "embedding_base_url",       # Custom endpoint (Ollama, Azure, proxy)
-    "embedding_dimensions",     # Output vector dimensions (768, 1536, 3072...)
+    # --- Embedding (whitelist-driven) ---
+    ACTIVE_EMBEDDING_MODEL_KEY,  # canonical spec_id, e.g. "openai/text-embedding-3-small"
+    "embedding_api_key__google",
+    "embedding_api_key__openai",
+    "embedding_base_url",        # optional, custom endpoint (Ollama, Azure, proxy)
 
     # --- LLM provider (for summarization, webhook gateway) ---
     "llm_provider",             # "google" | "openai" | "anthropic" | "ollama"
@@ -56,6 +73,12 @@ ALL_CONFIG_KEYS = [
 
     # --- System ---
     "session_timeout_minutes",
+
+    # --- Deprecated embedding keys (kept readable for one release; do not write) ---
+    "embedding_provider",
+    "embedding_model_id",
+    "embedding_api_key",
+    "embedding_dimensions",
 ]
 
 
@@ -105,7 +128,7 @@ class ConfigService:
 
         if row and row.value:
             value = row.value
-            if key in SENSITIVE_KEYS:
+            if _is_sensitive(key):
                 value = self._decrypt(value)
             return value
 
@@ -120,7 +143,7 @@ class ConfigService:
     async def set(self, key: str, value: str) -> None:
         """Set a config value in DB."""
         store_value = value
-        if key in SENSITIVE_KEYS and value:
+        if _is_sensitive(key) and value:
             store_value = self._encrypt(value)
 
         stmt = select(AppConfig).where(AppConfig.key == key)
@@ -141,13 +164,13 @@ class ConfigService:
             result[key] = await self.get(key)
         return result
 
-    async def get_all_for_ui(self) -> dict[str, any]:
+    async def get_all_for_ui(self) -> dict[str, Any]:
         """Get all config values, masking sensitive ones for UI display."""
         all_config = await self.get_all()
         ui_config = {}
 
         for key, value in all_config.items():
-            if key in SENSITIVE_KEYS and value:
+            if _is_sensitive(key) and value:
                 # Mask: show only last 4 chars
                 if len(value) > 8:
                     ui_config[key] = "•" * 8 + value[-4:]
@@ -156,7 +179,7 @@ class ConfigService:
                 ui_config[f"{key}_configured"] = True
             else:
                 ui_config[key] = value
-                if key in SENSITIVE_KEYS:
+                if _is_sensitive(key):
                     ui_config[f"{key}_configured"] = bool(value)
 
         return ui_config

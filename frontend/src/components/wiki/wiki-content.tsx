@@ -12,6 +12,18 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { WikiImage } from "@/components/wiki/wiki-image";
+import { useImageResolver } from "@/lib/hooks/use-image-resolver";
+
+const IMAGE_REF_RE = /image:\/\/([0-9a-fA-F-]{36})/g;
+
+// react-markdown's default URL sanitizer strips unknown schemes. Whitelist
+// `image://<uuid>` so our img renderer receives the original src.
+function wikiUrlTransform(url: string): string {
+  if (url.startsWith("image://")) return url;
+  if (/^(https?:|mailto:|tel:|#|\/|\.\/|\.\.\/)/i.test(url)) return url;
+  return "";
+}
 
 function preprocessWikilinks(md: string): string {
   return md
@@ -66,6 +78,13 @@ export function WikiContent({
   const processed = preprocessWikilinks(markdown);
   const headings = React.useMemo(() => extractHeadings(markdown), [markdown]);
   const [activeHeading, setActiveHeading] = React.useState<string | null>(null);
+
+  const imageIds = React.useMemo(() => {
+    const out = new Set<string>();
+    for (const m of processed.matchAll(IMAGE_REF_RE)) out.add(m[1].toLowerCase());
+    return Array.from(out);
+  }, [processed]);
+  const imageResolver = useImageResolver(imageIds);
 
   // Intersection observer for active heading tracking
   React.useEffect(() => {
@@ -122,6 +141,7 @@ export function WikiContent({
       <div className="prose-wiki">
         <ReactMarkdown
           remarkPlugins={[remarkGfm]}
+          urlTransform={wikiUrlTransform}
           components={{
             h1: ({ children }) => (
               <h1 className="font-heading text-3xl font-normal leading-tight text-foreground mt-0 mb-4">
@@ -263,6 +283,30 @@ export function WikiContent({
               <strong className="font-semibold text-foreground">{children}</strong>
             ),
             em: ({ children }) => <em className="italic">{children}</em>,
+            img: ({ src, alt }) => {
+              const srcStr = typeof src === "string" ? src : "";
+              const altStr = typeof alt === "string" ? alt : "";
+              if (!srcStr.startsWith("image://")) {
+                // External / regular image — render as-is.
+                // eslint-disable-next-line @next/next/no-img-element
+                return (
+                  <img
+                    src={srcStr}
+                    alt={altStr}
+                    loading="lazy"
+                    className="rounded-lg border border-border max-w-full my-4 mx-auto"
+                  />
+                );
+              }
+              const uuid = srcStr.slice("image://".length).toLowerCase();
+              const url = imageResolver.resolved[uuid];
+              if (url) return <WikiImage src={url} alt={altStr} status="ok" />;
+              if (imageResolver.denied.has(uuid))
+                return <WikiImage alt={altStr} status="denied" />;
+              if (imageResolver.loading)
+                return <WikiImage alt={altStr} status="loading" />;
+              return <WikiImage alt={altStr} status="missing" />;
+            },
             table: ({ children }) => (
               <div className="my-5 rounded-xl border border-border overflow-hidden shadow-sahara">
                 <Table>{children}</Table>

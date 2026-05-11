@@ -34,6 +34,10 @@ export function EditSourceDialog({
   const [title, setTitle] = React.useState(source.title);
   const [typeId, setTypeId] = React.useState(source.knowledge_type_id || "");
   const [selectedDepts, setSelectedDepts] = React.useState<string[]>(source.department_ids || []);
+
+  React.useEffect(() => {
+    setSelectedDepts(source.department_ids || []);
+  }, [source.id]);
   const [scopeType, setScopeType] = React.useState(source.scope_type || "global");
   const [scopeId, setScopeId] = React.useState(source.scope_id || "");
   const [projects, setProjects] = React.useState<{ id: string; name: string }[]>([]);
@@ -198,6 +202,12 @@ export function EditSourceDialog({
                 </SelectItem>
               </SelectContent>
             </Select>
+            {scopeType === "global" && (
+              <p className="text-xs text-amber-600 dark:text-amber-400 flex items-start gap-1.5 mt-0.5">
+                <span className="material-symbols-outlined shrink-0" style={{ fontSize: 13, marginTop: 1 }}>warning</span>
+                Document content will be compiled into the shared wiki and visible to all employees — including those without access to the original file. Only use Global if the content is not sensitive.
+              </p>
+            )}
           </div>
 
           {scopeType === "project" && (

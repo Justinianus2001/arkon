@@ -36,12 +36,12 @@ class AnthropicLLM(LLMProvider):
         self,
         prompt: str,
         system: Optional[str] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
     ) -> str:
         kwargs = {
             "model": self.config.model_id,
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens or 16384,
             "temperature": temperature,
             "messages": [{"role": "user", "content": prompt}],
         }
@@ -56,7 +56,7 @@ class AnthropicLLM(LLMProvider):
         messages: list[dict],
         tools: list[dict],
         system: Optional[str] = None,
-        max_tokens: int = 8192,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.2,
     ) -> AssistantTurn:
         anthropic_messages = neutral_to_anthropic_messages(messages)
@@ -64,7 +64,7 @@ class AnthropicLLM(LLMProvider):
 
         kwargs: dict = {
             "model": self.config.model_id,
-            "max_tokens": max_tokens,
+            "max_tokens": max_tokens or 16384,
             "temperature": temperature,
             "messages": anthropic_messages,
             "tools": anthropic_tools,

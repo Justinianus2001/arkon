@@ -1,15 +1,19 @@
 """
 Image extraction service — extract images from PDF and DOCX files.
-Uploads extracted images to MinIO and maps them to text chunks.
+Uploads extracted images to MinIO and returns metadata for downstream
+captioning + persistence.
 """
 
 import io
-import uuid
 from typing import Optional
 
 from loguru import logger
 
 from app.services.storage_service import storage_service
+
+# Skip images smaller than this — they're almost always icons/decorators,
+# not content. Tune via env later if needed.
+MIN_IMAGE_BYTES = 2048
 
 
 def _mime_from_ext(ext: str) -> str:
@@ -33,12 +37,20 @@ class ImageInfo:
         minio_key: str,
         page_number: Optional[int],
         image_index: int,
+        content_type: str,
+        size_bytes: int,
         caption: Optional[str] = None,
+        image_id: Optional[str] = None,
     ):
         self.minio_key = minio_key
         self.page_number = page_number
         self.image_index = image_index
+        self.content_type = content_type
+        self.size_bytes = size_bytes
         self.caption = caption
+        # Set after the row is persisted to source_images. The compiler
+        # references this in `image://<uuid>` markers inside wiki content_md.
+        self.image_id = image_id
 
 
 def extract_images_from_pdf(
@@ -73,22 +85,23 @@ def extract_images_from_pdf(
                 img_bytes = base_image["image"]
                 img_ext = base_image.get("ext", "png")
 
-                # Skip very small images (likely icons/decorators)
-                if len(img_bytes) < 2048:
+                if len(img_bytes) < MIN_IMAGE_BYTES:
                     continue
 
-                # Upload to MinIO
+                content_type = _mime_from_ext(img_ext)
                 object_name = f"sources/{source_id}/images/page{page_num + 1}_{image_index}.{img_ext}"
                 storage_service.upload_file(
                     object_name=object_name,
                     data=img_bytes,
-                    content_type=_mime_from_ext(img_ext),
+                    content_type=content_type,
                 )
 
                 images.append(ImageInfo(
                     minio_key=object_name,
                     page_number=page_num + 1,
                     image_index=image_index,
+                    content_type=content_type,
+                    size_bytes=len(img_bytes),
                 ))
                 image_index += 1
 
@@ -117,7 +130,8 @@ def extract_images_from_docx(
         logger.warning(f"Failed to open DOCX for image extraction: {e}")
         return images
 
-    for idx, rel in enumerate(doc.part.rels.values()):
+    image_index = 0
+    for rel in doc.part.rels.values():
         if "image" in rel.reltype:
             try:
                 img_blob = rel.target_part.blob
@@ -126,11 +140,10 @@ def extract_images_from_docx(
                 if ext == "svg+xml":
                     ext = "svg"
 
-                # Skip tiny images
-                if len(img_blob) < 2048:
+                if len(img_blob) < MIN_IMAGE_BYTES:
                     continue
 
-                object_name = f"sources/{source_id}/images/docx_{idx}.{ext}"
+                object_name = f"sources/{source_id}/images/docx_{image_index}.{ext}"
                 storage_service.upload_file(
                     object_name=object_name,
                     data=img_blob,
@@ -139,12 +152,15 @@ def extract_images_from_docx(
 
                 images.append(ImageInfo(
                     minio_key=object_name,
-                    page_number=None,  # DOCX doesn't have page numbers easily
-                    image_index=idx,
+                    page_number=None,  # DOCX doesn't expose page numbers easily
+                    image_index=image_index,
+                    content_type=content_type,
+                    size_bytes=len(img_blob),
                 ))
+                image_index += 1
 
             except Exception as e:
-                logger.warning(f"Failed to extract DOCX image {idx}: {e}")
+                logger.warning(f"Failed to extract DOCX image {image_index}: {e}")
                 continue
 
     logger.info(f"Extracted {len(images)} images from DOCX (source {source_id})")

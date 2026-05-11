@@ -96,7 +96,7 @@ class LLMProvider(ABC):
         self,
         prompt: str,
         system: Optional[str] = None,
-        max_tokens: int = 4096,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.7,
     ) -> str:
         """Generate a text completion."""
@@ -107,7 +107,7 @@ class LLMProvider(ABC):
         messages: list[dict],
         tools: list[dict],
         system: Optional[str] = None,
-        max_tokens: int = 8192,
+        max_tokens: Optional[int] = None,
         temperature: float = 0.2,
     ) -> "AssistantTurn":
         """

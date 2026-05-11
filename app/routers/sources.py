@@ -13,19 +13,23 @@ from arq.connections import ArqRedis, create_pool
 from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from loguru import logger
 from pydantic import BaseModel
-from sqlalchemy import delete as sql_delete, func, select, or_, exists
+from sqlalchemy import delete as sql_delete
+from sqlalchemy import exists, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Employee, Source, SourceDepartment, ScopeType, WikiPage
+from app.database.models import Employee, ScopeType, Source, SourceDepartment, WikiPage
 from app.database.repository import Repository
-from app.services.auth_service import require_admin, require_permission, get_current_user
+from app.services.audit_service import log_audit
+from app.services.auth_service import (
+    get_current_user,
+    require_permission,
+)
 from app.services.permission_engine import (
     _get_user_permissions,
     get_scope_level,
 )
-from app.services.audit_service import log_audit
 
 router = APIRouter()
 
@@ -93,7 +97,7 @@ class SourceUpdate(BaseModel):
 
 async def _wiki_page_count(session: AsyncSession, source_id: uuid.UUID) -> int:
     """How many wiki pages reference this source in their source_ids array."""
-    stmt = select(func.count()).select_from(WikiPage).where(WikiPage.source_ids.any(source_id))
+    stmt = select(func.count()).select_from(WikiPage).where(WikiPage.source_ids.any(source_id))  # type: ignore[arg-type]
     return (await session.execute(stmt)).scalar_one()
 
 
@@ -254,10 +258,7 @@ async def get_source(
     if source.minio_key:
         try:
             from app.services.storage_service import storage_service
-            download_url = storage_service.get_download_url(
-                source.minio_key,
-                expires_seconds=3600,
-            )
+            download_url = storage_service.get_presigned_url(source.minio_key)
         except Exception:
             pass
 
@@ -350,8 +351,8 @@ async def upload_source(
     await db.refresh(source)
 
     # Upload to MinIO before enqueuing so the worker downloads from storage
-    from app.services.storage_service import storage_service
     from app.services.kb_service import _guess_content_type
+    from app.services.storage_service import storage_service
     minio_key = f"sources/{source.id}/original/{file_name}"
     storage_service.upload_file(
         object_name=minio_key,
@@ -366,7 +367,8 @@ async def upload_source(
     job = await pool.enqueue_job(
         "ingest_file_task", str(source.id),
     )
-    source.job_id = job.job_id
+    if job:
+        source.job_id = job.job_id
     await db.commit()
 
     source = (await db.execute(
@@ -375,7 +377,7 @@ async def upload_source(
         .where(Source.id == source.id)
     )).scalar_one()
 
-    logger.info(f"Enqueued ingestion job {job.job_id} for source {source.id}")
+    logger.info(f"Enqueued ingestion job {job.job_id if job else 'N/A'} for source {source.id}")
     return _to_response(source)
 
 
@@ -411,7 +413,8 @@ async def add_url_source(
 
     pool = await get_arq_pool()
     job = await pool.enqueue_job("ingest_url_task", str(source.id))
-    source.job_id = job.job_id
+    if job:
+        source.job_id = job.job_id
     await db.commit()
 
     source = (await db.execute(
@@ -420,7 +423,7 @@ async def add_url_source(
         .where(Source.id == source.id)
     )).scalar_one()
 
-    logger.info(f"Enqueued URL ingestion job {job.job_id} for source {source.id}")
+    logger.info(f"Enqueued URL ingestion job {job.job_id if job else 'N/A'} for source {source.id}")
     return _to_response(source)
 
 
@@ -463,18 +466,17 @@ async def update_source(
     return _to_response(source, await _wiki_page_count(db, source_id))
 
 
-@router.post("/sources/{source_id}/recompile", response_model=SourceResponse)
-async def recompile_source(
+@router.post("/sources/{source_id}/retry", response_model=SourceResponse)
+async def retry_source(
     source_id: uuid.UUID,
-    force: bool = Query(False, description="If true, detach this source from existing wiki pages first"),
     db: AsyncSession = Depends(get_db),
     _user: Employee = require_permission("doc:edit"),
 ):
     """
-    Re-run the wiki compiler for this source. Without `force`, the compiler
-    merges new ops into the existing wiki state. With `force=True`, the
-    source is first detached from all wiki pages (orphans deleted) so the
-    wiki effectively starts fresh from this source's perspective.
+    Retry ingestion for a source whose previous attempt failed.
+
+    Only allowed when the source is in `error` status — successful sources
+    cannot be re-ingested.
     """
     source = (await db.execute(
         select(Source)
@@ -483,24 +485,36 @@ async def recompile_source(
     )).scalar_one_or_none()
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
+    allowed_statuses = ("error", "plan_ready")
+    if source.status not in allowed_statuses:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Retry is only allowed for sources in {allowed_statuses} status",
+        )
     if source.source_type == "url" and not source.url:
-        raise HTTPException(status_code=400, detail="Source has no URL to recompile")
+        raise HTTPException(status_code=400, detail="Source has no URL to retry")
     if source.source_type == "file" and not source.minio_key:
         raise HTTPException(status_code=400, detail="Source file not found in storage")
 
     source.status = "pending"
     source.progress = 0
-    source.progress_message = "Queued for recompile..."
+    source.progress_message = "Queued for retry..."
     source.error_message = None
     await db.flush()
 
     pool = await get_arq_pool()
-    if source.source_type == "url":
-        job = await pool.enqueue_job("ingest_url_task", str(source_id))
+    # Route to the right task based on pipeline phase
+    pipeline_phase = source.pipeline_phase
+    if pipeline_phase in ("refine", "verify", "commit"):
+        task_name = "ingest_refine_task"
+    elif pipeline_phase in ("map", "reduce", "plan_review") or source.status == "plan_ready":
+        task_name = "ingest_map_reduce_task"
     else:
-        job = await pool.enqueue_job("reingest_file_task", str(source_id), force)
+        task_name = "ingest_url_task" if source.source_type == "url" else "ingest_file_task"
+    job = await pool.enqueue_job(task_name, str(source_id))
 
-    source.job_id = job.job_id
+    if job:
+        source.job_id = job.job_id
     await db.commit()
     await db.refresh(source)
 
@@ -509,8 +523,143 @@ async def recompile_source(
         .options(*_source_load_options())
         .where(Source.id == source_id)
     )).scalar_one()
-    logger.info(f"Queued recompile job {job.job_id} for source {source_id} (force={force})")
+    logger.info(f"Queued retry job {job.job_id if job else 'N/A'} for source {source_id}")
     return _to_response(source)
+
+
+# ---------------------------------------------------------------------------
+# Compilation Plan review endpoints (MRP Phase 2.5)
+# ---------------------------------------------------------------------------
+
+class PlanApproveRequest(BaseModel):
+    note: Optional[str] = None
+    modified_plan: Optional[dict] = None
+
+
+class PlanRejectRequest(BaseModel):
+    note: str
+
+
+@router.get("/sources/{source_id}/plan")
+async def get_compilation_plan(
+    source_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = require_permission("doc:read"),
+):
+    """Return the current compilation plan for a source (MRP Phase 2.5)."""
+    from app.database.models import SourceCompilationPlan
+    plan = (await db.execute(
+        select(SourceCompilationPlan).where(SourceCompilationPlan.source_id == source_id)
+    )).scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="No compilation plan found for this source")
+
+    plan_json = dict(plan.plan_json or {})
+    # Strip internal keys before returning
+    plan_json.pop("_claims", None)
+    plan_json.pop("_entities", None)
+    plan_json.pop("_concepts", None)
+
+    return {
+        "id": str(plan.id),
+        "source_id": str(plan.source_id),
+        "status": plan.status,
+        "plan": plan_json,
+        "created_at": plan.created_at.isoformat(),
+        "reviewed_at": plan.reviewed_at.isoformat() if plan.reviewed_at else None,
+        "review_note": plan.review_note,
+    }
+
+
+@router.post("/sources/{source_id}/plan/approve")
+async def approve_compilation_plan(
+    source_id: uuid.UUID,
+    body: PlanApproveRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = require_permission("doc:edit"),
+):
+    """Approve (and optionally modify) the compilation plan, then enqueue REFINE task."""
+    from datetime import datetime, timezone
+
+    from app.database.models import SourceCompilationPlan
+
+    plan = (await db.execute(
+        select(SourceCompilationPlan).where(SourceCompilationPlan.source_id == source_id)
+    )).scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="No plan found for this source")
+    if plan.status != "pending_review":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan is not pending review (status={plan.status})",
+        )
+
+    if body.modified_plan:
+        # Preserve internal keys from original plan
+        internal_keys = {k: plan.plan_json[k] for k in ("_claims", "_entities", "_concepts") if k in plan.plan_json}
+        merged = {**body.modified_plan, **internal_keys}
+        plan.plan_json = merged
+
+    plan.status = "approved"
+    plan.reviewed_by = user.id
+    plan.review_note = body.note
+    plan.reviewed_at = datetime.now(timezone.utc)
+
+    source = await db.get(Source, source_id)
+    if source:
+        source.status = "processing"
+        source.progress = 78
+        source.progress_message = "Plan approved — compiling wiki pages..."
+
+    await db.flush()
+
+    pool = await get_arq_pool()
+    job = await pool.enqueue_job("ingest_refine_task", str(source_id))
+
+    if job and source:
+        source.job_id = job.job_id
+    await db.commit()
+
+    logger.info(f"Plan approved for source {source_id} by user {user.id}, refine job: {job.job_id if job else 'N/A'}")
+    return {"approved": True, "job_id": job.job_id if job else None}
+
+
+@router.post("/sources/{source_id}/plan/reject")
+async def reject_compilation_plan(
+    source_id: uuid.UUID,
+    body: PlanRejectRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = require_permission("doc:edit"),
+):
+    """Reject the compilation plan. Source moves to error status."""
+    from datetime import datetime, timezone
+
+    from app.database.models import SourceCompilationPlan
+
+    plan = (await db.execute(
+        select(SourceCompilationPlan).where(SourceCompilationPlan.source_id == source_id)
+    )).scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="No plan found for this source")
+    if plan.status != "pending_review":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan is not pending review (status={plan.status})",
+        )
+
+    plan.status = "rejected"
+    plan.reviewed_by = user.id
+    plan.review_note = body.note
+    plan.reviewed_at = datetime.now(timezone.utc)
+
+    source = await db.get(Source, source_id)
+    if source:
+        source.status = "error"
+        source.error_message = f"Compilation plan rejected: {body.note}"
+
+    await db.commit()
+    logger.info(f"Plan rejected for source {source_id} by user {user.id}: {body.note}")
+    return {"rejected": True}
 
 
 @router.delete("/sources/{source_id}")
@@ -530,10 +679,14 @@ async def delete_source(
     except Exception as e:
         logger.warning(f"Failed to clean MinIO files for source {source_id}: {e}")
 
-    # Detach from wiki — orphan pages are removed, then rebuild index.
+    # Detach from wiki — single-source pages are deleted, then rebuild index.
     from app.services import wiki_service
     await wiki_service.detach_source_from_wiki(db, source_id)
-    await wiki_service.regenerate_index(db)
+    await wiki_service.regenerate_index(
+        db,
+        scope_type=source.scope_type or "global",
+        scope_id=source.scope_id,
+    )
 
     await log_audit(db, _user, "delete", "source", str(source.id), reason=source.title)
     await repo.delete_by_id(Source, source_id)

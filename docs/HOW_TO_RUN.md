@@ -37,10 +37,10 @@ docker run -d --name arkon-minio \
 ## 2. Environment
 
 ```bash
-cp .env.example .env
+cp .env.local.example .env.local
 ```
 
-Minimum values to set in `.env`:
+Minimum values to set in `.env.local`:
 
 ```env
 SECRET_KEY=<generate with: python -c "import secrets; print(secrets.token_urlsafe(32))">
@@ -100,7 +100,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 5055 --reload
 
 On first startup, Arkon will:
 - Create the MinIO bucket if it doesn't exist
-- **Auto-create the default admin account** from `.env` (if no admin exists yet)
+- **Auto-create the default admin account** from `.env.local` (if no admin exists yet)
 
 You should see:
 ```
@@ -132,7 +132,7 @@ cd frontend
 npm run dev
 ```
 
-Open http://localhost:3000 — log in with the admin credentials from `.env`.
+Open http://localhost:3000 — log in with the admin credentials from `.env.local`.
 
 ## 7. Configure AI Providers
 
@@ -203,7 +203,7 @@ Use the `access_token` as `Authorization: Bearer <token>` for all admin API call
 | CRUD | `/api/sources` | Manage documents |
 | POST | `/api/sources/upload` | Upload a file |
 | POST | `/api/sources/url` | Add a URL source |
-| POST | `/api/sources/:id/recompile` | Re-run wiki compilation for a source |
+| POST | `/api/sources/:id/retry` | Retry ingestion for a failed source |
 | CRUD | `/api/contacts` | Manage contacts |
 
 ### Wiki (requires login)
@@ -243,10 +243,10 @@ After generating an MCP token for an employee, add to Claude Desktop config (`cl
 |---|---|
 | `connection refused` on port 5432 | PostgreSQL is not running |
 | `pgvector extension not found` | Use `pgvector/pgvector` Docker image, or install pgvector manually |
-| `No admin created` on startup | Check `DEFAULT_ADMIN_EMAIL` / `DEFAULT_ADMIN_PASSWORD` in `.env` |
+| `No admin created` on startup | Check `DEFAULT_ADMIN_EMAIL` / `DEFAULT_ADMIN_PASSWORD` in `.env.local` |
 | Documents stuck at `pending` | Wiki worker not running — start Terminal 2 |
 | Wiki pages not created after upload | Check LLM provider config in Settings; check worker logs for errors |
 | Skills not processing | Skills worker not running — start Terminal 3 |
 | Frontend shows "API Error" | Backend not running, or `NEXT_PUBLIC_API_URL` incorrect in `frontend/.env.local` |
-| CORS errors in browser | Add `http://localhost:3000` to `CORS_ORIGINS` in backend `.env` |
+| CORS errors in browser | Add `http://localhost:3000` to `CORS_ORIGINS` in backend `.env.local` |
 | `requires Python 3.11` error | Use `py -3.11 -m venv .venv` to create venv with correct version |

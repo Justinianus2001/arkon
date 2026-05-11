@@ -11,23 +11,22 @@ from datetime import datetime
 from enum import Enum as PyEnum
 from typing import Optional
 
-from pgvector.sqlalchemy import Vector
-import sqlalchemy as sa
+from pgvector.sqlalchemy import HALFVEC, Vector
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     PrimaryKeyConstraint,
     String,
     Text,
-    Integer,
-    Boolean,
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID, ENUM as PgEnum
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import ENUM as PgEnum
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -55,6 +54,14 @@ WORKSPACE_ROLE_HIERARCHY: dict[WorkspaceRole, int] = {
     WorkspaceRole.EDITOR: 2,
     WorkspaceRole.ADMIN: 3,
 }
+
+
+class SkillContributionStatus(str, PyEnum):
+    """Status of a skill contribution request."""
+    DRAFT = "draft"
+    PENDING = "pending"
+    APPROVED = "approved"
+    REJECTED = "rejected"
 
 
 class Base(DeclarativeBase):
@@ -102,6 +109,14 @@ class Source(Base):
     progress: Mapped[int] = mapped_column(Integer, default=0)
     progress_message: Mapped[Optional[str]] = mapped_column(String(500))
     job_id: Mapped[Optional[str]] = mapped_column(String(200))
+    pipeline_strategy: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True,
+        comment="single_pass | standard | hierarchical — set by Phase 0 triage",
+    )
+    pipeline_phase: Mapped[Optional[str]] = mapped_column(
+        String(30), nullable=True,
+        comment="Current MRP phase: map | reduce | plan_review | refine | verify | commit",
+    )
     # Heading-based TOC tree (PageIndex-style) built at ingest time from extracted markdown.
     # Schema: [{"title": str, "level": int, "page": int, "char_start": int, "char_end": int, "children": [...]}]
     outline_json: Mapped[Optional[list]] = mapped_column(JSONB)
@@ -146,6 +161,102 @@ class SourceDepartment(Base):
     department: Mapped["Department"] = relationship(back_populates="source_departments")
 
 
+class SourceImage(Base):
+    """An image extracted from a source document during ingestion.
+
+    Wiki pages reference these by id via `image://<uuid>` markers in content_md.
+    The wiki compiler decides which page each image belongs to based on context.
+    """
+    __tablename__ = "source_images"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    minio_key: Mapped[str] = mapped_column(Text, nullable=False)
+    page_number: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    image_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    caption: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    content_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(),
+    )
+
+    __table_args__ = (
+        UniqueConstraint("source_id", "image_index", name="uq_source_images_source_idx"),
+    )
+
+    source: Mapped["Source"] = relationship()
+
+
+# ---------------------------------------------------------------------------
+# MRP Pipeline — MAP/REDUCE/PLAN/REFINE/VERIFY compilation state
+# ---------------------------------------------------------------------------
+
+class SourceChunkExtract(Base):
+    """Phase 1 MAP output: structured knowledge extracted from one document chunk.
+
+    Each row corresponds to a ~20k-char section of the source document.
+    Stored immediately after extraction so the pipeline can resume if interrupted.
+    """
+    __tablename__ = "source_chunk_extracts"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_char: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_char: Mapped[int] = mapped_column(Integer, nullable=False)
+    section_path: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    extract_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    __table_args__ = (
+        UniqueConstraint("source_id", "chunk_index", name="uq_sce_source_chunk"),
+        Index("ix_sce_source_status", "source_id", "status"),
+    )
+
+    source: Mapped["Source"] = relationship()
+
+
+class SourceCompilationPlan(Base):
+    """Phase 2 REDUCE output: compilation plan listing pages to create/update.
+
+    One plan per source. Status flow:
+    pending_review → approved (→ in_progress → done) | rejected
+    """
+    __tablename__ = "source_compilation_plans"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"),
+        nullable=False, unique=True,
+    )
+    plan_json: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    status: Mapped[str] = mapped_column(String(30), nullable=False, default="pending_review")
+    reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="SET NULL"), nullable=True,
+    )
+    review_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    __table_args__ = (
+        Index("ix_scp_status", "status"),
+    )
+
+    source: Mapped["Source"] = relationship()
+    reviewer: Mapped[Optional["Employee"]] = relationship(foreign_keys=[reviewed_by])
+
+
 # ---------------------------------------------------------------------------
 # Wiki — LLM-compiled persistent knowledge layer
 # ---------------------------------------------------------------------------
@@ -180,7 +291,9 @@ class WikiPage(Base):
     source_ids: Mapped[list[uuid.UUID]] = mapped_column(
         ARRAY(UUID(as_uuid=True)), nullable=False, default=list,
     )
-    embedding = mapped_column(Vector(768), nullable=True)
+    # Embeddings live in per-dimension tables (wiki_page_embeddings_<dim>) so
+    # different embedding models with different output sizes can coexist.
+    # See app/ai/embedding_catalog.py and migration 015.
     version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     orphaned: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -582,7 +695,6 @@ class Skill(Base):
     )
     name: Mapped[str] = mapped_column(String(200), nullable=False, unique=True)
     slug: Mapped[str] = mapped_column(String(200), nullable=False, unique=True, index=True)
-    description: Mapped[Optional[str]] = mapped_column(Text)
     scope_type: Mapped[str] = mapped_column(
         String(20), default="global",
         comment="Scope type: global, project, department, team",
@@ -599,6 +711,10 @@ class Skill(Base):
         server_default="active",
         nullable=False,
     )
+    is_system: Mapped[bool] = mapped_column(
+        Boolean, default=False, nullable=False, server_default="false",
+        comment="True for skills seeded from source code. Immutable via API.",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now()
     )
@@ -608,9 +724,15 @@ class Skill(Base):
 
     # Relationships
     departments: Mapped[list["SkillDepartment"]] = relationship(
-        back_populates="skill", cascade="all, delete-orphan"
+        "SkillDepartment",
+        back_populates="skill",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
     versions: Mapped[list["SkillVersion"]] = relationship(
+        back_populates="skill", cascade="all, delete-orphan"
+    )
+    contributions: Mapped[list["SkillContribution"]] = relationship(
         back_populates="skill", cascade="all, delete-orphan"
     )
 
@@ -664,6 +786,7 @@ class SkillVersion(Base):
     __table_args__ = (
         Index("ix_skill_versions_skill_id", "skill_id"),
     )
+
 
 
 # ---------------------------------------------------------------------------
@@ -722,3 +845,155 @@ class AuditLog(Base):
         Index("ix_audit_log_principal", "principal_id"),
         Index("ix_audit_log_resource", "resource_type", "resource_id"),
     )
+
+
+# ---------------------------------------------------------------------------
+# Multi-dimension wiki page embeddings
+# ---------------------------------------------------------------------------
+# One table per supported output dimension. The active embedding model spec
+# (stored in app_config.active_embedding_model_spec_id) determines which table
+# search & ingestion read/write. See app/ai/embedding_catalog.py.
+
+class _WikiPageEmbeddingBase:
+    """Mixin: shared columns for all wiki_page_embeddings_<dim> tables."""
+
+    page_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("wiki_pages.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    model_spec_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class WikiPageEmbedding768(_WikiPageEmbeddingBase, Base):
+    __tablename__ = "wiki_page_embeddings_768"
+    embedding = mapped_column(Vector(768), nullable=False)
+
+
+class WikiPageEmbedding1024(_WikiPageEmbeddingBase, Base):
+    __tablename__ = "wiki_page_embeddings_1024"
+    embedding = mapped_column(Vector(1024), nullable=False)
+
+
+class WikiPageEmbedding1536(_WikiPageEmbeddingBase, Base):
+    __tablename__ = "wiki_page_embeddings_1536"
+    embedding = mapped_column(Vector(1536), nullable=False)
+
+
+class WikiPageEmbedding3072(_WikiPageEmbeddingBase, Base):
+    # 3072d uses halfvec — pgvector's HNSW index caps `vector` at 2000 dims.
+    __tablename__ = "wiki_page_embeddings_3072"
+    embedding = mapped_column(HALFVEC(3072), nullable=False)
+
+
+_EMBEDDING_MODEL_BY_DIM: dict[int, type] = {
+    768: WikiPageEmbedding768,
+    1024: WikiPageEmbedding1024,
+    1536: WikiPageEmbedding1536,
+    3072: WikiPageEmbedding3072,
+}
+
+
+def get_embedding_model_for_dim(dimension: int) -> type:
+    """Return the WikiPageEmbedding<dim> ORM class for a supported dimension."""
+    try:
+        return _EMBEDDING_MODEL_BY_DIM[dimension]
+    except KeyError as e:
+        raise ValueError(
+            f"Unsupported embedding dimension: {dimension}. "
+            f"Supported: {sorted(_EMBEDDING_MODEL_BY_DIM)}"
+        ) from e
+
+
+class EmbeddingJob(Base):
+    """Tracks a background re-embed job triggered when admin switches model."""
+
+    __tablename__ = "embedding_jobs"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    model_spec_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending"
+    )  # pending | running | completed | failed | cancelled
+    total_pages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    done_pages: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    finished_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        Index("ix_embedding_jobs_status", "status", "created_at"),
+    )
+
+
+# Skill Contributions — Pull Request style workflow
+# ---------------------------------------------------------------------------
+
+class SkillContribution(Base):
+    """
+    A request to create a new skill or update an existing one.
+    Acts as a 'Pull Request' where files are stored in a temporary path
+    until approved by an admin.
+    """
+    __tablename__ = "skill_contributions"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    skill_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("skills.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    contributor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE")
+    )
+    base_version: Mapped[Optional[int]] = mapped_column(
+        Integer,
+        comment="Version number this contribution was forked from. Null for new skills.",
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), default=SkillContributionStatus.DRAFT.value,
+        index=True
+    )
+    scope_type: Mapped[str] = mapped_column(
+        String(20), default="global",
+        comment="Scope type for NEW skills: global or department",
+    )
+    scope_ids: Mapped[Optional[list]] = mapped_column(
+        JSONB, nullable=True,
+        comment="List of Department IDs if scope_type is department",
+    )
+    title: Mapped[str] = mapped_column(String(200), nullable=False)
+    storage_path: Mapped[Optional[str]] = mapped_column(
+        String(1000),
+        comment="MinIO prefix for this contribution's files, e.g. 'skill-contributions/{id}/'",
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    # Relationships
+    skill: Mapped[Optional["Skill"]] = relationship(back_populates="contributions")
+    contributor: Mapped["Employee"] = relationship()
+
+    __table_args__ = (
+        Index("ix_skill_contributions_contributor_id", "contributor_id"),
+        Index("ix_skill_contributions_status", "status"),
+    )
+

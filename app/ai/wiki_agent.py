@@ -6,6 +6,7 @@ multiple turns. Each create_page / update_page call gets the LLM's full token
 budget, producing much denser output than the old single-call approach.
 """
 
+import asyncio
 import json
 from typing import Any, Awaitable, Callable, Optional
 
@@ -23,9 +24,9 @@ from app.ai.wiki_analyzer import analyze_source, format_analysis_section
 from app.database.models import Source
 from app.services import wiki_service
 
-
 MAX_STEPS = 50
 WARN_STEPS = 40
+LLM_CALL_TIMEOUT = 180  # seconds per LLM call — prevents a single hung call from blocking forever
 INITIAL_EXCERPT_CHARS = 30_000
 
 
@@ -156,6 +157,21 @@ Tổ chức cho mọi thành viên ≥10 tuổi học quy định PCCC cơ bản
 Why good: legal references (Điều 5, Nghị định 136/2020), specific numbers (≥10 tuổi,
 6 tháng/lần), procedure ordering, wikilinks throughout.
 
+# Image markers
+The source text may contain image references in this exact form:
+    ![caption](image://<uuid>)
+
+Rules:
+- PRESERVE these markers verbatim — do not rename, rewrite, or invent UUIDs.
+- PLACE each marker in the wiki page where it's most contextually relevant
+  (next to the section that discusses the same thing). Move them between
+  paragraphs/sections as needed — that's the point.
+- DROP a marker if no page meaningfully discusses it (decorative/irrelevant).
+- A single marker should appear in AT MOST ONE wiki page.
+- Keep markers on their own line for readability.
+- The caption inside `![ ]` may be edited for clarity, but the
+  `(image://<uuid>)` part must stay byte-for-byte identical.
+
 # Decision rules
 - Prefer UPDATE over CREATE when the wiki already has a relevant page. Merge new facts
   into existing prose — do not just append.
@@ -273,14 +289,21 @@ async def compile_source_with_agent(
         {"slug": p.slug, "title": p.title, "page_type": p.page_type}
         for p in existing_pages_raw
     ]
-    analysis = await analyze_source(
-        llm=llm,
-        source_title=source.title or source.file_name or str(source.id),
-        full_text=full_text,
-        existing_pages=existing_pages,
-        kt_name=kt_name,
-        kt_desc=kt_desc,
-    )
+    try:
+        analysis = await asyncio.wait_for(
+            analyze_source(
+                llm=llm,
+                source_title=source.title or source.file_name or str(source.id),
+                full_text=full_text,
+                existing_pages=existing_pages,
+                kt_name=kt_name,
+                kt_desc=kt_desc,
+            ),
+            timeout=LLM_CALL_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning(f"WikiAgent: pre-analysis timed out (>{LLM_CALL_TIMEOUT}s), skipping")
+        analysis = None
     analysis_section = format_analysis_section(analysis)
     if analysis_section:
         logger.debug(f"WikiAgent: pre-analysis injected for source {source.id}")
@@ -299,24 +322,30 @@ async def compile_source_with_agent(
 
     messages: list[dict] = [{"role": "user", "content": initial_msg}]
 
+    step = -1
     for step in range(MAX_STEPS):
         try:
-            turn: AssistantTurn = await llm.generate_with_tools(
-                messages=messages,
-                tools=TOOL_SCHEMAS,
-                system=SYSTEM_PROMPT,
-                max_tokens=8192,
-                temperature=0.2,
+            turn: AssistantTurn = await asyncio.wait_for(
+                llm.generate_with_tools(
+                    messages=messages,
+                    tools=TOOL_SCHEMAS,
+                    system=SYSTEM_PROMPT,
+                    temperature=0.2,
+                ),
+                timeout=LLM_CALL_TIMEOUT,
             )
+        except asyncio.TimeoutError:
+            logger.warning(f"WikiAgent: LLM call timed out at step {step} (>{LLM_CALL_TIMEOUT}s), stopping")
+            break
         except NotImplementedError:
             logger.error(
-                f"WikiAgent: configured LLM provider does not support tool calling. "
-                f"Switch to Anthropic, OpenAI, or Google in Settings."
+                "WikiAgent: configured LLM provider does not support tool calling. "
+                "Switch to Anthropic, OpenAI, or Google in Settings."
             )
             return state.summary()
         except Exception as e:
-            logger.warning(f"WikiAgent: LLM call failed at step {step}: {e}")
-            break
+            logger.error(f"WikiAgent: LLM call failed at step {step}: {e}")
+            raise
 
         messages.append(assistant_message_from_turn(turn))
 

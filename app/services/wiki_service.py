@@ -23,7 +23,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database.models import WikiLink, WikiPage, WikiPageDraft, WikiPageRevision
 
-
 # Reserved page slugs — these are regular WikiPage rows but treated specially.
 INDEX_SLUG = "_index"
 LOG_SLUG = "_log"
@@ -222,7 +221,7 @@ async def list_pages(
     if page_type:
         stmt = stmt.where(WikiPage.page_type == page_type)
     if knowledge_type_slug:
-        stmt = stmt.where(WikiPage.knowledge_type_slugs.any(knowledge_type_slug))
+        stmt = stmt.where(WikiPage.knowledge_type_slugs.any(knowledge_type_slug))  # type: ignore[arg-type]
     if allowed_kt_slugs:
         stmt = stmt.where(
             or_(
@@ -241,24 +240,46 @@ async def search_pages_semantic(
     allowed_kt_slugs: Optional[list[str]] = None,
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
+    spec_id: Optional[str] = None,
 ) -> list[tuple[WikiPage, float]]:
     """
     Cosine-similarity search over wiki page embeddings within a scope.
-    Returns (page, similarity) pairs sorted by similarity descending.
+
+    Embeddings live in per-dimension tables (`wiki_page_embeddings_<dim>`).
+    The active embedding model spec determines which table to query and which
+    `model_spec_id` rows to filter to. Pass `spec_id` explicitly to override —
+    only used by tests and internal tooling.
+
+    Returns (page, similarity) pairs sorted by similarity descending. Returns
+    an empty list if no active embedding model is configured.
     """
+    from app.ai.embedding_catalog import get_spec
+    from app.ai.registry import ProviderRegistry
+    from app.database.models import get_embedding_model_for_dim
+
+    if spec_id is None:
+        registry = ProviderRegistry(session)
+        spec_id = await registry.get_active_embedding_spec_id()
+    if not spec_id:
+        return []
+
+    spec = get_spec(spec_id)
+    Emb = get_embedding_model_for_dim(spec.dimension)
+
     stmt = (
         select(
             WikiPage,
-            (1 - WikiPage.embedding.cosine_distance(query_embedding)).label("similarity"),
+            (1 - Emb.embedding.cosine_distance(query_embedding)).label("similarity"),
         )
+        .join(Emb, Emb.page_id == WikiPage.id)
         .where(
             and_(
-                WikiPage.embedding.is_not(None),
+                Emb.model_spec_id == spec.id,
                 WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
                 _scope_filter(scope_type, scope_id),
             )
         )
-        .order_by(WikiPage.embedding.cosine_distance(query_embedding))
+        .order_by(Emb.embedding.cosine_distance(query_embedding))
         .limit(top_k)
     )
     if allowed_kt_slugs:
@@ -298,11 +319,12 @@ async def apply_create(
         summary=summary,
         knowledge_type_slugs=list(knowledge_type_slugs or []),
         source_ids=list(source_ids or []),
-        embedding=embedding,
+        # embedding intentionally omitted: stored in wiki_page_embeddings_<dim>
         scope_type=scope_type,
         scope_id=scope_id,
         version=1,
     )
+    _ = embedding  # backward-compat parameter, ignored
     session.add(page)
     await session.flush()
     await refresh_links(session, slug, content_md)
@@ -347,8 +369,11 @@ async def apply_update(
         page.knowledge_type_slugs = [*(page.knowledge_type_slugs or []), add_knowledge_type_slug]
     if add_source_id and add_source_id not in (page.source_ids or []):
         page.source_ids = [*(page.source_ids or []), add_source_id]
-    if embedding is not None:
-        page.embedding = embedding
+    # Embeddings are no longer stored on WikiPage; the compiler calls
+    # _reembed_pages after this returns, which writes into the active
+    # wiki_page_embeddings_<dim> table. The `embedding` parameter is accepted
+    # only for backward compatibility and ignored here.
+    _ = embedding
     page.version = (page.version or 1) + 1
     await session.flush()
     await refresh_links(session, slug, new_content_md)
@@ -544,7 +569,7 @@ async def delete_page_cascade(
 
 
 # ---------------------------------------------------------------------------
-# Source removal — for force-recompile
+# Source removal — used when deleting a source
 # ---------------------------------------------------------------------------
 
 async def detach_source_from_wiki(
@@ -552,25 +577,26 @@ async def detach_source_from_wiki(
     source_id: uuid.UUID,
 ) -> int:
     """
-    Remove `source_id` from every WikiPage.source_ids. Pages whose source_ids
-    becomes empty are marked orphaned=True (not deleted) — admin decides per case.
-    Used by source deletion flow.
+    Remove `source_id` from every WikiPage.source_ids.
+    - Pages that have other contributing sources: keep, just remove this source_id.
+    - Pages whose only source was this one: delete immediately.
 
-    Returns the number of pages marked orphaned.
+    Returns the number of pages deleted.
     """
-    stmt = select(WikiPage).where(WikiPage.source_ids.any(source_id))
+    stmt = select(WikiPage).where(WikiPage.source_ids.any(source_id))  # type: ignore[arg-type]
     pages = list((await session.execute(stmt)).scalars().all())
-    orphaned_count = 0
+    deleted_count = 0
     for page in pages:
         remaining = [sid for sid in (page.source_ids or []) if sid != source_id]
-        page.source_ids = remaining
         if not remaining:
-            page.orphaned = True
-            orphaned_count += 1
+            await session.delete(page)
+            deleted_count += 1
+        else:
+            page.source_ids = remaining
     await session.flush()
-    if orphaned_count:
-        logger.info(f"detach_source_from_wiki({source_id}): marked {orphaned_count} pages orphaned")
-    return orphaned_count
+    if deleted_count:
+        logger.info(f"detach_source_from_wiki({source_id}): deleted {deleted_count} single-source pages")
+    return deleted_count
 
 
 # ---------------------------------------------------------------------------

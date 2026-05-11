@@ -11,10 +11,30 @@ import uuid
 from typing import Any, Callable, Optional
 
 from loguru import logger
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.database.models import Source
+from app.database.models import Source, SourceImage
 from app.services import wiki_service
+
+_IMAGE_MARKER_RE = re.compile(r"!\[[^\]]*\]\(image://([0-9a-fA-F-]{36})\)")
+
+
+async def _load_allowed_image_ids(session: AsyncSession, source_id: uuid.UUID) -> set[str]:
+    result = await session.execute(
+        select(SourceImage.id).where(SourceImage.source_id == source_id)
+    )
+    return {str(row[0]).lower() for row in result.all()}
+
+
+def _strip_invalid_image_markers(content: str, allowed_ids: set[str]) -> str:
+    """Remove `image://<uuid>` markers whose UUID isn't in allowed_ids."""
+    if "image://" not in content:
+        return content
+    return _IMAGE_MARKER_RE.sub(
+        lambda m: m.group(0) if m.group(1).lower() in allowed_ids else "",
+        content,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +288,15 @@ def build_tool_handlers(
     _scope_type = source.scope_type or "global"
     _scope_id = source.scope_id
 
+    # Cache allowed image UUIDs for marker validation. Loaded lazily on first
+    # create/update because not every source has images.
+    _allowed_image_ids_cache: dict[str, set[str]] = {}
+
+    async def _allowed_image_ids() -> set[str]:
+        if "ids" not in _allowed_image_ids_cache:
+            _allowed_image_ids_cache["ids"] = await _load_allowed_image_ids(session, source.id)
+        return _allowed_image_ids_cache["ids"]
+
     async def _embed(text: str) -> Optional[list[float]]:
         if embedding_provider is None:
             return None
@@ -373,6 +402,8 @@ def build_tool_handlers(
         if page_type not in wiki_service.PAGE_TYPES:
             page_type = "concept"
 
+        content_md = _strip_invalid_image_markers(content_md, await _allowed_image_ids())
+
         embedding = await _embed(f"{title}\n\n{summary}\n\n{content_md}")
 
         await wiki_service.apply_create(
@@ -407,6 +438,8 @@ def build_tool_handlers(
         )
         if existing is None:
             return {"error": f"Page '{clean}' not found. Use create_page to create it."}
+
+        new_content_md = _strip_invalid_image_markers(new_content_md, await _allowed_image_ids())
 
         embed_title = title or existing.title or ""
         embed_summary = summary or existing.summary or ""

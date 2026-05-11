@@ -69,21 +69,28 @@ FastAPI application serving two protocols simultaneously:
 Two arq (Redis-based) worker pools:
 
 **Wiki Worker** (`WorkerSettings`):
-- `ingest_file_task` — extract text and images from uploaded files
-- `ingest_url_task` — scrape and extract text from URLs
-- `compile_wiki_task` — run the LLM wiki agent to compile a source into wiki pages
+- `ingest_file_task` — extract text and images from uploaded files, then enqueue `ingest_map_reduce_task`
+- `ingest_url_task` — scrape and extract text from URLs, then enqueue `ingest_map_reduce_task`
+- `ingest_map_reduce_task` — MRP Phase 0-2: triage, parallel chunk extraction (MAP), entity dedup + KB reconciliation + compilation plan (REDUCE)
+- `ingest_refine_task` — MRP Phase 3-5: parallel page writers (REFINE), citation/coverage/conflict checks (VERIFY), atomic DB write (COMMIT)
 
 **Skill Worker** (`SkillWorkerSettings`):
 - `process_skill_task` — process uploaded skill packages
 
-### LLM Wiki Agent (`app/ai/`)
-The core compilation pipeline:
+### MRP Pipeline (`app/ai/mrp/`)
+The core compilation pipeline — MAP-REDUCE-PLAN-REFINE-VERIFY:
 
-1. **Pre-analysis** (`wiki_analyzer.py`) — a cheap single LLM call that reads the first ~30K characters of a document and returns a structural map: document type, key entities, related existing wiki pages to update, new pages to create.
+1. **Triage + MAP** (`mapper.py`) — classifies document size (single_pass / standard / hierarchical), splits into ~20K-char chunks aligned to section headings, runs parallel LLM extraction per chunk. Each chunk produces structured JSON (entities, concepts, claims with `absolute_offset` back to source). Results saved to `source_chunk_extracts` incrementally for crash resume.
 
-2. **Agent loop** (`wiki_agent.py`) — a tool-calling agent that reads the source, searches the existing wiki, and calls `create_page` / `update_page` tools to write or update wiki pages. Runs until the agent calls `finish()` or hits the turn limit.
+2. **REDUCE** (`reducer.py`) — merges all chunk extracts: exact entity dedup → embedding cosine similarity dedup (auto-merge > 0.90, LLM disambiguates 0.75–0.90) → KB reconciliation via semantic search → single planning LLM call → `SourceCompilationPlan` saved with `status=pending_review`.
 
-3. **Agent tools** (`wiki_agent_tools.py`) — the tool catalog available to the agent: `read_wiki_index`, `read_wiki_page`, `search_wiki`, `read_source_excerpt`, `create_page`, `update_page`, `append_log`, `finish`.
+3. **Human review (Phase 2.5)** — editor approves/modifies/rejects the plan via portal or API. Controlled by `mrp_auto_approve_plan` config for automated pipelines.
+
+4. **REFINE** (`writer.py`) — parallel page writers (up to 4 concurrent). Simple writer (≤ 8 evidence items): 1 LLM call. Complex writer: mini agent loop (max 10 steps, `read_kb_page` / `read_source_excerpt` / `finish` tools). All claims cited with `[^N]` footnotes.
+
+5. **VERIFY** (`verifier.py`) — citation verification (LLM checks each `[^N]` claim against source excerpt), coverage check (entities with ≥ 3 mentions not covered by any page), conflict check (semantic similarity + LLM contradiction detection against existing KB). All checks non-blocking.
+
+6. **COMMIT** (`pipeline.py`) — `apply_create` / `apply_update` per page, `upsert_page_embedding`, single atomic `session.commit()`, `regenerate_index`, `append_log`.
 
 ---
 
@@ -93,7 +100,9 @@ The core compilation pipeline:
 
 ```
 sources                    → uploaded documents (files or URLs)
-  └── source_departments   → which departments can access a source
+  ├── source_departments       → which departments can access a source
+  ├── source_chunk_extracts    → MAP output: per-chunk structured extraction (entities/claims/concepts)
+  └── source_compilation_plans → REDUCE output: planned pages to create/update (pending_review → approved → done)
 
 wiki_pages                 → compiled wiki articles
   ├── wiki_links           → [[wikilink]] graph edges between pages
@@ -117,6 +126,11 @@ skills                     → AI skill packages
 mcp_tokens                 → per-employee bearer tokens for MCP access
 audit_log                  → immutable activity log
 ```
+
+**Key fields on `sources` for pipeline tracking:**
+- `pipeline_strategy` — `single_pass | standard | hierarchical` (set by Phase 0 triage)
+- `pipeline_phase` — `map | reduce | plan_review | refine | verify | commit` (drives crash resume)
+- `status` — includes `plan_ready` (waiting for human review) in addition to `pending | processing | ready | error`
 
 ### Permission scoping
 
@@ -142,15 +156,28 @@ Worker: ingest_file_task
   → Extract text (pdfplumber / python-docx / html2text)
   → Vision model: caption embedded images (optional)
   → DB: Source(status=processing)
-  → Redis: enqueue compile_wiki_task
+  → Redis: enqueue ingest_map_reduce_task
 
-Worker: compile_wiki_task
-  → wiki_analyzer: single LLM call, structural pre-analysis
-  → wiki_agent loop:
-      LLM calls tools (search_wiki, read_wiki_page, create_page, update_page)
-      Each create/update writes a WikiPageRevision(change_type=agent_compile)
-  → DB: Source(status=ready)
-  → wiki_service.regenerate_index() + append_log()
+Worker: ingest_map_reduce_task   [Phase 0-2]
+  → Phase 0 (Triage): classify strategy (single_pass / standard / hierarchical)
+  → Phase 1 (MAP): chunk by section headings → parallel LLM extraction
+      Each chunk → SourceChunkExtract(status=done) saved incrementally
+  → Phase 2 (REDUCE): dedup entities → reconcile with KB → planning LLM call
+      → SourceCompilationPlan(status=pending_review)
+      → Source(status=plan_ready)   [if manual review]
+      → Redis: enqueue ingest_refine_task   [if mrp_auto_approve_plan=True]
+
+[Human review: GET /api/sources/{id}/plan → POST /api/sources/{id}/plan/approve]
+
+Worker: ingest_refine_task   [Phase 3-5]
+  → Phase 3 (REFINE): parallel page writers
+      Simple (≤8 evidence): 1 LLM call
+      Complex (>8 evidence): mini agent loop (read_kb_page, read_source_excerpt, finish)
+  → Phase 4 (VERIFY): citation check + coverage check + conflict check (non-blocking)
+  → Phase 5 (COMMIT): apply_create / apply_update per page
+      Each page → upsert_page_embedding
+      DB: Source(status=ready), SourceCompilationPlan(status=done)
+      wiki_service.regenerate_index() + append_log()
 ```
 
 ### Employee Claude query → MCP response
@@ -196,7 +223,7 @@ arkon/
 │   │   └── __init__.py       # async_session_factory, get_db dependency
 │   ├── routers/
 │   │   ├── auth.py           # Login, me, change-password
-│   │   ├── sources.py        # Document upload, ingestion, recompile
+│   │   ├── sources.py        # Document upload, ingestion, retry
 │   │   ├── wiki.py           # Wiki page CRUD, revisions, graph
 │   │   ├── wiki_drafts.py    # Draft propose/approve/reject
 │   │   ├── projects.py       # Workspace CRUD, members, sources, wiki
@@ -218,9 +245,15 @@ arkon/
 │   │   ├── audit_service.py      # log_audit()
 │   │   └── kb_service.py         # Source extraction helpers
 │   ├── ai/
-│   │   ├── wiki_agent.py         # LLM agent loop (compile_source_with_agent)
-│   │   ├── wiki_agent_tools.py   # Tool catalog for the wiki agent
-│   │   ├── wiki_analyzer.py      # Pre-analysis single LLM call
+│   │   ├── mrp/
+│   │   │   ├── mapper.py         # Phase 0 (triage) + Phase 1 (MAP: chunking, extraction)
+│   │   │   ├── reducer.py        # Phase 2 (REDUCE: dedup, KB reconcile, planning call)
+│   │   │   ├── writer.py         # Phase 3 (REFINE: simple + complex page writers)
+│   │   │   ├── verifier.py       # Phase 4 (VERIFY: citation, coverage, conflict checks)
+│   │   │   └── pipeline.py       # Phase 5 (COMMIT) + pipeline orchestrators
+│   │   ├── wiki_agent.py         # Legacy agent loop (kept for reference)
+│   │   ├── wiki_agent_tools.py   # Legacy tool catalog
+│   │   ├── wiki_analyzer.py      # Legacy pre-analysis call
 │   │   └── providers/            # Provider-agnostic LLM/embedding/vision wrappers
 │   └── mcp/
 │       ├── server.py             # FastMCP server factory (create_mcp_server)
@@ -230,10 +263,11 @@ arkon/
 │       ├── app/(portal)/         # Page routes (wiki, workspaces, knowledge, ...)
 │       └── components/           # UI components
 ├── alembic/
-│   └── versions/                 # Migration files (001 → 014)
+│   └── versions/                 # Migration files (001 → 020)
 ├── docker-compose.yml
 ├── Dockerfile
-├── .env.example
+├── .env.docker.example     # Env template for Docker Compose
+├── .env.local.example      # Env template for local development
 └── pyproject.toml
 ```
 

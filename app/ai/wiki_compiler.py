@@ -28,8 +28,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.registry import ProviderRegistry
-from app.database.models import Source, WikiPage
+from app.database.models import Source, SourceImage, WikiPage
 from app.services import wiki_service
+
+# Match `image://<uuid>` references inside markdown image markers.
+_IMAGE_MARKER_RE = re.compile(r"!\[[^\]]*\]\(image://([0-9a-fA-F-]{36})\)")
 
 
 # Slug must be a-z 0-9 and `/_-` only — kept narrow so they're URL-safe and stable.
@@ -222,6 +225,21 @@ from the source. Follow this structure:
   cháy), procedure ordering, edge cases (trẻ nhỏ và người cao tuổi), and links
   every concept and entity to its dedicated page.
 
+# Image markers
+The source text may contain image references in this exact form:
+    ![caption](image://<uuid>)
+
+Rules for handling them:
+- PRESERVE these markers verbatim — do not rename, rewrite, or invent UUIDs.
+- PLACE each marker in the wiki page where it's most contextually relevant
+  (next to the section that discusses the same thing). You can move them
+  between paragraphs or sections — that's the point.
+- DROP a marker if no page meaningfully discusses it (decorative/irrelevant).
+- A single marker should appear in AT MOST ONE wiki page (no duplication).
+- Keep markers on their own line for readability.
+- The caption inside `![ ]` may be edited for clarity, but the `(image://uuid)`
+  part must stay byte-for-byte identical to what was in the source.
+
 # Decision rules
 - Prefer UPDATE over CREATE when the wiki already has a relevant page.
   Merge new facts into existing prose; don't just append.
@@ -319,7 +337,7 @@ async def compile_source_into_wiki(
 
     # 2. Call LLM. Low temperature for structured output reliability.
     try:
-        raw = await llm.generate(prompt=prompt, temperature=0.2, max_tokens=32768)
+        raw = await llm.generate(prompt=prompt, temperature=0.2)
     except Exception as e:
         logger.warning(f"Wiki compile LLM call failed for source {source.id}: {e}")
         return {"pages_created": 0, "pages_updated": 0, "log_entry": ""}
@@ -328,6 +346,10 @@ async def compile_source_into_wiki(
     if not operations:
         logger.warning(f"Wiki compile produced no operations for source {source.id}")
         return {"pages_created": 0, "pages_updated": 0, "log_entry": ""}
+
+    # 2b. Strip any hallucinated image:// UUIDs from content_md before persisting.
+    allowed_image_ids = await _load_source_image_ids(session, source.id)
+    _sanitize_image_markers(operations, allowed_image_ids, source_id=source.id)
 
     # 3. Apply operations — all within the source's scope.
     created = 0
@@ -449,6 +471,50 @@ async def _apply_update(
         scope_type=scope_type,
         scope_id=scope_id,
     )
+
+
+async def _load_source_image_ids(session: AsyncSession, source_id: uuid.UUID) -> set[str]:
+    """Return the set of image UUIDs (lowercased str) belonging to this source."""
+    result = await session.execute(
+        select(SourceImage.id).where(SourceImage.source_id == source_id)
+    )
+    return {str(row[0]).lower() for row in result.all()}
+
+
+def _sanitize_image_markers(
+    operations: list[dict[str, Any]],
+    allowed_ids: set[str],
+    source_id: uuid.UUID,
+) -> None:
+    """Remove `image://<uuid>` markers whose UUID isn't in allowed_ids.
+
+    LLMs occasionally hallucinate IDs or strip the alt text into something that
+    breaks markdown — strip those rather than persisting a broken reference.
+    Mutates the operations list in place. Markers with valid UUIDs are kept
+    verbatim.
+    """
+    dropped = 0
+    for op in operations:
+        for key in ("content_md", "new_content_md"):
+            content = op.get(key)
+            if not isinstance(content, str) or "image://" not in content:
+                continue
+
+            def _replace(match: re.Match[str]) -> str:
+                nonlocal dropped
+                uuid_str = match.group(1).lower()
+                if uuid_str in allowed_ids:
+                    return match.group(0)
+                dropped += 1
+                return ""
+
+            op[key] = _IMAGE_MARKER_RE.sub(_replace, content)
+
+    if dropped:
+        logger.warning(
+            f"Wiki compile (source {source_id}): dropped {dropped} invalid "
+            f"image markers from LLM output"
+        )
 
 
 def _validate_slug(slug: Any) -> Optional[str]:
@@ -580,8 +646,19 @@ async def _reembed_pages(
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
 ) -> None:
-    """Re-embed all pages in `slugs` within the given scope in one batch."""
+    """Re-embed all pages in `slugs` within the given scope in one batch.
+
+    Vectors are written to the per-dimension `wiki_page_embeddings_<dim>` table
+    matching the active embedding model's spec (looked up via ProviderRegistry).
+    """
+    from app.ai.registry import ProviderRegistry
+    from app.services.embedding_storage import (
+        compute_content_hash,
+        embedding_input_text,
+        upsert_page_embedding,
+    )
     from app.services.wiki_service import _scope_filter
+
     unique = list(dict.fromkeys(slugs))
     if not unique:
         return
@@ -594,9 +671,16 @@ async def _reembed_pages(
     if not rows:
         return
 
-    # Embed using `title + summary + content` so search hits both metadata and body.
+    registry = ProviderRegistry(session)
+    spec_id = await registry.get_active_embedding_spec_id()
+    if not spec_id:
+        logger.info("No active embedding model — skipping re-embed for compile.")
+        return
+    from app.ai.embedding_catalog import get_spec
+    spec = get_spec(spec_id)
+
     inputs = [
-        f"{p.title}\n\n{p.summary or ''}\n\n{p.content_md or ''}"[:8000]
+        embedding_input_text(p.title, p.summary or "", p.content_md or "")
         for p in rows
     ]
     try:
@@ -604,6 +688,15 @@ async def _reembed_pages(
     except Exception as e:
         logger.warning(f"Wiki compile: re-embed failed for {len(rows)} pages: {e}")
         return
+
     for page, vec in zip(rows, vectors):
-        page.embedding = vec
+        await upsert_page_embedding(
+            session,
+            page_id=page.id,
+            spec=spec,
+            vector=list(vec),
+            content_hash=compute_content_hash(
+                page.title, page.summary or "", page.content_md or ""
+            ),
+        )
     await session.flush()

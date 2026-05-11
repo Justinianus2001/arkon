@@ -23,6 +23,7 @@ ENV/
 # Environment
 .env
 .env.local
+.env.docker
 
 # Docker volumes
 pg_data/
@@ -56,8 +57,4 @@ uv.lock
 .grapuco/
 
 # Reference
-stitch_enterprise_claude_control_center
-PageIndex-main
-obsidian-wiki-main
-llm_wiki-main
 .rtk/

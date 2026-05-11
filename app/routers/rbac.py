@@ -13,10 +13,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Department, Employee, Role
-from app.services.mcp_auth_service import MCPAuthService
-from app.services.auth_service import get_current_user, require_admin, require_permission, hash_password
+from app.database.models import Department, Employee
 from app.services.audit_service import log_audit
+from app.services.auth_service import (
+    get_current_user,
+    hash_password,
+    require_permission,
+)
+from app.services.mcp_auth_service import MCPAuthService
 
 router = APIRouter()
 

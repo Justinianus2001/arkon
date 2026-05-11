@@ -5,9 +5,10 @@ Revises: 011_permission_v2
 Create Date: 2026-05-05
 """
 
-from alembic import op
 import sqlalchemy as sa
 from sqlalchemy.dialects import postgresql
+
+from alembic import op
 
 revision = "012"
 down_revision = "011_permission_v2"
@@ -19,7 +20,7 @@ def upgrade() -> None:
     # 1. Create skill_status enum type (check if exists first)
     bind = op.get_bind()
     inspector = sa.inspect(bind)
-    existing_enums = [e['name'] for e in inspector.get_enums()]
+    existing_enums = [e['name'] for e in inspector.get_enums()]  # type: ignore[attr-defined]
     
     if "skill_status" not in existing_enums:
         skill_status = postgresql.ENUM("active", "processing", "deleting", "deprecated", "archived", name="skill_status")

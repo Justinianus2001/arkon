@@ -6,13 +6,13 @@ Two system roles:
   - employee: Access governed by custom_role scoped permissions
 """
 
+
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
 
 from app.database import get_db
 from app.database.models import Employee, ProjectMember
@@ -89,7 +89,7 @@ async def _get_workspace_memberships(db, employee_id) -> list[WorkspaceMembershi
     ]
 
 
-def _build_user_dict(employee: Employee, permissions: list[str], workspace_memberships: list = None) -> dict:
+def _build_user_dict(employee: Employee, permissions: list[str], workspace_memberships: Optional[list] = None) -> dict:
     """Build user dict for login/me responses."""
     return {
         "id": str(employee.id),

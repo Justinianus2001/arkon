@@ -2,9 +2,9 @@
 Application configuration loaded from environment variables.
 """
 
-from pydantic_settings import BaseSettings
+
 from pydantic import Field
-from typing import Optional
+from pydantic_settings import BaseSettings
 
 
 class Settings(BaseSettings):
@@ -38,6 +38,12 @@ class Settings(BaseSettings):
 
     # --- MinIO ---
     minio_endpoint: str = Field(default="localhost:9000")
+    minio_public_endpoint: str = Field(
+        default="",
+        description="Public-facing MinIO address used in presigned URLs (browser-accessible). "
+                    "Defaults to minio_endpoint if not set. "
+                    "In Docker: set to 'localhost:9000' so presigned URLs work from the browser.",
+    )
     minio_access_key: str = Field(default="minioadmin")
     minio_secret_key: str = Field(default="minioadmin123")
     minio_bucket: str = Field(default="arkon-files")
@@ -53,7 +59,13 @@ class Settings(BaseSettings):
     redis_password: str = Field(default="")
     redis_db: int = Field(default=0)
     worker_max_jobs: int = Field(default=3, description="Max concurrent ingestion jobs")
-    worker_job_timeout: int = Field(default=600, description="Job timeout in seconds")
+    worker_job_timeout: int = Field(default=1800, description="Job timeout in seconds")
+
+    # --- MRP Pipeline ---
+    mrp_auto_approve_plan: bool = Field(
+        default=False,
+        description="If True, compilation plans are auto-approved without human review",
+    )
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

@@ -50,7 +50,7 @@ export function PlanReviewDialog({
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [submitting, setSubmitting] = React.useState<"approve" | "reject" | null>(null);
-  const [rejectNote, setRejectNote] = React.useState("");
+  const [reviewNote, setReviewNote] = React.useState("");
   const [confirmReject, setConfirmReject] = React.useState(false);
 
   React.useEffect(() => {
@@ -66,7 +66,7 @@ export function PlanReviewDialog({
     try {
       await api(`/api/sources/${source.id}/plan/approve`, {
         method: "POST",
-        body: { note: "Approved via UI" },
+        body: { note: reviewNote || "Approved via UI" },
       });
       onDone();
     } catch (e) {
@@ -85,7 +85,7 @@ export function PlanReviewDialog({
     try {
       await api(`/api/sources/${source.id}/plan/reject`, {
         method: "POST",
-        body: { note: rejectNote || "Rejected via UI" },
+        body: { note: reviewNote || "Rejected via UI" },
       });
       onDone();
     } catch (e) {
@@ -196,19 +196,16 @@ export function PlanReviewDialog({
             </div>
           )}
         </div>
+        <div className="mt-4 flex flex-col gap-2 shrink-0">
+          <textarea
+            value={reviewNote}
+            onChange={(e) => setReviewNote(e.target.value)}
+            placeholder="Review note or feedback (optional)"
+            className="w-full text-sm rounded-lg border border-border bg-background px-3 py-2 resize-none h-16 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary/50"
+          />
+        </div>
 
-        {confirmReject && (
-          <div className="mt-3 flex flex-col gap-2">
-            <textarea
-              value={rejectNote}
-              onChange={(e) => setRejectNote(e.target.value)}
-              placeholder="Reason for rejection (optional)"
-              className="w-full text-sm rounded-lg border border-border bg-background px-3 py-2 resize-none h-16 focus:outline-none focus:ring-2 focus:ring-destructive/30 focus:border-destructive/50"
-            />
-          </div>
-        )}
-
-        <div className="flex items-center justify-end gap-2 mt-4 pt-4 border-t border-border">
+        <div className="flex items-center justify-end gap-2 mt-4 pt-4 border-t border-border shrink-0">
           <Button
             variant="ghost"
             onClick={onClose}

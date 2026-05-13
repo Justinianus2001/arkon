@@ -65,10 +65,32 @@ export function ProjectDetail({ project, isAdmin, onBack }: Props) {
     }
   }, [project.id]);
 
+  const loadProjectSources = useCallback(async () => {
+    try {
+      const s = await api<ProjectSource[]>(`/api/projects/${project.id}/sources`);
+      setSources(s);
+    } catch (err) {
+      console.error(err);
+    }
+  }, [project.id]);
+
   useEffect(() => {
     load();
     loadWiki();
   }, [load, loadWiki]);
+
+  // Poll for document processing status
+  useEffect(() => {
+    const hasPending = sources.some(s => s.status === "pending" || s.status === "processing" || s.status === "plan_ready");
+    if (!hasPending) return;
+
+    const interval = setInterval(() => {
+      loadProjectSources();
+      loadWiki(); // Also reload wiki pages so the count live-updates
+    }, 3000);
+
+    return () => clearInterval(interval);
+  }, [sources, loadProjectSources, loadWiki]);
 
   const memberIds = new Set(members.map((m) => m.employee_id));
   const sourceIds = new Set(sources.map((s) => s.source_id));

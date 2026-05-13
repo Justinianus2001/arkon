@@ -40,6 +40,7 @@ export function ProjectList({ projects, loading, isAdmin, onEdit, onOpen, onRefr
     setError(null);
     try {
       await api(`/api/projects/${id}`, { method: "DELETE" });
+      window.dispatchEvent(new Event("workspaces-changed"));
       onRefresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Failed to delete");

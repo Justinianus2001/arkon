@@ -17,7 +17,7 @@ import json
 import re
 import string
 import uuid
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from loguru import logger
 from sqlalchemy import select
@@ -25,6 +25,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.providers.base import EmbeddingProvider, LLMProvider
 from app.utils.progress import ProgressTracker
+
+if TYPE_CHECKING:
+    from app.database.models import SourceCompilationPlan
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -325,23 +328,34 @@ async def reconcile_with_kb(
 
     reconciliation: dict[str, dict] = {}
 
-    async def _reconcile_item(item_type: str, name: str, item: dict):
-        query_text = name
-        if item_type == "concept" and item.get("definition_excerpt"):
-            query_text = f"{name}: {item['definition_excerpt'][:200]}"
+    if not all_items:
+        return reconciliation
+
+    # Batch-embed all query texts in a single API call, then search DB sequentially.
+    # Sequential DB access avoids concurrent AsyncSession errors.
+    query_texts = [
+        (f"{name}: {item['definition_excerpt'][:200]}" if itype == "concept" and item.get("definition_excerpt") else name)[:4000]
+        for itype, name, item in all_items
+    ]
+    try:
+        vectors = await embedding_provider.embed_batch(query_texts)
+    except Exception as exc:
+        logger.warning(f"MRP REDUCE kb reconcile embed_batch failed: {exc}. All items → CREATE.")
+        return {name: {"action": "CREATE", "page_slug": None, "similarity": 0.0} for _, name, _ in all_items}
+
+    for (_, name, _), vec in zip(all_items, vectors):
         try:
-            vec = await embedding_provider.embed(query_text[:4000])
             hits = await wiki_service.search_pages_semantic(
                 session, vec, top_k=3, scope_type=scope_type, scope_id=scope_id,
             )
         except Exception as exc:
             logger.debug(f"MRP REDUCE kb reconcile failed for '{name}': {exc}")
             reconciliation[name] = {"action": "CREATE", "page_slug": None, "similarity": 0.0}
-            return
+            continue
 
         if not hits:
             reconciliation[name] = {"action": "CREATE", "page_slug": None, "similarity": 0.0}
-            return
+            continue
 
         top_page, top_sim = hits[0]
         if top_sim >= KB_UPDATE_THRESHOLD:
@@ -351,8 +365,6 @@ async def reconcile_with_kb(
                                     "_page_title": top_page.title}
         else:
             reconciliation[name] = {"action": "CREATE", "page_slug": None, "similarity": top_sim}
-
-    await asyncio.gather(*[_reconcile_item(t, n, i) for t, n, i in all_items])
 
     # Batch-resolve MAYBE items with LLM
     maybe_items = [(name, rec) for name, rec in reconciliation.items() if rec["action"] == "MAYBE"]
@@ -423,7 +435,7 @@ Rules:
 - Group closely related small entities onto the same page (max 3-4 per page)
 - priority 1 = highest importance (process first)
 - entity_names must match the names in the entities/concepts lists above
-- Target approximately {target_page_count} total pages
+- Target approximately {target_page_count} total pages (feel free to create more if the document is dense and contains many distinct concepts).
 - Return ONLY the JSON object
 """
 
@@ -440,12 +452,16 @@ async def run_planning_call(
 ) -> dict:
     """Single LLM call to produce the Compilation Plan JSON."""
     n_chars = len(source.full_text or "")
+    # Calculate target based on the actual number of extracted concepts rather than just document length
+    total_extracted_items = len(canonical_entities) + len(canonical_concepts)
+    
     if strategy == "single_pass":
-        target_pages = max(3, min(8, n_chars // 5_000))
+        # Usually 1 page per 2-3 items, minimum 3, maximum 15
+        target_pages = max(3, min(15, total_extracted_items // 2))
     elif strategy == "standard":
-        target_pages = max(8, min(20, n_chars // 8_000))
+        target_pages = max(8, min(30, total_extracted_items // 3))
     else:
-        target_pages = max(15, min(40, n_chars // 10_000))
+        target_pages = max(15, min(60, total_extracted_items // 3))
 
     kt_context = kt_name or "(no specific knowledge type)"
     if kt_desc:
@@ -466,8 +482,12 @@ async def run_planning_call(
         kb_info = f"→ {kb['action']} {kb.get('page_slug', '')}" if kb else "→ CREATE"
         return f"  - {c['term']} ({c['mention_count']} mentions) {kb_info}"
 
-    entities_summary = "\n".join(_fmt_entity(e) for e in canonical_entities[:50]) or "  (none)"
-    concepts_summary = "\n".join(_fmt_concept(c) for c in canonical_concepts[:50]) or "  (none)"
+    # Sort by mention count descending to ensure the planner sees the most important items
+    sorted_entities = sorted(canonical_entities, key=lambda x: x.get("mention_count", 0), reverse=True)
+    sorted_concepts = sorted(canonical_concepts, key=lambda x: x.get("mention_count", 0), reverse=True)
+
+    entities_summary = "\n".join(_fmt_entity(e) for e in sorted_entities[:100]) or "  (none)"
+    concepts_summary = "\n".join(_fmt_concept(c) for c in sorted_concepts[:100]) or "  (none)"
 
     kb_lines = []
     for name, rec in reconciliation.items():

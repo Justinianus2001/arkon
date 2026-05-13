@@ -262,21 +262,24 @@ SUPPORTED_PROVIDERS = {
     ],
     "llm": [
         {"id": "google", "name": "Google Gemini", "models": [
-            "gemini-2.5-flash", "gemini-2.0-flash", "gemini-2.5-pro",
+            "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.0-flash",
+            "gemini-2.5-flash", "gemini-2.5-pro",
         ]},
         {"id": "openai", "name": "OpenAI", "models": [
-            "gpt-4o", "gpt-4o-mini", "gpt-4.1-mini", "gpt-4.1-nano",
+            "gpt-5.5-instant", "gpt-5.4", "gpt-5.2",
+            "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini",
         ]},
         {"id": "anthropic", "name": "Anthropic", "models": [
+            "claude-4.7-opus", "claude-4.6-sonnet",
             "claude-sonnet-4-20250514", "claude-haiku-4-20250514",
         ]},
     ],
     "vision": [
         {"id": "google", "name": "Google Gemini", "models": [
-            "gemini-2.0-flash", "gemini-2.5-flash",
+            "gemini-3.1-flash", "gemini-3.0-flash", "gemini-2.5-flash",
         ]},
         {"id": "openai", "name": "OpenAI", "models": [
-            "gpt-4o", "gpt-4o-mini",
+            "gpt-5.4", "gpt-4o", "gpt-4o-mini",
         ]},
     ],
 }

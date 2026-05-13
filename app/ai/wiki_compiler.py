@@ -364,6 +364,11 @@ async def compile_source_into_wiki(
                 slug = _validate_slug(op.get("slug"))
                 if not slug:
                     continue
+                    
+                # Acquire advisory lock for this slug to prevent race conditions
+                from sqlalchemy import select, func
+                await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(slug))))
+
                 if await wiki_service.get_page_by_slug(
                     session, slug, scope_type=src_scope_type, scope_id=src_scope_id
                 ) is not None:
@@ -405,6 +410,11 @@ async def compile_source_into_wiki(
                 slug = _validate_slug(op.get("slug"))
                 if not slug:
                     continue
+                    
+                # Acquire advisory lock for this slug
+                from sqlalchemy import select, func
+                await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(slug))))
+
                 applied = await _apply_update(
                     session, op, source, knowledge_type_slug,
                     scope_type=src_scope_type, scope_id=src_scope_id,

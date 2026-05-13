@@ -191,11 +191,18 @@ function SidebarWorkspacesSection({
   const [open, toggle] = useGroupToggle("workspaces", true);
 
   useEffect(() => {
-    api<WorkspaceItem[]>("/api/projects")
-      .then((data) => setWorkspaces(data))
-      .catch(() => setWorkspaces([]))
-      .finally(() => setLoaded(true));
-  }, []);
+    const fetchWS = () => {
+      api<WorkspaceItem[]>("/api/projects")
+        .then((data) => setWorkspaces(data))
+        .catch(() => setWorkspaces([]))
+        .finally(() => setLoaded(true));
+    };
+
+    fetchWS();
+
+    window.addEventListener("workspaces-changed", fetchWS);
+    return () => window.removeEventListener("workspaces-changed", fetchWS);
+  }, [pathname]);
 
   const SIDEBAR_LIMIT = 10;
   const hasActiveChild = workspaces.some((w) =>

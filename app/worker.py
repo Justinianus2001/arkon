@@ -13,7 +13,7 @@ import uuid
 import zipfile
 from typing import Optional
 
-from arq import cron
+from arq import cron, func as arq_func
 from arq.connections import ArqRedis, RedisSettings, create_pool
 from loguru import logger
 from sqlalchemy import select
@@ -56,10 +56,10 @@ from app.utils.progress import ProgressTracker  # noqa: E402
 async def ingest_file_task(ctx: dict, source_id: str):
     """
     arq task: full file ingestion → wiki compilation.
-    Steps: download from MinIO → extract text → vision captions → outline → compile wiki.
+    Steps: download from MinIO → extract text → outline → enqueue MRP + caption_images_task.
+    Image captioning is offloaded to caption_images_task so this job is not blocked by image count.
     File must already be uploaded to MinIO before this task is enqueued.
     """
-    from app.ai.registry import ProviderRegistry
     from app.database import async_session_factory
     from app.database.models import KnowledgeType, Source, SourceImage
     from app.services.image_service import extract_images
@@ -76,7 +76,8 @@ async def ingest_file_task(ctx: dict, source_id: str):
     async with async_session_factory() as session:
         source = await session.get(Source, sid)
         if not source:
-            raise ValueError(f"Source {source_id} not found")
+            logger.warning(f"Source {source_id} not found, it may have been deleted.")
+            return
         if not source.minio_key:
             raise ValueError(f"Source {source_id} has no file in storage")
 
@@ -106,40 +107,11 @@ async def ingest_file_task(ctx: dict, source_id: str):
 
             await tracker.update(25, "Text extraction complete")
 
-            # --- Step 3: Extract images + vision captions (40%) ---
-            await tracker.update(30, "Extracting and analyzing images...")
+            # --- Step 3: Extract images (40%) ---
+            # Captioning is offloaded to caption_images_task (enqueued below) so
+            # this job is not blocked by the number of images in the document.
+            await tracker.update(30, "Extracting images...")
             images = extract_images(file_data, file_name, source_id)
-
-            registry = ProviderRegistry(session)
-            vision_provider = await registry.get_vision()
-            if vision_provider and images:
-                # Build a lookup of page text by page number so we can give
-                # the vision model surrounding context when captioning.
-                page_text_by_num: dict[int, str] = {
-                    p.get("page_number") or 1: (p.get("content") or "")[:1500]
-                    for p in pages_data
-                }
-                for idx, img in enumerate(images, 1):
-                    try:
-                        if idx % 5 == 0 or idx == 1 or idx == len(images):
-                            logger.info(f"Vision AI analyzing image {idx}/{len(images)}...")
-                        img_bytes = storage_service.download_file(img.minio_key)
-                        page_ctx = page_text_by_num.get(img.page_number or 1, "")
-                        vision_prompt = (
-                            "Describe this image concisely in 1-3 sentences. "
-                            "Focus on what is shown (diagrams, charts, photos, illustrations) "
-                            "and what information it conveys. Be specific — mention key elements, "
-                            "labels, numbers, or steps visible in the image. Do not start with "
-                            "'Based on the image' or similar filler phrases.\n\n"
-                            + (f"Page context:\n{page_ctx}" if page_ctx else "")
-                        )
-                        img.caption = await vision_provider.analyze_image(
-                            img_bytes, img.content_type, prompt=vision_prompt
-                        )
-                    except Exception as e:
-                        logger.warning(f"Failed to analyze image {img.minio_key}: {e}")
-            elif images:
-                logger.info("No vision provider configured, skipping image captioning")
 
             # Persist images so wiki content_md can reference them by uuid.
             for img in images:
@@ -176,10 +148,13 @@ async def ingest_file_task(ctx: dict, source_id: str):
                 if kt:
                     kt_slug, kt_name, kt_desc = kt.slug, kt.name, kt.description
 
-            # --- Step 6: Enqueue MRP pipeline (MAP + REDUCE + PLAN) ---
+            # --- Step 6: Enqueue MRP pipeline + image captioning in parallel ---
             await tracker.update(55, "Queuing compilation pipeline...")
             pool = await get_arq_pool()
-            job = await pool.enqueue_job("ingest_map_reduce_task", source_id)
+            job, _ = await asyncio.gather(
+                pool.enqueue_job("ingest_map_reduce_task", source_id),
+                pool.enqueue_job("caption_images_task", source_id) if images else asyncio.sleep(0),
+            )
             source.status = "processing"
             source.progress = 55
             source.progress_message = "Extraction queued..."
@@ -187,7 +162,7 @@ async def ingest_file_task(ctx: dict, source_id: str):
                 source.job_id = job.job_id
             await session.commit()
 
-            logger.info(f"Source {source_id} pre-processing done, MRP task enqueued: {job.job_id if job else 'n/a'}")
+            logger.info(f"Source {source_id} pre-processing done, MRP + caption tasks enqueued")
             return {"status": "processing", "images": len(images)}
 
         except BaseException as e:
@@ -227,7 +202,8 @@ async def ingest_url_task(ctx: dict, source_id: str):
     async with async_session_factory() as session:
         source = await session.get(Source, sid)
         if not source:
-            raise ValueError(f"Source {source_id} not found")
+            logger.warning(f"Source {source_id} not found, it may have been deleted.")
+            return
 
         try:
             source.status = "processing"
@@ -671,7 +647,8 @@ async def ingest_map_reduce_task(ctx: dict, source_id: str):
     async with async_session_factory() as session:
         source = await session.get(Source, sid)
         if not source:
-            raise ValueError(f"Source {source_id} not found")
+            logger.warning(f"Source {source_id} not found, it may have been deleted.")
+            return
         if not source.full_text:
             raise ValueError(f"Source {source_id} has no full_text — run pre-processing first")
 
@@ -757,7 +734,8 @@ async def ingest_refine_task(ctx: dict, source_id: str):
     async with async_session_factory() as session:
         source = await session.get(Source, sid)
         if not source:
-            raise ValueError(f"Source {source_id} not found")
+            logger.warning(f"Source {source_id} not found, it may have been deleted.")
+            return
         if not source.full_text:
             raise ValueError(f"Source {source_id} has no full_text")
 
@@ -816,12 +794,96 @@ async def ingest_refine_task(ctx: dict, source_id: str):
             raise
 
 
+async def caption_images_task(ctx: dict, source_id: str):
+    """
+    arq task: vision-caption all SourceImage rows for a source.
+
+    Runs independently from the MRP pipeline — enqueued by ingest_file_task
+    immediately after images are persisted to DB. Updates each row's caption
+    field as soon as the vision call returns, so captions are available by the
+    time ingest_refine_task writes wiki pages.
+
+    Each image opens its own DB session for the UPDATE so concurrent coroutines
+    never share session state.
+    """
+    from sqlalchemy import update as sa_update
+
+    from app.ai.registry import ProviderRegistry
+    from app.database import async_session_factory
+    from app.database.models import Source, SourceImage
+    from app.services.storage_service import storage_service
+
+    sid = uuid.UUID(source_id)
+
+    # Load vision provider and image rows in a short-lived session, then close it.
+    async with async_session_factory() as session:
+        source = await session.get(Source, sid)
+        if not source:
+            logger.warning(f"caption_images_task: source {source_id} not found")
+            return
+
+        registry = ProviderRegistry(session)
+        vision_provider = await registry.get_vision()
+        if not vision_provider:
+            logger.info(f"caption_images_task: no vision provider configured, skipping")
+            return
+
+        rows = (await session.execute(
+            select(SourceImage).where(SourceImage.source_id == sid)
+        )).scalars().all()
+
+        # Snapshot only the fields we need — session closes after this block.
+        image_records = [(row.id, row.minio_key, row.content_type) for row in rows]
+
+    if not image_records:
+        return
+
+    logger.info(f"caption_images_task: captioning {len(image_records)} images for {source_id}")
+
+    MAX_CONCURRENCY = 4
+    PER_IMAGE_TIMEOUT = 120
+    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+    total = len(image_records)
+
+    async def _caption_one(image_id, minio_key: str, content_type: str, idx: int) -> None:
+        async with sem:
+            try:
+                img_bytes = storage_service.download_file(minio_key)
+                vision_prompt = (
+                    "Describe this image concisely in 1-3 sentences. "
+                    "Focus on what is shown (diagrams, charts, photos, illustrations) "
+                    "and what information it conveys. Be specific — mention key elements, "
+                    "labels, numbers, or steps visible in the image. Do not start with "
+                    "'Based on the image' or similar filler phrases."
+                )
+                caption = await asyncio.wait_for(
+                    vision_provider.analyze_image(img_bytes, content_type, prompt=vision_prompt),
+                    timeout=PER_IMAGE_TIMEOUT,
+                )
+                # Each image gets its own session — no concurrent session access.
+                async with async_session_factory() as upd_session:
+                    await upd_session.execute(
+                        sa_update(SourceImage).where(SourceImage.id == image_id).values(caption=caption)
+                    )
+                    await upd_session.commit()
+                logger.info(f"caption_images_task: image {idx}/{total} done for {source_id}")
+            except Exception as e:
+                logger.warning(f"caption_images_task: failed {minio_key}: {type(e).__name__}: {e}")
+
+    await asyncio.gather(*[
+        _caption_one(img_id, mkey, ctype, idx)
+        for idx, (img_id, mkey, ctype) in enumerate(image_records, 1)
+    ])
+    logger.success(f"caption_images_task: {total} images processed for {source_id}")
+
+
 class WorkerSettings:
     """arq worker configuration."""
 
     functions = [
         ingest_file_task,
         ingest_url_task,
+        arq_func(caption_images_task, timeout=3600),
         ingest_map_reduce_task,
         ingest_refine_task,
         reembed_all_pages_task,

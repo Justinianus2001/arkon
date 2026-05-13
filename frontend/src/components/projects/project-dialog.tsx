@@ -68,6 +68,7 @@ export function ProjectDialog({ open, onOpenChange, project, onSaved }: Props) {
           body: { name: name.trim(), description: description.trim() || undefined, workspace_type: workspaceType },
         });
       }
+      window.dispatchEvent(new Event("workspaces-changed"));
       onSaved();
       onOpenChange(false);
     } catch (err) {

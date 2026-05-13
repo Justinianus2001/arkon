@@ -15,13 +15,16 @@ All writers run in parallel (asyncio.Semaphore(MAX_WRITER_CONCURRENCY)).
 import asyncio
 import json
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.providers.base import EmbeddingProvider, LLMProvider
 from app.utils.progress import ProgressTracker
+
+if TYPE_CHECKING:
+    from app.database.models import SourceCompilationPlan
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -31,7 +34,7 @@ MAX_WRITER_CONCURRENCY = 4
 WRITER_COMPLEX_THRESHOLD_EVIDENCE = 8
 WRITER_COMPLEX_THRESHOLD_EXISTING_CHARS = 3_000
 WRITER_AGENT_MAX_STEPS = 10
-WRITER_AGENT_TIMEOUT = 120  # seconds per LLM call in complex writer
+WRITER_AGENT_TIMEOUT = 300  # seconds per LLM call in complex writer
 
 # ---------------------------------------------------------------------------
 # Dataclass
@@ -84,27 +87,309 @@ def assemble_evidence(
 
 
 # ---------------------------------------------------------------------------
-# System prompt (quality rules, same spirit as wiki_agent.py)
+# System prompt — ported from wiki_compiler.py with full quality rules
 # ---------------------------------------------------------------------------
 
 WRITER_SYSTEM = """\
-You are an enterprise knowledge wiki writer. Write a single wiki page using
-ONLY the evidence provided. Every factual claim must cite its source with a
-footnote marker like [^1], [^2], etc.
+You are an enterprise knowledge wiki writer. Your job is to write a single,
+high-quality wiki page by reading the SOURCE TEXT provided and using the
+evidence checklist as guidance for what to cover.
 
-Quality rules:
-- Write in the SAME LANGUAGE as the source document.
-- Open with a 2-4 sentence paragraph (no heading) defining what this thing is.
-- Use H2 headings to group related facts. Each section starts with prose.
-- Bold key terms on first mention.
-- Use wikilinks [[slug]] or [[slug|display text]] to link to related pages.
-- End with a ## See also section linking to related pages.
-- Minimum lengths: concept/topic: 200 words; entity: 100 words; source: 150 words.
-- Every page must link to at least 2 other pages.
-- Do NOT write a page that is just a title + bullet list.
+# Mindset: COMPILE, do NOT summarize
+You are not writing an executive summary. You are extracting structured knowledge
+and rewriting it into a reusable wiki page. The output should contain MORE
+information density than a summary — organized differently, but not condensed.
+
+A summary loses specifics. A wiki page preserves them in a queryable structure.
+If someone reads the wiki page two years from now, they should still be able to
+find the actual numbers, regulations, procedures, names, and edge cases — not
+just a high-level recap.
+
+# What to KEEP from the source (do not lose these)
+- Specific numbers: thresholds, dosages, timeframes, dimensions, percentages.
+- Named regulations, laws, articles, code references.
+- Equipment names, model numbers, product specs.
+- Procedure steps in order, with actual actions (not "follow the procedure"
+  but "1. do X 2. do Y 3. do Z").
+- Worked examples and exceptions — usually the highest-value content.
+- Named parties, roles, contact paths, escalation chains.
+- Definitions verbatim or near-verbatim if the source is authoritative.
+- Cause-effect statements ("X causes Y because Z") — preserve all three parts.
+
+# What to DROP
+- Marketing language, mission statements, ceremonial filler.
+- Source-specific framing: "This document explains...", "In Section 3 below..."
+- Repeated boilerplate, tables of contents, cover page metadata.
+- Prose that just rephrases what was already said.
+
+# Language rule
+Write in the SAME LANGUAGE as the source document. Never translate content.
+
+# Page structure — CRITICAL
+Each page must be a proper encyclopedic article, NOT a flat bullet list:
+
+1. **Opening paragraph** — 2-4 sentences defining what this thing is. No heading.
+2. **Sections with H2 headings** — group related facts under clear headings.
+   Each section starts with prose before any sub-bullets.
+3. **Bold key terms** on first use. Link them to their wiki pages with [[ ]].
+4. **Examples or implications** where the source provides them.
+5. **See also** section at the end — wikilinks to related pages.
+
+# What NOT to do
+- Do NOT dump raw bullet points from the source as the entire content.
+- Do NOT write a page that is just a title + 3 bullets. That is not a wiki page.
+- Do NOT omit the opening prose paragraph.
+- Do NOT include a Citations or Footnotes section.
+- Do NOT use [^N] footnote markers.
 - Do NOT translate the content language.
+
+# Wikilinks
+- Use [[slug]] or [[slug|display text]] to cross-link.
+- CRITICAL: You may ONLY link to slugs from the "Available pages" list.
+  Do NOT invent or hallucinate slugs.
+
+# Minimum depth
+- concept/topic pages: at least 200 words of actual prose+structure.
+- entity pages: at least 100 words.
+- source pages: at least 150 words.
+
+# Image markers
 - PRESERVE image markers verbatim: ![caption](image://<uuid>)
+- Place each marker where it's most contextually relevant.
+- Do NOT invent image UUIDs.
 """
+
+SOURCE_CONTEXT_FALLBACK_CHARS = 60_000  # fallback when model is unknown
+
+# Approximate context windows for known models (in tokens).
+# We use ~60% of input window for source text, leaving room for
+# system prompt, evidence blocks, and output tokens.
+# 1 token ≈ 4 chars (English), conservative estimate.
+# Last updated: 2026-05-11
+_MODEL_CONTEXT_TOKENS: dict[str, int] = {
+    # Google Gemini — all 1M context
+    "gemini-3.1-pro": 1_000_000,
+    "gemini-3.1-flash": 1_000_000,
+    "gemini-3.0-flash": 1_000_000,
+    "gemini-2.5-flash": 1_000_000,
+    "gemini-2.5-pro": 1_000_000,
+    "gemini-2.0-flash": 1_000_000,
+    # OpenAI GPT-5.x
+    "gpt-5.5-instant": 1_000_000,
+    "gpt-5.4": 1_000_000,
+    "gpt-5.2": 256_000,
+    # OpenAI GPT-4.x (legacy but still used)
+    "gpt-4.1-mini": 1_000_000,
+    "gpt-4.1-nano": 1_000_000,
+    "gpt-4o": 128_000,
+    "gpt-4o-mini": 128_000,
+    # Anthropic Claude 4.x — all 1M context
+    "claude-4.7-opus": 1_000_000,
+    "claude-4.6-sonnet": 1_000_000,
+    "claude-sonnet-4-20250514": 1_000_000,
+    "claude-haiku-4-20250514": 200_000,
+}
+
+# Source text gets 60% of the context budget; the rest is for system prompt,
+# evidence blocks, existing content, and output tokens.
+_SOURCE_BUDGET_RATIO = 0.60
+_CHARS_PER_TOKEN = 4  # conservative estimate
+
+
+def _get_source_context_budget(model_id: str | None) -> int:
+    """
+    Calculate the maximum chars allowed for source context based on the
+    model's context window. Falls back to SOURCE_CONTEXT_FALLBACK_CHARS
+    if the model is unknown.
+    """
+    if not model_id:
+        return SOURCE_CONTEXT_FALLBACK_CHARS
+
+    # Try exact match first, then prefix match for versioned models
+    ctx_tokens = _MODEL_CONTEXT_TOKENS.get(model_id)
+    if ctx_tokens is None:
+        for key, val in _MODEL_CONTEXT_TOKENS.items():
+            if model_id.startswith(key):
+                ctx_tokens = val
+                break
+
+    if ctx_tokens is None:
+        return SOURCE_CONTEXT_FALLBACK_CHARS
+
+    budget_chars = int(ctx_tokens * _CHARS_PER_TOKEN * _SOURCE_BUDGET_RATIO)
+
+    # Cap at 800k chars (~200k tokens) — beyond this, diminishing returns
+    # and most LLMs struggle with very long context anyway.
+    return min(budget_chars, 800_000)
+
+
+# ---------------------------------------------------------------------------
+# Source context builder
+# ---------------------------------------------------------------------------
+
+def _build_source_context(
+    full_text: str,
+    evidence: list[dict],
+    model_id: str | None = None,
+) -> str:
+    """
+    Build source context for the writer.
+
+    Budget is dynamically calculated based on the model's context window:
+      - gemini-2.5-flash (1M tokens) → up to ~800k chars of source
+      - gpt-4o (128k tokens)         → up to ~307k chars
+      - unknown model                → 60k chars fallback
+
+    For short documents (fits in budget): include the full text.
+    For long documents: smart extraction — section-level relevance scoring
+    based on evidence density, with full sections preserved for coherence.
+    """
+    budget = _get_source_context_budget(model_id)
+
+    if len(full_text) <= budget:
+        return full_text
+
+    # --- Long document: smart section extraction ---
+    # 1. Split into sections by headings (H1-H4) or paragraph blocks
+    sections = _split_into_sections(full_text)
+
+    # 2. Score each section by evidence density
+    scored = _score_sections(sections, evidence)
+
+    # 3. Always include first section (intro/overview) if it's reasonably short
+    result_parts: list[tuple[int, str]] = []  # (original_index, text)
+    total = 0
+
+    if scored and scored[0][0] == 0:
+        # First section is already scored highest or close
+        pass
+
+    # Include the opening section (first 2000 chars at minimum)
+    intro = full_text[:2000]
+    intro_end = full_text.find("\n#", 2000)
+    if intro_end > 0:
+        intro = full_text[:intro_end]
+    result_parts.append((0, intro))
+    total += len(intro)
+
+    # 4. Greedily add highest-scored sections until budget is filled
+    for orig_idx, text, _score in scored:
+        if total + len(text) > budget:
+            # Try to fit a truncated version if section is very long
+            remaining = budget - total
+            if remaining > 1000:
+                result_parts.append((orig_idx, text[:remaining] + "\n\n[…section truncated…]"))
+                total += remaining
+            break
+        # Skip if overlaps with intro
+        if orig_idx == 0 and any(idx == 0 for idx, _ in result_parts):
+            continue
+        result_parts.append((orig_idx, text))
+        total += len(text)
+
+    # 5. Sort by original document order for coherent reading
+    result_parts.sort(key=lambda x: x[0])
+
+    # 6. Assemble with position markers
+    parts = []
+    for i, (orig_idx, text) in enumerate(result_parts):
+        if i > 0:
+            parts.append("\n\n[…skipped sections…]\n\n")
+        parts.append(text)
+
+    if total < len(full_text):
+        parts.append(f"\n\n[…document continues… total {len(full_text)} chars, showing {total}…]")
+
+    logger.info(
+        f"MRP WRITER source context: {len(full_text)} chars → {total} chars "
+        f"({total*100//len(full_text)}%), budget={budget}, model={model_id}"
+    )
+
+    return "".join(parts)
+
+
+def _split_into_sections(text: str) -> list[tuple[int, str]]:
+    """
+    Split text into sections by markdown headings (H1-H4).
+    Returns list of (char_offset, section_text).
+    If no headings found, splits by double-newline paragraphs.
+    """
+    import re
+    heading_pattern = re.compile(r'^(#{1,4})\s+', re.MULTILINE)
+
+    matches = list(heading_pattern.finditer(text))
+    if not matches:
+        # No headings — split by paragraph blocks (~3000 chars each)
+        chunks = []
+        for i in range(0, len(text), 3000):
+            # Try to break at paragraph boundary
+            end = min(i + 3000, len(text))
+            if end < len(text):
+                para_break = text.rfind("\n\n", i, end)
+                if para_break > i:
+                    end = para_break + 2
+            chunks.append((i, text[i:end]))
+        return chunks
+
+    sections = []
+    # Text before first heading
+    if matches[0].start() > 0:
+        sections.append((0, text[:matches[0].start()]))
+
+    for i, m in enumerate(matches):
+        start = m.start()
+        end = matches[i + 1].start() if i + 1 < len(matches) else len(text)
+        sections.append((start, text[start:end]))
+
+    return sections
+
+
+def _score_sections(
+    sections: list[tuple[int, str]],
+    evidence: list[dict],
+) -> list[tuple[int, str, float]]:
+    """
+    Score sections by relevance to evidence items.
+    Returns sorted list of (section_index, text, score) — highest score first.
+
+    Scoring signals:
+      1. Evidence overlap: how many evidence items fall within this section
+      2. Evidence proximity: distance-weighted score for nearby evidence
+      3. Section position: slight boost for earlier sections (usually more important)
+    """
+    if not evidence:
+        # No evidence — return sections in order with equal scores
+        return [(i, text, 1.0) for i, (_, text) in enumerate(sections)]
+
+    # Build evidence offsets
+    ev_offsets = [ev.get("absolute_offset", 0) for ev in evidence]
+
+    scored = []
+    for sec_idx, (sec_start, sec_text) in enumerate(sections):
+        sec_end = sec_start + len(sec_text)
+
+        # Count evidence items that fall within this section
+        direct_hits = sum(1 for off in ev_offsets if sec_start <= off < sec_end)
+
+        # Proximity score: evidence items near this section
+        proximity = 0.0
+        for off in ev_offsets:
+            if sec_start <= off < sec_end:
+                proximity += 1.0  # direct hit
+            else:
+                dist = min(abs(off - sec_start), abs(off - sec_end))
+                if dist < 5000:
+                    proximity += max(0, 1.0 - dist / 5000)
+
+        # Position bonus: earlier sections get slight boost
+        position_bonus = max(0, 1.0 - sec_idx * 0.02)
+
+        score = direct_hits * 3.0 + proximity + position_bonus
+        scored.append((sec_idx, sec_text, score))
+
+    # Sort by score descending
+    scored.sort(key=lambda x: -x[2])
+    return scored
 
 
 # ---------------------------------------------------------------------------
@@ -119,41 +404,43 @@ _SIMPLE_WRITER_PROMPT = """\
 - Slug: {slug}
 - Title: {title}
 - Type: {page_type}
-- Related pages to cross-link: {related_pages}
+
+## Available pages (ONLY use these slugs for [[wikilinks]])
+{all_plan_slugs}
 
 {existing_section}
 
-## Evidence ({evidence_count} items)
-Use ONLY the evidence below. Cite each piece with [^N] footnotes.
+## Source document text
+Read this carefully. Extract all relevant facts for this page's topic.
+
+{source_context}
+
+## Evidence checklist ({evidence_count} items)
+The following items were pre-extracted and should be covered in the page.
+Use them as a checklist — make sure you don't miss any of these facts.
+But also look for additional relevant information in the source text above.
 
 {evidence_blocks}
 
 ## Instructions
-Write the complete wiki page in markdown. Include [^N] citation markers
-inline where you use each piece of evidence. End the page with a
-## Citations section listing each footnote as:
-[^1]: <brief source reference>
+Write the complete wiki page in markdown based on the source text above.
+Cross-link to other pages using [[slug]] or [[slug|display text]] — ONLY
+use slugs from the "Available pages" list. Do NOT invent new slugs.
+Do NOT include Citations or Footnotes sections.
 
 Return ONLY the markdown content, no other text.
 """
 
 
 def _format_evidence_blocks(evidence: list[dict]) -> tuple[str, list[dict]]:
-    """Format evidence for the prompt. Returns (formatted_string, citations_metadata)."""
+    """Format evidence as a checklist for the prompt. Returns (formatted_string, empty_list)."""
     lines = []
-    citations_meta = []
     for i, ev in enumerate(evidence, 1):
         lines.append(
-            f"[^{i}] {ev['confidence'].upper()} — Subject: {ev['subject']}\n"
-            f"Claim: {ev['statement']}\n"
-            f"Source excerpt: \"{ev['source_excerpt'][:300]}\""
+            f"{i}. [{ev['confidence'].upper()}] {ev['subject']}\n"
+            f"   {ev['statement']}"
         )
-        citations_meta.append({
-            "ref": f"[^{i}]",
-            "absolute_offset": ev["absolute_offset"],
-            "evidence_length": ev["evidence_length"],
-        })
-    return "\n\n".join(lines), citations_meta
+    return "\n\n".join(lines), []
 
 
 async def _write_page_simple(
@@ -161,12 +448,17 @@ async def _write_page_simple(
     plan_item: dict,
     evidence: list[dict],
     existing_content: Optional[str],
-    related_summaries: dict[str, str],
+    all_plan_slugs: list[str],
+    source_context: str = "",
 ) -> tuple[str, str, list[dict]]:
     """
     Returns (content_md, summary, citations_meta).
     """
-    related_pages = ", ".join(f"[[{s}]]" for s in plan_item.get("related_kb_pages", []))
+    # Format available slugs for the prompt (exclude self)
+    own_slug = plan_item.get("slug", "")
+    available = [s for s in all_plan_slugs if s != own_slug]
+    all_plan_slugs_str = "\n".join(f"- [[{s}]]" for s in available) if available else "(none — this is the only page)"
+
     existing_section = (
         f"## Existing page content (UPDATE — integrate new evidence into this)\n\n{existing_content}\n"
         if existing_content else ""
@@ -178,15 +470,16 @@ async def _write_page_simple(
         slug=plan_item.get("slug", ""),
         title=plan_item.get("title", ""),
         page_type=plan_item.get("page_type", "concept"),
-        related_pages=related_pages or "(none specified)",
+        all_plan_slugs=all_plan_slugs_str,
         existing_section=existing_section,
+        source_context=source_context or "(no source text available)",
         evidence_count=len(evidence),
-        evidence_blocks=evidence_blocks or "(no evidence — write from plan spec only)",
+        evidence_blocks=evidence_blocks or "(no pre-extracted evidence)",
     )
 
     raw = await asyncio.wait_for(
         llm.generate(prompt, system=WRITER_SYSTEM, temperature=0.15),
-        timeout=180,
+        timeout=WRITER_AGENT_TIMEOUT,
     )
 
     # Extract summary from first non-heading paragraph
@@ -245,7 +538,7 @@ _COMPLEX_WRITER_TOOLS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "content_md": {"type": "string", "description": "Full markdown content with [^N] citations"},
+                    "content_md": {"type": "string", "description": "Full markdown content using [[slug]] wikilinks"},
                     "summary": {"type": "string", "description": "One-sentence summary"},
                 },
                 "required": ["content_md", "summary"],
@@ -271,6 +564,7 @@ async def _write_page_complex(
     full_text: str,
     session: AsyncSession,
     source,
+    all_plan_slugs: list[str],
 ) -> tuple[str, str, list[dict]]:
     """
     Mini agent loop for pages with many evidence items or large existing content.
@@ -287,15 +581,23 @@ async def _write_page_complex(
         f"\n## Existing page content (UPDATE — integrate):\n{existing_content}\n"
         if existing_content else ""
     )
-    related = ", ".join(plan_item.get("related_kb_pages", []))
+
+    # Format available slugs (exclude self)
+    own_slug = plan_item.get("slug", "")
+    available = [s for s in all_plan_slugs if s != own_slug]
+    slugs_list = "\n".join(f"- [[{s}]]" for s in available) if available else "(none)"
+
+    # Build source context
+    source_context = _build_source_context(full_text, evidence, model_id=llm.config.model_id)
 
     initial_msg = (
         f"Write a wiki page for: **{plan_item.get('title', '')}** "
-        f"(slug: `{plan_item.get('slug', '')}`, type: {plan_item.get('page_type', 'concept')})\n"
-        f"Action: {plan_item.get('action', 'CREATE')}\n"
-        f"Related pages: {related or 'none'}\n"
+        f"(slug: `{own_slug}`, type: {plan_item.get('page_type', 'concept')})\n"
+        f"Action: {plan_item.get('action', 'CREATE')}\n\n"
+        f"## Available pages (ONLY use these for [[wikilinks]])\n{slugs_list}\n"
         f"{existing_section}\n"
-        f"## Evidence ({len(evidence)} items)\n{evidence_blocks}"
+        f"## Source document text\n{source_context}\n\n"
+        f"## Evidence checklist ({len(evidence)} items)\n{evidence_blocks}"
     )
 
     messages = [{"role": "user", "content": initial_msg}]
@@ -315,7 +617,8 @@ async def _write_page_complex(
                 timeout=WRITER_AGENT_TIMEOUT,
             )
         except Exception as e:
-            logger.error(f"MRP complex writer LLM call failed at step {step}: {e}")
+            err_msg = f"{type(e).__name__}: {str(e)}"
+            logger.error(f"MRP complex writer LLM call failed at step {step}: {err_msg}")
             raise
 
         messages.append(assistant_message_from_turn(turn))
@@ -408,6 +711,9 @@ async def run_refine_phase(
     # Sort by priority (lower number = higher priority)
     pages_spec = sorted(pages_spec, key=lambda p: p.get("priority", 99))
 
+    # Collect ALL slugs from the plan so writers can cross-link accurately
+    all_plan_slugs = [p.get("slug", "") for p in pages_spec if p.get("slug")]
+
     scope_type = source.scope_type or "global"
     scope_id = source.scope_id
 
@@ -441,19 +747,26 @@ async def run_refine_phase(
                 or len(existing_content or "") > WRITER_COMPLEX_THRESHOLD_EXISTING_CHARS
             )
 
+            # Build source context for the writer
+            source_context = _build_source_context(full_text, evidence, model_id=llm.config.model_id)
+
             try:
                 if is_complex:
                     content_md, summary, citations = await _write_page_complex(
                         llm, plan_item, evidence, existing_content, full_text, session, source,
+                        all_plan_slugs=all_plan_slugs,
                     )
                 else:
                     content_md, summary, citations = await _write_page_simple(
-                        llm, plan_item, evidence, existing_content, {},
+                        llm, plan_item, evidence, existing_content,
+                        all_plan_slugs=all_plan_slugs,
+                        source_context=source_context,
                     )
             except Exception as e:
-                logger.error(f"MRP REFINE writer failed for '{slug}': {e}")
+                err_msg = f"{type(e).__name__}: {str(e)}"
+                logger.error(f"MRP REFINE writer failed for '{slug}': {err_msg}")
                 # Return minimal stub so COMMIT can still proceed
-                content_md = f"# {title}\n\n(Page generation failed: {str(e)[:200]})"
+                content_md = f"# {title}\n\n(Page generation failed: {err_msg[:200]})"
                 summary = title
                 citations = []
 

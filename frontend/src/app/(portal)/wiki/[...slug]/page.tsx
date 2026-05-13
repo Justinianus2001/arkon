@@ -16,6 +16,7 @@ import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
 import { Button } from "@/components/ui/button";
 import Link from "next/link";
+import ReactMarkdown from "react-markdown";
 
 const WORKSPACE_ROLE_LEVEL: Record<string, number> = {
   viewer: 0,
@@ -275,7 +276,11 @@ export default function WikiPageViewer() {
                     {page.title}
                   </h1>
                   {page.summary && (
-                    <p className="mt-2 text-muted-foreground text-sm leading-6">{page.summary}</p>
+                    <div className="mt-2 text-muted-foreground text-sm leading-6 [&_strong]:font-semibold [&_strong]:text-foreground [&_em]:italic">
+                      <ReactMarkdown components={{ p: ({ children }) => <>{children}</> }}>
+                        {page.summary}
+                      </ReactMarkdown>
+                    </div>
                   )}
                 </div>
 

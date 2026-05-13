@@ -11,6 +11,7 @@ import { api, apiUpload } from "@/lib/api";
 import { ProjectSource, Project, Source } from "./types";
 import { getFileExt, fileIcons } from "./utils";
 import { AddDocumentModal } from "./add-document-modal";
+import { PlanReviewDialog } from "@/components/knowledge/knowledge-table/plan-review-dialog";
 
 type Props = {
   project: Project;
@@ -30,6 +31,7 @@ export function SourcesTab({
   onError,
 }: Props) {
   const [showAddDocModal, setShowAddDocModal] = useState(false);
+  const [reviewPlanSource, setReviewPlanSource] = useState<ProjectSource | null>(null);
 
   const handleRemoveSource = async (sourceId: string) => {
     if (!confirm("Remove this document from the workspace?")) return;
@@ -198,25 +200,35 @@ export function SourcesTab({
                 {/* Status + date + actions */}
                 <div className="flex items-center gap-3 shrink-0">
                   <div className="flex items-center gap-1.5">
-                    <span
-                      className={`w-2 h-2 rounded-full ${
-                        s.status === "ready"
-                          ? "bg-green-500"
-                          : s.status === "processing"
-                          ? "bg-yellow-500 animate-pulse"
-                          : s.status === "error"
-                          ? "bg-destructive"
-                          : "bg-muted-foreground"
-                      }`}
-                    />
-                    <span className="text-xs capitalize text-muted-foreground">{s.status}</span>
-                    {s.status === "processing" && s.progress !== undefined && (
-                      <span className="text-xs text-muted-foreground tabular-nums">
-                        ({s.progress}%)
-                      </span>
+                    {s.status === "ready" && (
+                      <Badge variant="outline" className="bg-green-500/10 text-green-600 border-green-500/20 text-[10px] uppercase font-semibold">
+                        Ready
+                      </Badge>
+                    )}
+                    {s.status === "processing" && (
+                      <Badge variant="outline" className="bg-yellow-500/10 text-yellow-600 border-yellow-500/20 text-[10px] uppercase font-semibold flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-yellow-500 animate-pulse" />
+                        Processing {s.progress !== undefined ? `${s.progress}%` : ""}
+                      </Badge>
+                    )}
+                    {s.status === "error" && (
+                      <Badge variant="outline" className="bg-destructive/10 text-destructive border-destructive/20 text-[10px] uppercase font-semibold flex items-center gap-1.5">
+                        <span className="material-symbols-outlined text-[12px]">error</span>
+                        Failed
+                      </Badge>
+                    )}
+                    {s.status === "plan_ready" && (
+                      <Badge variant="outline" className="bg-blue-500/10 text-blue-600 border-blue-500/20 text-[10px] uppercase font-semibold">
+                        Needs Review
+                      </Badge>
+                    )}
+                    {s.status === "pending" && (
+                      <Badge variant="outline" className="bg-muted text-muted-foreground border-border text-[10px] uppercase font-semibold">
+                        Pending
+                      </Badge>
                     )}
                   </div>
-                  <span className="text-xs text-muted-foreground tabular-nums">
+                  <span className="text-xs text-muted-foreground tabular-nums hidden sm:inline-block">
                     {s.added_at
                       ? new Date(s.added_at).toLocaleDateString("en-US", {
                           month: "short",
@@ -224,6 +236,18 @@ export function SourcesTab({
                         })
                       : ""}
                   </span>
+
+                  {s.status === "plan_ready" && isAdmin && (
+                    <Button
+                      size="sm"
+                      onClick={() => setReviewPlanSource(s)}
+                      className="bg-blue-50 text-blue-600 hover:bg-blue-100 border border-blue-200 h-7 text-xs px-2.5 shadow-none"
+                    >
+                      <span className="material-symbols-outlined text-[14px]">fact_check</span>
+                      Review Plan
+                    </Button>
+                  )}
+
                   {isAdmin && (
                     <DropdownMenu>
                       <DropdownMenuTrigger className="inline-flex items-center justify-center h-7 w-7 rounded-md hover:bg-accent text-muted-foreground transition-opacity">
@@ -257,6 +281,17 @@ export function SourcesTab({
           setShowAddDocModal(false);
         }}
       />
+
+      {reviewPlanSource && (
+        <PlanReviewDialog
+          source={{ id: reviewPlanSource.source_id, title: reviewPlanSource.title || reviewPlanSource.source_id } as any}
+          onClose={() => setReviewPlanSource(null)}
+          onDone={() => {
+            setReviewPlanSource(null);
+            onChanged();
+          }}
+        />
+      )}
     </div>
   );
 }

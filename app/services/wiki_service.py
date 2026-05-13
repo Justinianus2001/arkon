@@ -171,7 +171,7 @@ async def get_page_by_slug(
         _scope_filter(scope_type, scope_id),
     )
     result = await session.execute(stmt)
-    page = result.scalar_one_or_none()
+    page = result.scalars().first()
     if page is None:
         return None
     if allowed_kt_slugs is None or slug in (INDEX_SLUG, LOG_SLUG):
@@ -194,7 +194,7 @@ async def get_page_by_slug_any_scope(
     """
     stmt = select(WikiPage).where(WikiPage.slug == slug).limit(1)
     result = await session.execute(stmt)
-    return result.scalar_one_or_none()
+    return result.scalars().first()
 
 
 async def list_pages(
@@ -398,6 +398,11 @@ async def upsert_page(
     scope_id: Optional[uuid.UUID] = None,
 ) -> WikiPage:
     """Create-or-update by slug within a scope."""
+    # Acquire a transaction-level advisory lock based on the hash of the slug
+    # to serialize concurrent upserts for the exact same page.
+    lock_query = select(func.pg_advisory_xact_lock(func.hashtext(slug)))
+    await session.execute(lock_query)
+
     existing = await get_page_by_slug(session, slug, scope_type=scope_type, scope_id=scope_id)
     if existing is None:
         return await apply_create(

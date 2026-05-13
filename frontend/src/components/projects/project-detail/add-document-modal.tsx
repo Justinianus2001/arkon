@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { api, apiUpload } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import {
@@ -18,6 +18,81 @@ import { Source } from "./types";
 
 const ALLOWED_EXTS = [".pdf", ".docx", ".doc", ".xlsx", ".csv", ".txt", ".md", ".pptx"];
 const MAX_SIZE = 50 * 1024 * 1024; // 50 MB
+
+// Token estimation: ~4 chars per token (conservative for English)
+// PDF/DOCX have lower text density (~40-60% of file size is actual text)
+const TEXT_DENSITY: Record<string, number> = {
+  ".pdf": 0.45,
+  ".docx": 0.35,
+  ".doc": 0.40,
+  ".pptx": 0.25,
+  ".xlsx": 0.30,
+  ".csv": 0.90,
+  ".txt": 1.0,
+  ".md": 1.0,
+};
+const CHARS_PER_TOKEN = 4;
+
+// Known model context windows (sync with backend writer.py)
+const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  "gemini-3.1": 1_000_000,
+  "gemini-2.5": 1_000_000,
+  "gpt-5": 1_000_000,
+  "gpt-4.1": 1_000_000,
+  "gpt-4o": 128_000,
+  "claude-4": 1_000_000,
+};
+// 60% of context for source text (same as backend)
+const SOURCE_BUDGET_RATIO = 0.60;
+const DEFAULT_CONTEXT = 200_000; // conservative default
+
+function estimateTokens(file: File): number {
+  const ext = "." + file.name.split(".").pop()?.toLowerCase();
+  const density = TEXT_DENSITY[ext] ?? 0.5;
+  const estimatedChars = file.size * density;
+  return Math.round(estimatedChars / CHARS_PER_TOKEN);
+}
+
+function formatTokens(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`;
+  if (tokens >= 1_000) return `${(tokens / 1_000).toFixed(0)}K`;
+  return tokens.toString();
+}
+
+type TokenWarning = {
+  level: "ok" | "caution" | "danger";
+  message: string;
+  estimatedTokens: number;
+};
+
+function getTokenWarning(tokens: number): TokenWarning {
+  // Use default context window as baseline (most models now have 1M)
+  const budget = Math.round(DEFAULT_CONTEXT * SOURCE_BUDGET_RATIO);
+
+  if (tokens <= budget) {
+    return {
+      level: "ok",
+      message: `~${formatTokens(tokens)} tokens — fits well within most model context windows.`,
+      estimatedTokens: tokens,
+    };
+  }
+
+  // Check against 1M context models (most frontier models)
+  const largeBudget = Math.round(1_000_000 * SOURCE_BUDGET_RATIO);
+  if (tokens <= largeBudget) {
+    return {
+      level: "caution",
+      message: `~${formatTokens(tokens)} tokens — large document. Works with Gemini, GPT-5, Claude 4 (1M context). May need chunking for smaller models (GPT-4o).`,
+      estimatedTokens: tokens,
+    };
+  }
+
+  return {
+    level: "danger",
+    message: `~${formatTokens(tokens)} tokens — exceeds most model context windows. Consider splitting this document into smaller files for better results.`,
+    estimatedTokens: tokens,
+  };
+}
 
 export function AddDocumentModal({
   open,
@@ -40,6 +115,7 @@ export function AddDocumentModal({
   const [selectedSourceId, setSelectedSourceId] = useState("");
   const [linking, setLinking] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [tokenWarning, setTokenWarning] = useState<TokenWarning | null>(null);
   const fileInputRef = React.useRef<HTMLInputElement>(null);
 
   const reset = () => {
@@ -49,6 +125,7 @@ export function AddDocumentModal({
     setSelectedSourceId("");
     setUploading(false);
     setLinking(false);
+    setTokenWarning(null);
   };
 
   const validateFile = (file: File): string | null => {
@@ -60,9 +137,14 @@ export function AddDocumentModal({
 
   const handleFile = (file: File) => {
     setFileError(null);
+    setTokenWarning(null);
     const err = validateFile(file);
     if (err) { setFileError(err); return; }
     setSelectedFile(file);
+
+    // Estimate tokens and set warning
+    const tokens = estimateTokens(file);
+    setTokenWarning(getTokenWarning(tokens));
   };
 
   const handleUpload = async () => {
@@ -197,6 +279,22 @@ export function AddDocumentModal({
                   </>
                 )}
               </div>
+
+              {/* Token estimation warning */}
+              {tokenWarning && (
+                <div className={`text-sm px-3 py-2.5 rounded-lg flex items-start gap-2 ${
+                  tokenWarning.level === "ok"
+                    ? "bg-green-500/10 text-green-700 dark:text-green-400"
+                    : tokenWarning.level === "caution"
+                      ? "bg-amber-500/10 text-amber-700 dark:text-amber-400"
+                      : "bg-destructive/10 text-destructive"
+                }`}>
+                  <span className="material-symbols-outlined text-sm mt-0.5 shrink-0">
+                    {tokenWarning.level === "ok" ? "check_circle" : tokenWarning.level === "caution" ? "warning" : "error"}
+                  </span>
+                  <span>{tokenWarning.message}</span>
+                </div>
+              )}
 
               {fileError && (
                 <p className="text-sm text-destructive flex items-center gap-1.5">

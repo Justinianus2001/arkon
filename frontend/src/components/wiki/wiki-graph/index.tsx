@@ -175,17 +175,18 @@ export function WikiGraph({
     const usable = Math.max(dimensions.w - 2 * margin, 1);
     for (const n of nodes) {
       const c = components.get(n.id) ?? 0;
+      // Map component target X around 0
       n.__targetX =
         componentTargetX <= 1
-          ? dimensions.w / 2
-          : margin + (usable * c) / (componentTargetX - 1);
+          ? 0
+          : -usable / 2 + (usable * c) / (componentTargetX - 1);
     }
 
     fg.d3Force(
       "x",
-      forceX<Node>((d: Node) => d.__targetX ?? dimensions.w / 2).strength(0.05)
+      forceX<Node>((d: Node) => d.__targetX ?? 0).strength(0.05)
     );
-    fg.d3Force("y", forceY<Node>(dimensions.h / 2).strength(0.03));
+    fg.d3Force("y", forceY<Node>(0).strength(0.03));
 
     // Charge stronger for hub nodes so leaves don't pile up on top.
     const charge = fg.d3Force("charge");
@@ -195,11 +196,14 @@ export function WikiGraph({
     const link = fg.d3Force("link");
     if (link) link.distance(mini ? 35 : 70).strength(0.4);
 
-    // Pin the center node so the graph orbits around it.
+    // Disable the default center force because it fights with our pinned node and rips the graph apart!
+    fg.d3Force("center", null);
+
+    // Pin the center node so the graph orbits around it (at 0,0).
     for (const n of nodes) {
       if (n.id === centerSlug) {
-        n.fx = dimensions.w / 2;
-        n.fy = dimensions.h / 2;
+        n.fx = 0;
+        n.fy = 0;
       } else {
         n.fx = undefined;
         n.fy = undefined;
@@ -209,17 +213,28 @@ export function WikiGraph({
     fg.d3ReheatSimulation();
   }, [nodes, components, componentTargetX, centerSlug, dimensions.w, dimensions.h, mini]);
 
-  // Auto fit-to-canvas when the simulation cools down (only the first time
-  // per dataset — refitting on every reheat fights the user's manual pan/zoom).
+  // Auto fit-to-canvas when the simulation cools down.
   const hasFitRef = React.useRef(false);
   React.useEffect(() => {
     hasFitRef.current = false;
   }, [rawNodes.length, rawEdges.length]);
+
   const handleEngineStop = React.useCallback(() => {
     if (hasFitRef.current) return;
     hasFitRef.current = true;
-    fgRef.current?.zoomToFit(400, 60);
-  }, []);
+    if (!mini) {
+      if (rawNodes.length <= 1) {
+        fgRef.current?.centerAt(0, 0, 0);
+        fgRef.current?.zoom(2, 400);
+      } else {
+        fgRef.current?.zoomToFit(400, 60);
+      }
+    } else {
+      // In mini mode, nodes are pinned around (0, 0), so we pan the camera there!
+      fgRef.current?.centerAt(0, 0, 0);
+      fgRef.current?.zoom(1.4, 400);
+    }
+  }, [mini, rawNodes.length]);
 
   // Stable graphData reference — react-force-graph treats a new object literal
   // as a data change and resets simulation state, which is what was causing

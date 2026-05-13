@@ -416,21 +416,25 @@ async def run_map_phase(
     logger.info(f"MRP MAP: {done_count} already done, {len(pending_chunks)} pending for source={source_id}")
 
     semaphore = asyncio.Semaphore(MAX_MAP_CONCURRENCY)
+    commit_lock = asyncio.Lock()
 
     async def _extract_with_sem(chunk: DocumentChunk):
         async with semaphore:
             row = existing_by_idx[chunk.index]
             try:
                 extract = await extract_chunk(llm, chunk)
-                row.extract_json = extract
-                row.status = "done"
-                row.error_message = None
+                # Serialize mutations and commits — AsyncSession can't handle concurrent state changes
+                async with commit_lock:
+                    row.extract_json = extract
+                    row.status = "done"
+                    row.error_message = None
+                    await session.commit()
             except Exception as e:
                 logger.warning(f"MRP MAP chunk {chunk.index} failed: {e}")
-                row.status = "error"
-                row.error_message = str(e)[:500]
-            # Commit after each chunk so a crash mid-MAP is resumable
-            await session.commit()
+                async with commit_lock:
+                    row.status = "error"
+                    row.error_message = str(e)[:500]
+                    await session.commit()
             pct = 10 + int(40 * (done_count + chunk.index + 1) / max(len(chunks), 1))
             await tracker.update(pct, f"Extracting chunk {chunk.index + 1}/{len(chunks)}...")
 

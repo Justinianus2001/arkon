@@ -22,9 +22,19 @@ type PlanPage = {
   related_kb_pages?: string[];
 };
 
-type Plan = {
+type PlanData = {
   pages: PlanPage[];
   strategy?: string;
+  compilation_notes?: string;
+  estimated_page_count?: number;
+  source_page_slug?: string;
+};
+
+type PlanResponse = {
+  id: string;
+  status: string;
+  plan: PlanData;
+  review_note: string | null;
 };
 
 export function PlanReviewDialog({
@@ -36,16 +46,16 @@ export function PlanReviewDialog({
   onClose: () => void;
   onDone: () => void;
 }) {
-  const [plan, setPlan] = React.useState<Plan | null>(null);
+  const [plan, setPlan] = React.useState<PlanData | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
   const [submitting, setSubmitting] = React.useState<"approve" | "reject" | null>(null);
-  const [rejectNote, setRejectNote] = React.useState("");
+  const [reviewNote, setReviewNote] = React.useState("");
   const [confirmReject, setConfirmReject] = React.useState(false);
 
   React.useEffect(() => {
-    api<Plan>(`/api/sources/${source.id}/plan`)
-      .then(setPlan)
+    api<PlanResponse>(`/api/sources/${source.id}/plan`)
+      .then((res) => setPlan(res.plan))
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load plan"))
       .finally(() => setLoading(false));
   }, [source.id]);
@@ -56,7 +66,7 @@ export function PlanReviewDialog({
     try {
       await api(`/api/sources/${source.id}/plan/approve`, {
         method: "POST",
-        body: { note: "Approved via UI" },
+        body: { note: reviewNote || "Approved via UI" },
       });
       onDone();
     } catch (e) {
@@ -75,7 +85,7 @@ export function PlanReviewDialog({
     try {
       await api(`/api/sources/${source.id}/plan/reject`, {
         method: "POST",
-        body: { note: rejectNote || "Rejected via UI" },
+        body: { note: reviewNote || "Rejected via UI" },
       });
       onDone();
     } catch (e) {
@@ -84,12 +94,13 @@ export function PlanReviewDialog({
     }
   };
 
-  const creates = plan?.pages.filter((p) => p.action === "CREATE") ?? [];
-  const updates = plan?.pages.filter((p) => p.action === "UPDATE") ?? [];
+  const pages = plan?.pages ?? [];
+  const creates = pages.filter((p) => p.action === "CREATE");
+  const updates = pages.filter((p) => p.action === "UPDATE");
 
   return (
     <Dialog open onOpenChange={(open) => !open && onClose()}>
-      <DialogContent className="max-w-2xl max-h-[85vh] flex flex-col">
+      <DialogContent className="sm:max-w-2xl max-h-[85vh] flex flex-col">
         <DialogHeader>
           <DialogTitle className="flex items-center gap-2">
             <span className="material-symbols-outlined text-blue-500" style={{ fontSize: 20 }}>
@@ -119,7 +130,8 @@ export function PlanReviewDialog({
 
           {plan && (
             <div className="flex flex-col gap-4">
-              <div className="flex items-center gap-4 text-sm text-muted-foreground">
+              {/* Summary row */}
+              <div className="flex items-center gap-4 text-sm text-muted-foreground flex-wrap">
                 <span className="flex items-center gap-1.5">
                   <span className="w-2 h-2 rounded-full bg-green-500" />
                   {creates.length} page{creates.length !== 1 ? "s" : ""} to create
@@ -136,6 +148,15 @@ export function PlanReviewDialog({
                 )}
               </div>
 
+              {/* Planner notes */}
+              {plan.compilation_notes && (
+                <div className="text-xs text-muted-foreground bg-secondary/40 rounded-lg px-3 py-2 border border-border">
+                  <span className="font-medium text-foreground">Planner note: </span>
+                  {plan.compilation_notes}
+                </div>
+              )}
+
+              {/* Page list */}
               {[...creates, ...updates]
                 .sort((a, b) => (a.priority ?? 99) - (b.priority ?? 99))
                 .map((page) => (
@@ -175,19 +196,16 @@ export function PlanReviewDialog({
             </div>
           )}
         </div>
+        <div className="mt-4 flex flex-col gap-2 shrink-0">
+          <textarea
+            value={reviewNote}
+            onChange={(e) => setReviewNote(e.target.value)}
+            placeholder="Review note or feedback (optional)"
+            className="w-full text-sm rounded-lg border border-border bg-background px-3 py-2 resize-none h-16 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary/50"
+          />
+        </div>
 
-        {confirmReject && (
-          <div className="mt-3 flex flex-col gap-2">
-            <textarea
-              value={rejectNote}
-              onChange={(e) => setRejectNote(e.target.value)}
-              placeholder="Reason for rejection (optional)"
-              className="w-full text-sm rounded-lg border border-border bg-background px-3 py-2 resize-none h-16 focus:outline-none focus:ring-2 focus:ring-destructive/30 focus:border-destructive/50"
-            />
-          </div>
-        )}
-
-        <div className="flex items-center justify-end gap-2 mt-4 pt-4 border-t border-border">
+        <div className="flex items-center justify-end gap-2 mt-4 pt-4 border-t border-border shrink-0">
           <Button
             variant="ghost"
             onClick={onClose}
@@ -202,7 +220,7 @@ export function PlanReviewDialog({
               disabled={loading || submitting !== null}
               className="text-destructive border-destructive/30 hover:bg-destructive/10"
             >
-              <span className="material-symbols-outlined mr-1.5" style={{ fontSize: 16 }}>close</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
               Reject
             </Button>
           ) : (
@@ -212,11 +230,11 @@ export function PlanReviewDialog({
               disabled={submitting !== null}
             >
               {submitting === "reject" ? (
-                <span className="material-symbols-outlined animate-spin mr-1.5" style={{ fontSize: 16 }}>
+                <span className="material-symbols-outlined animate-spin" style={{ fontSize: 16 }}>
                   progress_activity
                 </span>
               ) : (
-                <span className="material-symbols-outlined mr-1.5" style={{ fontSize: 16 }}>close</span>
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
               )}
               Confirm Reject
             </Button>
@@ -226,11 +244,11 @@ export function PlanReviewDialog({
             disabled={loading || submitting !== null}
           >
             {submitting === "approve" ? (
-              <span className="material-symbols-outlined animate-spin mr-1.5" style={{ fontSize: 16 }}>
+              <span className="material-symbols-outlined animate-spin" style={{ fontSize: 16 }}>
                 progress_activity
               </span>
             ) : (
-              <span className="material-symbols-outlined mr-1.5" style={{ fontSize: 16 }}>check</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>check</span>
             )}
             Approve & Compile
           </Button>

@@ -173,7 +173,7 @@ export function WikiSidebarRight({ slug, page }: Props) {
       </div>
 
       {/* Mini graph pinned to bottom */}
-      {graphData && graphData.nodes.length > 0 && (
+      {graphData && graphData.nodes.length > 1 && (
         <div className="shrink-0 border-t border-border p-4 bg-card/40">
           <div className="flex items-center gap-2 pb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             <span className="material-symbols-outlined text-xs">hub</span>

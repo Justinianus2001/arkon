@@ -49,16 +49,22 @@ export function PlanReviewDialog({
   const [plan, setPlan] = React.useState<PlanData | null>(null);
   const [loading, setLoading] = React.useState(true);
   const [error, setError] = React.useState<string | null>(null);
-  const [submitting, setSubmitting] = React.useState<"approve" | "reject" | null>(null);
+  const [submitting, setSubmitting] = React.useState<"approve" | "reject" | "regenerate" | null>(null);
   const [reviewNote, setReviewNote] = React.useState("");
   const [confirmReject, setConfirmReject] = React.useState(false);
 
-  React.useEffect(() => {
+  const loadPlan = React.useCallback(() => {
+    setLoading(true);
+    setError(null);
     api<PlanResponse>(`/api/sources/${source.id}/plan`)
       .then((res) => setPlan(res.plan))
       .catch((e) => setError(e instanceof Error ? e.message : "Failed to load plan"))
       .finally(() => setLoading(false));
   }, [source.id]);
+
+  React.useEffect(() => {
+    loadPlan();
+  }, [loadPlan]);
 
   const handleApprove = async () => {
     setSubmitting("approve");
@@ -90,6 +96,28 @@ export function PlanReviewDialog({
       onDone();
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to reject plan");
+      setSubmitting(null);
+    }
+  };
+
+  const handleRegenerate = async () => {
+    if (!reviewNote.trim()) {
+      setError("Please describe what should be changed before regenerating.");
+      return;
+    }
+    setSubmitting("regenerate");
+    setError(null);
+    try {
+      const res = await api<PlanResponse>(`/api/sources/${source.id}/plan/regenerate`, {
+        method: "POST",
+        body: { note: reviewNote },
+      });
+      setPlan(res.plan);
+      setReviewNote("");
+      setConfirmReject(false);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "Failed to regenerate plan");
+    } finally {
       setSubmitting(null);
     }
   };
@@ -196,62 +224,87 @@ export function PlanReviewDialog({
             </div>
           )}
         </div>
+
         <div className="mt-4 flex flex-col gap-2 shrink-0">
           <textarea
             value={reviewNote}
             onChange={(e) => setReviewNote(e.target.value)}
-            placeholder="Review note or feedback (optional)"
+            placeholder="Feedback or correction for the AI (e.g. 'Page X already exists, it should be UPDATE not CREATE'). Required to regenerate."
             className="w-full text-sm rounded-lg border border-border bg-background px-3 py-2 resize-none h-16 focus:outline-none focus:ring-2 focus:ring-primary/30 focus:border-primary/50"
           />
+          <p className="text-[11px] text-muted-foreground">
+            Write feedback then click <strong>Regenerate</strong> to have AI redo the plan, or click <strong>Approve</strong> to proceed as-is.
+          </p>
         </div>
 
-        <div className="flex items-center justify-end gap-2 mt-4 pt-4 border-t border-border shrink-0">
-          <Button
-            variant="ghost"
-            onClick={onClose}
-            disabled={submitting !== null}
-          >
-            Cancel
-          </Button>
-          {!confirmReject ? (
+        <div className="flex items-center justify-between mt-4 pt-4 border-t border-border shrink-0">
+          <div className="flex items-center gap-2">
             <Button
               variant="outline"
-              onClick={() => setConfirmReject(true)}
+              size="sm"
+              onClick={handleRegenerate}
               disabled={loading || submitting !== null}
-              className="text-destructive border-destructive/30 hover:bg-destructive/10"
+              className="gap-1.5"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
-              Reject
+              {submitting === "regenerate" ? (
+                <span className="material-symbols-outlined animate-spin" style={{ fontSize: 15 }}>
+                  progress_activity
+                </span>
+              ) : (
+                <span className="material-symbols-outlined" style={{ fontSize: 15 }}>refresh</span>
+              )}
+              Regenerate
             </Button>
-          ) : (
+          </div>
+
+          <div className="flex items-center gap-2">
             <Button
-              variant="destructive"
-              onClick={handleReject}
+              variant="ghost"
+              onClick={onClose}
               disabled={submitting !== null}
             >
-              {submitting === "reject" ? (
+              Cancel
+            </Button>
+            {!confirmReject ? (
+              <Button
+                variant="outline"
+                onClick={() => setConfirmReject(true)}
+                disabled={loading || submitting !== null}
+                className="text-destructive border-destructive/30 hover:bg-destructive/10"
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+                Reject
+              </Button>
+            ) : (
+              <Button
+                variant="destructive"
+                onClick={handleReject}
+                disabled={submitting !== null}
+              >
+                {submitting === "reject" ? (
+                  <span className="material-symbols-outlined animate-spin" style={{ fontSize: 16 }}>
+                    progress_activity
+                  </span>
+                ) : (
+                  <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+                )}
+                Confirm Reject
+              </Button>
+            )}
+            <Button
+              onClick={handleApprove}
+              disabled={loading || submitting !== null}
+            >
+              {submitting === "approve" ? (
                 <span className="material-symbols-outlined animate-spin" style={{ fontSize: 16 }}>
                   progress_activity
                 </span>
               ) : (
-                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>close</span>
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>check</span>
               )}
-              Confirm Reject
+              Approve & Compile
             </Button>
-          )}
-          <Button
-            onClick={handleApprove}
-            disabled={loading || submitting !== null}
-          >
-            {submitting === "approve" ? (
-              <span className="material-symbols-outlined animate-spin" style={{ fontSize: 16 }}>
-                progress_activity
-              </span>
-            ) : (
-              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>check</span>
-            )}
-            Approve & Compile
-          </Button>
+          </div>
         </div>
       </DialogContent>
     </Dialog>

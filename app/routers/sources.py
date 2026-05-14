@@ -583,6 +583,10 @@ class PlanRejectRequest(BaseModel):
     note: str
 
 
+class PlanRegenerateRequest(BaseModel):
+    note: str
+
+
 @router.get("/sources/{source_id}/plan")
 async def get_compilation_plan(
     source_id: uuid.UUID,
@@ -665,6 +669,105 @@ async def approve_compilation_plan(
 
     logger.info(f"Plan approved for source {source_id} by user {user.id}, refine job: {job.job_id if job else 'N/A'}")
     return {"approved": True, "job_id": job.job_id if job else None}
+
+
+@router.post("/sources/{source_id}/plan/regenerate")
+async def regenerate_compilation_plan(
+    source_id: uuid.UUID,
+    body: PlanRegenerateRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = require_permission("doc:edit"),
+):
+    """Re-run the planning phase using reviewer feedback and return the updated plan."""
+    from app.ai.mrp.reducer import reconcile_with_kb, run_planning_call
+    from app.ai.registry import ProviderRegistry
+    from app.database.models import Source, SourceCompilationPlan
+
+    source = (await db.execute(
+        select(Source).options(*_source_load_options()).where(Source.id == source_id)
+    )).scalar_one_or_none()
+    if not source:
+        raise HTTPException(status_code=404, detail="Source not found")
+
+    plan = (await db.execute(
+        select(SourceCompilationPlan).where(SourceCompilationPlan.source_id == source_id)
+    )).scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="No plan found for this source")
+    if plan.status not in ("pending_review", "rejected"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan cannot be regenerated (status={plan.status})",
+        )
+
+    plan_json = plan.plan_json or {}
+    canonical_entities = plan_json.get("_entities", [])
+    canonical_concepts = plan_json.get("_concepts", [])
+
+    registry = ProviderRegistry(db)
+    try:
+        llm = await registry.get_llm()
+    except Exception as exc:
+        raise HTTPException(status_code=503, detail=f"LLM provider unavailable: {exc}")
+
+    embedding_provider = None
+    try:
+        embedding_provider = await registry.get_embedding(task="document")
+    except Exception:
+        pass
+
+    # Re-run KB reconciliation
+    reconciliation: dict = {}
+    if embedding_provider and (canonical_entities or canonical_concepts):
+        try:
+            reconciliation = await reconcile_with_kb(
+                db, canonical_entities, canonical_concepts, embedding_provider, source, llm=llm,
+            )
+        except Exception as exc:
+            logger.warning(f"Plan regenerate: KB reconciliation failed: {exc}")
+
+    # Re-run planning call with user note
+    kt_name = source.knowledge_type.name if source.knowledge_type else None
+    kt_desc = None
+
+    strategy = source.pipeline_strategy or "standard"
+    try:
+        new_plan_dict = await run_planning_call(
+            llm=llm,
+            source=source,
+            strategy=strategy,
+            canonical_entities=canonical_entities,
+            canonical_concepts=canonical_concepts,
+            reconciliation=reconciliation,
+            kt_name=kt_name,
+            kt_desc=kt_desc,
+            user_note=body.note,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Planning call failed: {exc}")
+
+    # Preserve internal keys and save
+    internal_keys = {k: plan_json[k] for k in ("_claims", "_entities", "_concepts") if k in plan_json}
+    new_plan_dict.update(internal_keys)
+
+    plan.plan_json = new_plan_dict
+    plan.status = "pending_review"
+    plan.reviewed_by = None
+    plan.review_note = None
+    plan.reviewed_at = None
+    await db.commit()
+
+    # Return updated plan (strip internal keys)
+    clean = dict(new_plan_dict)
+    clean.pop("_claims", None)
+    clean.pop("_entities", None)
+    clean.pop("_concepts", None)
+    return {
+        "id": str(plan.id),
+        "status": plan.status,
+        "plan": clean,
+        "review_note": None,
+    }
 
 
 @router.post("/sources/{source_id}/plan/reject")

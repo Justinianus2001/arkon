@@ -1,7 +1,10 @@
 import asyncio
+
 from sqlalchemy import select
+
 from app.database import async_session_factory
 from app.database.models import WikiPage
+
 
 async def deduplicate():
     async with async_session_factory() as session:

@@ -10,7 +10,6 @@ in the page content (markers), but never cause the pipeline to fail.
 """
 
 import asyncio
-import json
 from typing import Optional
 
 from loguru import logger

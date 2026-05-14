@@ -16,8 +16,6 @@ Design notes:
   hallucinating them.
 """
 
-import json
-import re
 from typing import Optional
 
 from loguru import logger

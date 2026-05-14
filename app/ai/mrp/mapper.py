@@ -12,8 +12,6 @@ Phase 1: build_chunks() — splits document into ~20k-char chunks along section
 """
 
 import asyncio
-import json
-import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Optional

@@ -13,7 +13,6 @@ All writers run in parallel (asyncio.Semaphore(MAX_WRITER_CONCURRENCY)).
 """
 
 import asyncio
-import json
 import re
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Optional

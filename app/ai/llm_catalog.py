@@ -66,24 +66,11 @@ LLM_CATALOG: dict[str, LLMModelSpec] = {
         cost_per_1m_output_tokens=15.0,
         notes="Balanced cost/quality. Recommended default.",
     ),
-    "anthropic/claude-haiku-4-5": LLMModelSpec(
-        id="anthropic/claude-haiku-4-5",
-        provider="anthropic",
-        model_id="claude-haiku-4-5-20251001",
-        context_window_tokens=200_000,
-        max_output_tokens=16_000,
-        supports_tools=True,
-        supports_vision=True,
-        label="Claude Haiku 4.5 (200k)",
-        cost_per_1m_input_tokens=1.0,
-        cost_per_1m_output_tokens=5.0,
-        notes="Fast and cheap. Good for high-volume extraction.",
-    ),
     # --- Google Gemini ---
-    "google/gemini-3.1-pro": LLMModelSpec(
-        id="google/gemini-3.1-pro",
+    "google/gemini-3.1-pro-preview": LLMModelSpec(
+        id="google/gemini-3.1-pro-preview",
         provider="google",
-        model_id="gemini-3.1-pro",
+        model_id="gemini-3.1-pro-preview",
         context_window_tokens=1_000_000,
         max_output_tokens=65_000,
         supports_tools=True,
@@ -102,8 +89,8 @@ LLM_CATALOG: dict[str, LLMModelSpec] = {
         supports_tools=True,
         supports_vision=True,
         label="Gemini 3 Flash Preview (1M)",
-        cost_per_1m_input_tokens=None,
-        cost_per_1m_output_tokens=None,
+        cost_per_1m_input_tokens=0.5,
+        cost_per_1m_output_tokens=3,
         notes=(
             "Preview model. Strongest multimodal + agentic Flash so far. "
             "Supports thinking and computer use. Pricing not yet published."
@@ -125,19 +112,6 @@ LLM_CATALOG: dict[str, LLMModelSpec] = {
             "agentic tasks, translation, simple extraction. Supports thinking. "
             "Audio input charged at $0.50/1M."
         ),
-    ),
-    "google/gemini-2.5-pro": LLMModelSpec(
-        id="google/gemini-2.5-pro",
-        provider="google",
-        model_id="gemini-2.5-pro",
-        context_window_tokens=1_000_000,
-        max_output_tokens=8_192,
-        supports_tools=True,
-        supports_vision=True,
-        label="Gemini 2.5 Pro (1M)",
-        cost_per_1m_input_tokens=1.25,
-        cost_per_1m_output_tokens=5.0,
-        notes="Stable predecessor. Use if 3.1 unavailable.",
     ),
     # --- OpenAI ---
     "openai/gpt-5.4": LLMModelSpec(

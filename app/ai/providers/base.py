@@ -36,6 +36,11 @@ class ProviderConfig:
     """
     Configuration for a single provider instance.
     Loaded from DB by ProviderRegistry at runtime.
+
+    `spec` is a reference back to the catalog entry (LLMModelSpec /
+    VisionModelSpec / EmbeddingModelSpec) when one applies. Callers that
+    need capability metadata (context window, supports_tools, ...) read it
+    from `config.spec` rather than hard-coding per model_id.
     """
     provider: ProviderType
     api_key: str = ""
@@ -43,6 +48,7 @@ class ProviderConfig:
     base_url: Optional[str] = None      # For Ollama, Azure, proxies
     dimensions: Optional[int] = None    # Embedding output dimensions
     extra: dict = field(default_factory=dict)  # Provider-specific params
+    spec: Optional[object] = None        # LLMModelSpec | VisionModelSpec | EmbeddingModelSpec
 
 
 # ---------------------------------------------------------------------------

@@ -1,95 +1,62 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect } from "react";
 import { useRouter } from "next/navigation";
-import { api } from "@/lib/api";
 import { useAuth } from "@/lib/auth";
 import { PageHeader } from "@/components/shared/page-header";
-import { ProviderConfigCard } from "@/components/settings/provider-config-card";
 import { EmbeddingSettingsCard } from "@/components/settings/embedding-settings-card";
+import {
+  ModelCatalogCard,
+  type ModelSpec,
+} from "@/components/settings/model-catalog-card";
 
-// Keys must match ALL_CONFIG_KEYS in app/services/config_service.py.
-// Embedding configuration is now driven by EmbeddingSettingsCard (catalog
-// whitelist + re-embed jobs); only LLM and Vision are still free-form here.
-type ProviderConfig = {
-  llm_provider: string;
-  llm_model_id: string;
-  llm_api_key: string;
-  vision_provider: string;
-  vision_model_id: string;
-  vision_api_key: string;
-};
+function fmtTokens(n: number | undefined): string {
+  if (!n) return "—";
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(n % 1_000_000 === 0 ? 0 : 1)}M`;
+  if (n >= 1_000) return `${Math.round(n / 1_000)}k`;
+  return String(n);
+}
 
-const defaultConfig: ProviderConfig = {
-  llm_provider: "",
-  llm_model_id: "",
-  llm_api_key: "",
-  vision_provider: "",
-  vision_model_id: "",
-  vision_api_key: "",
-};
+function fmtUSD(n: number | null | undefined): string {
+  if (n == null) return "—";
+  return `$${n.toFixed(n < 1 ? 2 : 2)}`;
+}
+
+function llmMeta(s: ModelSpec) {
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+      <span>Context: {fmtTokens(s.context_window_tokens)} tokens</span>
+      <span>Out: {fmtTokens(s.max_output_tokens)}</span>
+      {s.supports_tools && <span className="text-green-600 dark:text-green-400">tools</span>}
+      {s.supports_vision && <span className="text-blue-600 dark:text-blue-400">vision</span>}
+      <span>
+        {fmtUSD(s.cost_per_1m_input_tokens)} in / {fmtUSD(s.cost_per_1m_output_tokens)} out per 1M
+      </span>
+    </div>
+  );
+}
+
+function visionMeta(s: ModelSpec) {
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-0.5">
+      <span>Max image: {s.max_image_size_mb} MB</span>
+      <span>{fmtUSD(s.cost_per_1m_input_tokens)} per 1M input tokens</span>
+      {s.cost_per_image != null && <span>{fmtUSD(s.cost_per_image)} / image</span>}
+    </div>
+  );
+}
 
 export default function SettingsPage() {
   const { user } = useAuth();
   const router = useRouter();
-  const [config, setConfig] = useState<ProviderConfig>(defaultConfig);
-  const [loading, setLoading] = useState(true);
-  const [saving, setSaving] = useState(false);
-  const [saved, setSaved] = useState(false);
-  const [saveError, setSaveError] = useState("");
 
-  // Admin guard
   useEffect(() => {
     if (user && user.role !== "admin") {
       router.replace("/");
     }
   }, [user, router]);
 
-  useEffect(() => {
-    if (user?.role !== "admin") return;
-    async function load() {
-      try {
-        const data = await api<Record<string, unknown>>("/api/settings");
-        const coerced = Object.fromEntries(
-          Object.keys(defaultConfig).map((k) => [k, String(data[k] ?? "")])
-        ) as ProviderConfig;
-        setConfig(coerced);
-      } catch {
-        // Use defaults
-      } finally {
-        setLoading(false);
-      }
-    }
-    load();
-  }, [user]);
-
-  const handleSave = async () => {
-    setSaving(true);
-    setSaved(false);
-    setSaveError("");
-    try {
-      const settings: Record<string, string> = {};
-      for (const [k, v] of Object.entries(config)) {
-        const str = typeof v === "string" ? v : "";
-        // Skip masked values — server already has them stored
-        if (str && !str.startsWith("•")) settings[k] = str;
-        else if (!str) settings[k] = "";
-      }
-      await api("/api/settings", { method: "PUT", body: { settings } });
-      setSaved(true);
-      setTimeout(() => setSaved(false), 3000);
-    } catch (err) {
-      setSaveError(err instanceof Error ? err.message : "Save failed");
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const updateField = (key: keyof ProviderConfig, value: string) => {
-    setConfig((prev) => ({ ...prev, [key]: value }));
-  };
-
-  if (loading) {
+  if (!user || user.role !== "admin") {
     return (
       <div className="flex items-center justify-center py-16">
         <span className="material-symbols-outlined text-3xl text-muted-foreground animate-spin">
@@ -109,53 +76,25 @@ export default function SettingsPage() {
       <div className="flex flex-col gap-6">
         <EmbeddingSettingsCard />
 
-        <ProviderConfigCard
-          title="LLM Provider"
-          description="Used for AI-powered analysis and summarization"
+        <ModelCatalogCard
+          title="LLM Model"
+          description="Used for entity extraction, planning, and wiki compilation."
           icon="psychology"
-          provider={config.llm_provider}
-          model={config.llm_model_id}
-          apiKey={config.llm_api_key}
-          onProviderChange={(v) => updateField("llm_provider", v)}
-          onModelChange={(v) => updateField("llm_model_id", v)}
-          onApiKeyChange={(v) => updateField("llm_api_key", v)}
+          catalogUrl="/api/settings/llm/catalog"
+          switchUrl="/api/settings/llm/switch"
+          apiKeyConfigKey="llm_api_key"
+          renderMeta={llmMeta}
         />
 
-        <ProviderConfigCard
-          title="Vision Provider"
-          description="Optional — used for image analysis in documents"
+        <ModelCatalogCard
+          title="Vision Model"
+          description="Used for image analysis during document ingestion."
           icon="visibility"
-          provider={config.vision_provider}
-          model={config.vision_model_id}
-          apiKey={config.vision_api_key}
-          onProviderChange={(v) => updateField("vision_provider", v)}
-          onModelChange={(v) => updateField("vision_model_id", v)}
-          onApiKeyChange={(v) => updateField("vision_api_key", v)}
+          catalogUrl="/api/settings/vision/catalog"
+          switchUrl="/api/settings/vision/switch"
+          apiKeyConfigKey="vision_api_key"
+          renderMeta={visionMeta}
         />
-
-        <div className="flex flex-col gap-2">
-          <div className="flex items-center gap-3">
-            <button
-              onClick={handleSave}
-              disabled={saving}
-              className="bg-primary text-primary-foreground px-6 py-2.5 rounded-lg text-sm font-medium hover:bg-primary/90 transition-colors disabled:opacity-50"
-            >
-              {saving ? "Saving..." : "Save Settings"}
-            </button>
-            {saved && (
-              <span className="text-sm text-green-600 flex items-center gap-1">
-                <span className="material-symbols-outlined text-sm filled">check_circle</span>
-                Saved successfully
-              </span>
-            )}
-          </div>
-          {saveError && (
-            <p className="text-sm text-destructive bg-destructive/10 px-3 py-2 rounded-lg flex items-center gap-2">
-              <span className="material-symbols-outlined text-base">error</span>
-              {saveError}
-            </p>
-          )}
-        </div>
       </div>
     </>
   );

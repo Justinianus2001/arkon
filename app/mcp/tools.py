@@ -169,6 +169,7 @@ def register_tools(mcp: FastMCP):
                 query_embedding=query_embedding,
                 top_k=top_k,
                 allowed_kt_slugs=identity.allowed_knowledge_types,
+                department_id=identity.department_id,
             )
 
         if not hits:
@@ -240,10 +241,21 @@ def register_tools(mcp: FastMCP):
         from app.services import wiki_service
 
         async with async_session_factory() as session:
+            # Try exact slug in global scope first, then fall back to dept scope
             page = await wiki_service.get_page_by_slug(
                 session, slug, allowed_kt_slugs=identity.allowed_knowledge_types,
             )
             if not page:
+                page = await wiki_service.get_page_by_slug(
+                    session, slug,
+                    allowed_kt_slugs=identity.allowed_knowledge_types,
+                    scope_type="department",
+                    scope_id=identity.department_id,
+                )
+            if not page:
+                return f"Wiki page not found or out of scope: `{slug}`"
+            # Access check: deny dept pages from other departments
+            if page.scope_type == "department" and page.scope_id != identity.department_id:
                 return f"Wiki page not found or out of scope: `{slug}`"
             backlinks = await wiki_service.get_backlinks(session, slug)
 
@@ -289,6 +301,7 @@ def register_tools(mcp: FastMCP):
                 allowed_kt_slugs=identity.allowed_knowledge_types,
                 limit=limit,
                 offset=offset,
+                department_id=identity.department_id,
             )
 
         if not pages:

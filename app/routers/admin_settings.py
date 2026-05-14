@@ -152,6 +152,10 @@ async def test_vision(db: AsyncSession = Depends(get_db)):
 
 @router.get("/settings/providers")
 async def list_providers():
-    """Get supported providers and models for each capability."""
-    from app.ai.registry import SUPPORTED_PROVIDERS
-    return SUPPORTED_PROVIDERS
+    """
+    Catalog-derived listing of supported providers per capability. Each model
+    entry includes spec_id, label, cost, and capability metadata so the UI can
+    render rich dropdowns.
+    """
+    from app.ai.registry import supported_providers
+    return supported_providers()

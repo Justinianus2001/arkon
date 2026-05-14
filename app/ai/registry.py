@@ -127,41 +127,74 @@ class ProviderRegistry:
 
     async def get_llm(self) -> LLMProvider:
         """Get the configured LLM provider."""
-        config = await self._load_config("llm")
+        config = await self._load_llm_config()
         cls = _get_llm_class(config.provider)
         return cls(config)
+
+    async def get_active_llm_spec_id(self) -> Optional[str]:
+        """Return the spec_id currently active for LLM, or None if unset."""
+        from app.ai.llm_catalog import LLM_CATALOG, derive_spec_id
+        from app.services.config_service import ACTIVE_LLM_MODEL_KEY, ConfigService
+
+        svc = ConfigService(self.db)
+        spec_id = await svc.get(ACTIVE_LLM_MODEL_KEY)
+        if spec_id and spec_id in LLM_CATALOG:
+            return spec_id
+        # Backward-compat: derive from legacy provider+model_id pair.
+        legacy_provider = await svc.get("llm_provider")
+        legacy_model = await svc.get("llm_model_id")
+        if legacy_provider and legacy_model:
+            return derive_spec_id(legacy_provider, legacy_model)
+        return None
 
     async def get_vision(self) -> Optional[VisionProvider]:
         """Get the configured vision provider. Returns None if not configured."""
         try:
-            config = await self._load_config("vision")
-            cls = _get_vision_class(config.provider)
-            return cls(config)
+            config = await self._load_vision_config()
         except ValueError:
             logger.debug("No vision provider configured, image analysis disabled")
             return None
+        cls = _get_vision_class(config.provider)
+        return cls(config)
+
+    async def get_active_vision_spec_id(self) -> Optional[str]:
+        """Return the spec_id currently active for vision, or None if unset."""
+        from app.ai.vision_catalog import VISION_CATALOG, derive_spec_id
+        from app.services.config_service import (
+            ACTIVE_VISION_MODEL_KEY,
+            ConfigService,
+        )
+
+        svc = ConfigService(self.db)
+        spec_id = await svc.get(ACTIVE_VISION_MODEL_KEY)
+        if spec_id and spec_id in VISION_CATALOG:
+            return spec_id
+        legacy_provider = await svc.get("vision_provider")
+        legacy_model = await svc.get("vision_model_id")
+        if legacy_provider and legacy_model:
+            return derive_spec_id(legacy_provider, legacy_model)
+        return None
 
     async def test_all(self) -> dict[str, tuple[bool, str]]:
         """
         Test all configured providers.
         Returns: {"embedding": (True, "OK"), "llm": (False, "error"), ...}
         """
-        results = {}
+        results: dict[str, tuple[bool, str]] = {}
+        loaders = {
+            "embedding": (self._load_embedding_config, _get_embedding_class),
+            "llm": (self._load_llm_config, _get_llm_class),
+            "vision": (self._load_vision_config, _get_vision_class),
+        }
 
-        for capability in ("embedding", "llm", "vision"):
+        for capability, (loader, cls_fn) in loaders.items():
             try:
-                config = await self._load_config(capability)
+                config = await loader()
             except ValueError as e:
                 results[capability] = (False, f"Not configured: {e}")
                 continue
-
             try:
-                if capability == "embedding":
-                    provider = _get_embedding_class(config.provider)(config)
-                elif capability == "llm":
-                    provider = _get_llm_class(config.provider)(config)
-                else:
-                    provider = _get_vision_class(config.provider)(config)
+                provider = cls_fn(config.provider)(config)
                 results[capability] = await provider.test_connection()
             except Exception as e:
                 results[capability] = (False, str(e))
@@ -217,69 +250,125 @@ class ProviderRegistry:
             extra={"spec_id": spec.id},
         )
 
-    async def _load_config(self, capability: str) -> ProviderConfig:
-        """Load provider config from DB for LLM / vision capabilities."""
-        if capability == "embedding":
-            return await self._load_embedding_config()
+    async def _load_llm_config(self) -> ProviderConfig:
+        """
+        Build a ProviderConfig for the active LLM from LLM_CATALOG.
 
+        Resolution: spec_id (new) → legacy provider+model_id derivation.
+        Raises ValueError if no LLM is configured at all.
+        """
+        from app.ai.llm_catalog import get_spec
         from app.services.config_service import ConfigService
+
         svc = ConfigService(self.db)
+        spec_id = await self.get_active_llm_spec_id()
+        if not spec_id:
+            raise ValueError("No active LLM. Pick one in Settings → LLM.")
+        spec = get_spec(spec_id)
 
-        provider_str = await svc.get(f"{capability}_provider")
-        model_id = await svc.get(f"{capability}_model_id")
-        api_key = await svc.get(f"{capability}_api_key")
-        base_url = await svc.get(f"{capability}_base_url")
-        dimensions_str = await svc.get(f"{capability}_dimensions")
-
-        if not provider_str or not model_id:
-            raise ValueError(
-                f"No {capability} provider configured. "
-                f"Set {capability}_provider and {capability}_model_id in settings."
-            )
+        api_key = await svc.get("llm_api_key") or ""
+        base_url = await svc.get("llm_base_url")
 
         return ProviderConfig(
-            provider=ProviderType(provider_str),
-            api_key=api_key or "",
-            model_id=model_id,
+            provider=ProviderType(spec.provider),
+            api_key=api_key,
+            model_id=spec.model_id,
             base_url=base_url,
-            dimensions=int(dimensions_str) if dimensions_str else None,
-            extra={},
+            extra={"spec_id": spec.id},
+            spec=spec,
+        )
+
+    async def _load_vision_config(self) -> ProviderConfig:
+        """Build a ProviderConfig for the active vision model from VISION_CATALOG."""
+        from app.ai.vision_catalog import get_spec
+        from app.services.config_service import ConfigService
+
+        svc = ConfigService(self.db)
+        spec_id = await self.get_active_vision_spec_id()
+        if not spec_id:
+            raise ValueError("No active vision model. Pick one in Settings → Vision.")
+        spec = get_spec(spec_id)
+
+        api_key = await svc.get("vision_api_key") or ""
+        base_url = await svc.get("vision_base_url")
+
+        return ProviderConfig(
+            provider=ProviderType(spec.provider),
+            api_key=api_key,
+            model_id=spec.model_id,
+            base_url=base_url,
+            extra={"spec_id": spec.id},
+            spec=spec,
         )
 
 
 # ---------------------------------------------------------------------------
-# Convenience: supported providers list (for admin UI dropdowns)
+# Catalog-derived listings (for admin UI dropdowns)
 # ---------------------------------------------------------------------------
 
-SUPPORTED_PROVIDERS = {
-    "embedding": [
-        {"id": "google", "name": "Google Gemini", "models": [
-            "gemini-embedding-2", "text-embedding-004",
-        ]},
-        {"id": "openai", "name": "OpenAI", "models": [
-            "text-embedding-3-small", "text-embedding-3-large", "text-embedding-ada-002",
-        ]},
-    ],
-    "llm": [
-        {"id": "google", "name": "Google Gemini", "models": [
-            "gemini-3.1-pro", "gemini-3.1-flash", "gemini-3.0-flash",
-            "gemini-2.5-flash", "gemini-2.5-pro",
-        ]},
-        {"id": "openai", "name": "OpenAI", "models": [
-            "gpt-5.5-instant", "gpt-5.4", "gpt-5.2",
-            "gpt-4.1-mini", "gpt-4.1-nano", "gpt-4o", "gpt-4o-mini",
-        ]},
-        {"id": "anthropic", "name": "Anthropic", "models": [
-            "claude-4.7-opus", "claude-4.6-sonnet",
-            "claude-sonnet-4-20250514", "claude-haiku-4-20250514",
-        ]},
-    ],
-    "vision": [
-        {"id": "google", "name": "Google Gemini", "models": [
-            "gemini-3.1-flash", "gemini-3.0-flash", "gemini-2.5-flash",
-        ]},
-        {"id": "openai", "name": "OpenAI", "models": [
-            "gpt-5.4", "gpt-4o", "gpt-4o-mini",
-        ]},
-    ],
+_PROVIDER_LABELS = {
+    "google": "Google Gemini",
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "ollama": "Ollama",
+    "voyage": "Voyage AI",
+    "cohere": "Cohere",
 }
+
+
+def supported_providers() -> dict:
+    """
+    Build the {capability: [{id, name, models}]} dict from the catalogs so
+    the admin UI never sees a stale hard-coded model list. Each model entry
+    carries enough metadata (label, cost, context window) for the UI to
+    render an informed dropdown.
+    """
+    from app.ai.embedding_catalog import EMBEDDING_CATALOG
+    from app.ai.llm_catalog import LLM_CATALOG
+    from app.ai.vision_catalog import VISION_CATALOG
+
+    def _group(catalog: dict) -> list[dict]:
+        by_provider: dict[str, list[dict]] = {}
+        for spec in catalog.values():
+            entry: dict = {
+                "id": spec.id,
+                "model_id": spec.model_id,
+                "label": spec.label,
+            }
+            # Add capability-specific fields when present on the spec.
+            for field_name in (
+                "context_window_tokens",
+                "max_output_tokens",
+                "supports_tools",
+                "supports_vision",
+                "dimension",
+                "max_input_tokens",
+                "cost_per_1m_input_tokens",
+                "cost_per_1m_output_tokens",
+                "cost_per_1m_tokens",
+                "cost_per_image",
+                "notes",
+            ):
+                if hasattr(spec, field_name):
+                    entry[field_name] = getattr(spec, field_name)
+            by_provider.setdefault(spec.provider, []).append(entry)
+        return [
+            {
+                "id": pid,
+                "name": _PROVIDER_LABELS.get(pid, pid.title()),
+                "models": models,
+            }
+            for pid, models in by_provider.items()
+        ]
+
+    return {
+        "embedding": _group(EMBEDDING_CATALOG),
+        "llm": _group(LLM_CATALOG),
+        "vision": _group(VISION_CATALOG),
+    }
+
+
+# Backward-compat alias for any external code that imported SUPPORTED_PROVIDERS
+# as a constant. Equivalent to calling supported_providers() once at import,
+# but callers that need fresh data should call supported_providers() directly.
+SUPPORTED_PROVIDERS = supported_providers()

@@ -41,8 +41,11 @@ SENSITIVE_KEYS = frozenset({
     "vision_api_key",
 })
 
-# Active embedding model selection (canonical spec_id from EMBEDDING_CATALOG)
+# Active model selection (canonical spec_id from the respective catalog).
+# All three follow the same pattern so the registry resolution code is uniform.
 ACTIVE_EMBEDDING_MODEL_KEY = "active_embedding_model_spec_id"
+ACTIVE_LLM_MODEL_KEY = "active_llm_model_spec_id"
+ACTIVE_VISION_MODEL_KEY = "active_vision_model_spec_id"
 
 # Per-provider embedding API keys: `embedding_api_key__<provider>`. We store
 # one key per provider so admins can switch provider without losing the
@@ -59,17 +62,21 @@ ALL_CONFIG_KEYS = [
     "embedding_api_key__openai",
     "embedding_base_url",        # optional, custom endpoint (Ollama, Azure, proxy)
 
-    # --- LLM provider (for summarization, webhook gateway) ---
-    "llm_provider",             # "google" | "openai" | "anthropic" | "ollama"
-    "llm_model_id",             # e.g. "gpt-4o-mini", "claude-sonnet-4-20250514"
-    "llm_api_key",              # Provider API key
-    "llm_base_url",             # Custom endpoint
+    # --- LLM (catalog-driven; old llm_provider/llm_model_id kept readable below) ---
+    ACTIVE_LLM_MODEL_KEY,        # canonical spec_id from LLM_CATALOG
+    "llm_api_key",               # Provider API key
+    "llm_base_url",              # Custom endpoint
 
-    # --- Vision provider (for image analysis during ingestion) ---
-    "vision_provider",          # "google" | "openai" | None
-    "vision_model_id",          # e.g. "gemini-2.0-flash", "gpt-4o"
-    "vision_api_key",           # Provider API key (or empty = same as embedding)
-    "vision_base_url",          # Custom endpoint
+    # --- Vision (catalog-driven; old vision_provider/vision_model_id kept below) ---
+    ACTIVE_VISION_MODEL_KEY,     # canonical spec_id from VISION_CATALOG
+    "vision_api_key",            # Provider API key (or empty = same as embedding)
+    "vision_base_url",           # Custom endpoint
+
+    # --- Deprecated LLM/Vision free-form keys (read-only for backward compat) ---
+    "llm_provider",
+    "llm_model_id",
+    "vision_provider",
+    "vision_model_id",
 
     # --- System ---
     "session_timeout_minutes",

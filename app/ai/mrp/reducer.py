@@ -13,11 +13,8 @@ Steps:
 """
 
 import asyncio
-import json
-import re
 import string
-import uuid
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Union
 
 from loguru import logger
 from sqlalchemy import select
@@ -175,7 +172,7 @@ def exact_dedup_concepts(raw_concepts: list[dict]) -> list[dict]:
 async def embedding_dedup_entities(
     entities: list[dict],
     embedding_provider: EmbeddingProvider,
-) -> list[dict]:
+) -> Union[list[dict], tuple[dict[int, int], list[tuple[int, int]], list[list[float]], list[dict]]]:
     """
     Merge entities whose name embeddings are very similar (> MERGE_THRESHOLD)
     and have the same type. Returns a reduced list of canonical entities.
@@ -266,8 +263,8 @@ async def resolve_ambiguous_entities(
             llm.generate(prompt, system="You are a named-entity resolution assistant. Return only JSON.", temperature=0.0),
             timeout=60,
         )
-        cleaned = raw.strip().strip("```json").strip("```").strip()
-        decisions: list[bool] = json.loads(cleaned)
+        from app.utils.text import parse_json_loose
+        decisions: list[bool] = parse_json_loose(raw)
         for k, (i, j) in enumerate(ambiguous_pairs):
             if k < len(decisions) and decisions[k]:
                 ri, rj = _root(i), _root(j)
@@ -313,15 +310,15 @@ async def reconcile_with_kb(
     concepts: list[dict],
     embedding_provider: EmbeddingProvider,
     source,
+    llm: Optional[LLMProvider] = None,
 ) -> dict[str, dict]:
     """
     For each canonical entity/concept, search existing wiki pages.
     Returns {item_name: {"action": "CREATE"|"UPDATE"|"MAYBE", "page_slug": str|None, "similarity": float}}
     """
+    from app.ai.mrp.pipeline import _resolve_wiki_scopes
     from app.services import wiki_service
-
-    scope_type = source.scope_type or "global"
-    scope_id = source.scope_id
+    wiki_scopes = await _resolve_wiki_scopes(session, source)
 
     all_items = [("entity", e["name"], e) for e in entities] + \
                 [("concept", c["term"], c) for c in concepts]
@@ -344,20 +341,29 @@ async def reconcile_with_kb(
         return {name: {"action": "CREATE", "page_slug": None, "similarity": 0.0} for _, name, _ in all_items}
 
     for (_, name, _), vec in zip(all_items, vectors):
-        try:
-            hits = await wiki_service.search_pages_semantic(
-                session, vec, top_k=3, scope_type=scope_type, scope_id=scope_id,
-            )
-        except Exception as exc:
-            logger.debug(f"MRP REDUCE kb reconcile failed for '{name}': {exc}")
+        # Search across ALL scopes the source belongs to and keep the best hit.
+        # Prevents creating duplicate pages when an entity exists in one of the
+        # destination scopes but the search only checks another.
+        best_hit: Optional[tuple] = None
+        for scope_type, scope_id in wiki_scopes:
+            try:
+                hits = await wiki_service.search_pages_semantic(
+                    session, vec, top_k=3, scope_type=scope_type, scope_id=scope_id,
+                )
+            except Exception as exc:
+                logger.debug(f"MRP REDUCE kb reconcile failed for '{name}' scope={scope_type}: {exc}")
+                continue
+            if not hits:
+                continue
+            page, sim = hits[0]
+            if best_hit is None or sim > best_hit[1]:
+                best_hit = (page, sim)
+
+        if best_hit is None:
             reconciliation[name] = {"action": "CREATE", "page_slug": None, "similarity": 0.0}
             continue
 
-        if not hits:
-            reconciliation[name] = {"action": "CREATE", "page_slug": None, "similarity": 0.0}
-            continue
-
-        top_page, top_sim = hits[0]
+        top_page, top_sim = best_hit
         if top_sim >= KB_UPDATE_THRESHOLD:
             reconciliation[name] = {"action": "UPDATE", "page_slug": top_page.slug, "similarity": top_sim}
         elif top_sim >= KB_MAYBE_THRESHOLD:
@@ -369,7 +375,7 @@ async def reconcile_with_kb(
     # Batch-resolve MAYBE items with LLM
     maybe_items = [(name, rec) for name, rec in reconciliation.items() if rec["action"] == "MAYBE"]
     if maybe_items:
-        await _resolve_maybe_items(reconciliation, maybe_items, embedding_provider)
+        await _resolve_maybe_items(reconciliation, maybe_items, embedding_provider, llm=llm)
 
     return reconciliation
 
@@ -377,11 +383,52 @@ async def reconcile_with_kb(
 async def _resolve_maybe_items(
     reconciliation: dict,
     maybe_items: list[tuple[str, dict]],
-    embedding_provider,  # not used but kept for future re-ranking
+    embedding_provider,
+    llm: Optional[LLMProvider] = None,
 ):
-    """Downgrade unresolved MAYBE items to CREATE (conservative default)."""
-    for name, _ in maybe_items:
-        reconciliation[name]["action"] = "CREATE"
+    """Resolve MAYBE items via LLM; falls back to CREATE when LLM is unavailable."""
+    if not maybe_items:
+        return
+
+    if llm is None:
+        for name, _ in maybe_items:
+            reconciliation[name]["action"] = "CREATE"
+        return
+
+    lines = []
+    for k, (name, rec) in enumerate(maybe_items):
+        page_title = rec.get("_page_title") or rec.get("page_slug", "")
+        lines.append(
+            f"{k + 1}. Entity: \"{name}\" — existing wiki page: \"{page_title}\" "
+            f"(slug: {rec['page_slug']}, similarity: {rec['similarity']:.2f})"
+        )
+
+    prompt = (
+        "For each pair below, decide whether the entity refers to the same real-world "
+        "concept as the existing wiki page (true = UPDATE existing page, false = CREATE new page).\n"
+        "Return a JSON array of exactly " + str(len(maybe_items)) + " booleans. "
+        "Return ONLY the JSON array.\n\n" + "\n".join(lines)
+    )
+    try:
+        raw = await asyncio.wait_for(
+            llm.generate(
+                prompt,
+                system="You are a knowledge base assistant. Return only a JSON boolean array.",
+                temperature=0.0,
+            ),
+            timeout=30,
+        )
+        from app.utils.text import parse_json_loose
+        decisions: list[bool] = parse_json_loose(raw)
+        for k, (name, rec) in enumerate(maybe_items):
+            if k < len(decisions) and decisions[k]:
+                reconciliation[name]["action"] = "UPDATE"
+            else:
+                reconciliation[name]["action"] = "CREATE"
+    except Exception as exc:
+        logger.warning(f"MRP REDUCE MAYBE LLM resolution failed: {exc}. Defaulting to CREATE.")
+        for name, _ in maybe_items:
+            reconciliation[name]["action"] = "CREATE"
 
 
 # ---------------------------------------------------------------------------
@@ -407,7 +454,7 @@ Strategy: {strategy}
 
 ## KB reconciliation results
 {kb_reconciliation}
-
+{user_note_section}
 Produce a JSON compilation plan:
 
 {{
@@ -449,9 +496,9 @@ async def run_planning_call(
     reconciliation: dict[str, dict],
     kt_name: Optional[str],
     kt_desc: Optional[str],
+    user_note: Optional[str] = None,
 ) -> dict:
     """Single LLM call to produce the Compilation Plan JSON."""
-    n_chars = len(source.full_text or "")
     # Calculate target based on the actual number of extracted concepts rather than just document length
     total_extracted_items = len(canonical_entities) + len(canonical_concepts)
     
@@ -495,6 +542,14 @@ async def run_planning_call(
             kb_lines.append(f"  - UPDATE: {name} → {rec['page_slug']} (sim={rec['similarity']:.2f})")
     kb_reconciliation = "\n".join(kb_lines) if kb_lines else "  (all items are new)"
 
+    user_note_section = ""
+    if user_note and user_note.strip():
+        user_note_section = (
+            "\n## Human reviewer feedback\n"
+            f"{user_note.strip()}\n"
+            "Please incorporate this feedback when producing the plan.\n"
+        )
+
     prompt = PLANNING_PROMPT_TEMPLATE.format(
         source_title=source.title or source.file_name or str(source.id),
         kt_context=kt_context,
@@ -502,6 +557,7 @@ async def run_planning_call(
         entities_summary=entities_summary,
         concepts_summary=concepts_summary,
         kb_reconciliation=kb_reconciliation,
+        user_note_section=user_note_section,
         target_page_count=target_pages,
     )
 
@@ -510,18 +566,8 @@ async def run_planning_call(
         timeout=120,
     )
 
-    cleaned = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```$", "", cleaned)
-    try:
-        plan = json.loads(cleaned)
-    except json.JSONDecodeError:
-        last_brace = cleaned.rfind("}")
-        if last_brace != -1:
-            plan = json.loads(cleaned[: last_brace + 1])
-        else:
-            raise
-
-    return plan
+    from app.utils.text import parse_json_loose
+    return parse_json_loose(raw)
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +579,7 @@ async def run_reduce_phase(
     source,
     chunk_extracts: list,
     llm: LLMProvider,
-    embedding_provider: EmbeddingProvider,
+    embedding_provider: Optional[EmbeddingProvider],
     kt_name: Optional[str],
     kt_desc: Optional[str],
     tracker: ProgressTracker,
@@ -579,7 +625,7 @@ async def run_reduce_phase(
     if embedding_provider is not None:
         try:
             reconciliation = await reconcile_with_kb(
-                session, canonical_entities, canonical_concepts, embedding_provider, source,
+                session, canonical_entities, canonical_concepts, embedding_provider, source, llm=llm,
             )
         except Exception as exc:
             logger.warning(f"MRP REDUCE KB reconciliation failed: {exc}. All items will be CREATE.")
@@ -605,7 +651,6 @@ async def run_reduce_phase(
     plan_dict["_concepts"] = canonical_concepts
 
     # 2.8 Persist plan (upsert: safe to re-run)
-    from sqlalchemy.dialects.postgresql import insert as pg_insert
 
     existing = (await session.execute(
         select(SourceCompilationPlan).where(SourceCompilationPlan.source_id == source.id)

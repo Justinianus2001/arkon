@@ -34,15 +34,18 @@ export function EditSourceDialog({
   const [title, setTitle] = React.useState(source.title);
   const [typeId, setTypeId] = React.useState(source.knowledge_type_id || "");
   const [selectedDepts, setSelectedDepts] = React.useState<string[]>(source.department_ids || []);
+  const originalDepts = React.useRef<string[]>(source.department_ids || []);
 
   React.useEffect(() => {
     setSelectedDepts(source.department_ids || []);
+    originalDepts.current = source.department_ids || [];
   }, [source.id]);
   const [scopeType, setScopeType] = React.useState(source.scope_type || "global");
   const [scopeId, setScopeId] = React.useState(source.scope_id || "");
   const [projects, setProjects] = React.useState<{ id: string; name: string }[]>([]);
   const [saving, setSaving] = React.useState(false);
   const [error, setError] = React.useState("");
+  const [pendingConfirm, setPendingConfirm] = React.useState(false);
 
   // Fetch projects for workspace scope picker
   React.useEffect(() => {
@@ -57,9 +60,16 @@ export function EditSourceDialog({
     );
   };
 
-  const handleSave = async () => {
+  const deptChanged = () => {
+    const orig = new Set(originalDepts.current);
+    const cur = new Set(selectedDepts);
+    return orig.size !== cur.size || selectedDepts.some((d) => !orig.has(d));
+  };
+
+  const doSave = async () => {
     setSaving(true);
     setError("");
+    setPendingConfirm(false);
     try {
       await api(`/api/sources/${source.id}`, {
         method: "PATCH",
@@ -76,6 +86,14 @@ export function EditSourceDialog({
       setError(err instanceof Error ? err.message : "Failed to save");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleSave = () => {
+    if (source.status === "ready" && deptChanged()) {
+      setPendingConfirm(true);
+    } else {
+      doSave();
     }
   };
 
@@ -228,6 +246,20 @@ export function EditSourceDialog({
             </div>
           )}
 
+          {pendingConfirm && (
+            <div className="rounded-lg border border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-950/30 p-3 flex flex-col gap-3">
+              <p className="text-sm text-amber-800 dark:text-amber-300">
+                Đổi phòng ban sẽ chạy lại quá trình phân tích AI. Wiki pages cũ sẽ được cập nhật sang phòng ban mới. Tiếp tục?
+              </p>
+              <div className="flex justify-end gap-2">
+                <Button variant="outline" size="sm" onClick={() => setPendingConfirm(false)}>Huỷ</Button>
+                <Button size="sm" onClick={doSave} className="bg-amber-600 hover:bg-amber-700 text-white">
+                  Xác nhận
+                </Button>
+              </div>
+            </div>
+          )}
+
           {error && (
             <p className="text-destructive text-sm bg-destructive/10 px-3 py-2 rounded-lg">
               {error}
@@ -237,7 +269,7 @@ export function EditSourceDialog({
           <div className="flex justify-end gap-2 mt-2">
             <Button variant="outline" onClick={onClose}>Cancel</Button>
             <Button
-              disabled={saving}
+              disabled={saving || pendingConfirm}
               onClick={handleSave}
               className="bg-primary text-primary-foreground hover:bg-primary/90"
             >

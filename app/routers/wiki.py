@@ -16,7 +16,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, field_validator
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -116,12 +116,16 @@ def _build_wiki_scope_filter(user: Employee):
         return None  # No filter
 
     if scope_level == "own_dept":
-        # Show: global wiki + project-scoped wiki where user is a member
+        # Show: global wiki + project-scoped wiki where user is a member + dept wiki for user's dept
         return or_(
             WikiPage.scope_type == "global",
             WikiPage.scope_id.in_(
                 select(ProjectMember.project_id)
                 .where(ProjectMember.employee_id == user.id)
+            ),
+            and_(
+                WikiPage.scope_type == "department",
+                WikiPage.scope_id == user.department_id,
             ),
         )
 
@@ -195,6 +199,13 @@ async def get_wiki_page(
                 )).scalar_one_or_none()
                 if not member:
                     raise HTTPException(403, "Access denied — you are not a member of this workspace")
+
+    if page.scope_type == "department" and page.scope_id:
+        if user.role != "admin":
+            perms = _get_user_permissions(user)
+            if "wiki:read:all" not in perms:
+                if user.department_id != page.scope_id:
+                    raise HTTPException(403, "Access denied — this page belongs to another department")
 
     backlinks = await wiki_service.get_backlinks(db, slug)
     outlinks = await wiki_service.get_outlinks(db, slug)

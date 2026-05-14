@@ -33,11 +33,10 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 # ---------------------------------------------------------------------------
 
 class ScopeType(str, PyEnum):
-    """Scope for sources/wiki: global or project (workspace).
-    Department visibility is handled via source_departments M2M.
-    """
+    """Scope for sources/wiki: global, project (workspace), or department."""
     GLOBAL = "global"
     PROJECT = "project"
+    DEPARTMENT = "department"
 
 
 class WorkspaceRole(str, PyEnum):

@@ -434,6 +434,8 @@ async def update_source(
     db: AsyncSession = Depends(get_db),
     _user: Employee = require_permission("doc:edit"),
 ):
+    from app.services import wiki_service
+
     source = await db.get(Source, source_id)
     if not source:
         raise HTTPException(status_code=404, detail="Source not found")
@@ -445,18 +447,59 @@ async def update_source(
         source.scope_type = body.scope_type
         source.scope_id = body.scope_id
 
-    # Update department M2M
+    # Detect department changes and trigger re-ingestion when needed
+    dept_changed = False
     if body.department_ids is not None:
-        # Delete existing
+        # Permission check: own_dept users may only assign their own department
+        perms = _get_user_permissions(_user)
+        if _user.role != "admin" and "doc:edit:all" not in perms:
+            for did in body.department_ids:
+                if did != _user.department_id:
+                    raise HTTPException(403, "You can only assign documents to your own department")
+
+        old_dept_rows = (await db.execute(
+            select(SourceDepartment.department_id).where(SourceDepartment.source_id == source_id)
+        )).scalars().all()
+        old_dept_ids = set(old_dept_rows)
+        new_dept_ids = set(body.department_ids)
+
+        if old_dept_ids != new_dept_ids and source.status == "ready":
+            dept_changed = True
+
+            # Snapshot old scopes before detaching so we can regenerate their indexes
+            from app.ai.mrp.pipeline import _resolve_wiki_scopes
+            old_scopes = await _resolve_wiki_scopes(db, source)
+
+            # Detach source from wiki pages in old scopes
+            await wiki_service.detach_source_from_wiki(db, source.id)
+
+            # Regenerate index for each old scope after detach
+            for st, sid in old_scopes:
+                await wiki_service.regenerate_index(db, scope_type=st, scope_id=sid)
+
+        # Replace M2M rows
         await db.execute(
             sql_delete(SourceDepartment).where(SourceDepartment.source_id == source_id)
         )
-        # Insert new
         for did in body.department_ids:
             db.add(SourceDepartment(source_id=source_id, department_id=did))
 
     await log_audit(db, _user, "update", "source", str(source.id), reason=source.title)
     await db.flush()
+
+    if dept_changed:
+        source.status = "processing"
+        source.progress = 0
+        source.progress_message = "Re-queued after department change..."
+        source.error_message = None
+        await db.flush()
+
+        pool = await get_arq_pool()
+        job = await pool.enqueue_job("ingest_map_reduce_task", str(source_id))
+        if job:
+            source.job_id = job.job_id
+
+    await db.commit()
 
     source = (await db.execute(
         select(Source)
@@ -533,10 +576,13 @@ async def retry_source(
 
 class PlanApproveRequest(BaseModel):
     note: Optional[str] = None
-    modified_plan: Optional[dict] = None
 
 
 class PlanRejectRequest(BaseModel):
+    note: str
+
+
+class PlanRegenerateRequest(BaseModel):
     note: str
 
 
@@ -559,6 +605,7 @@ async def get_compilation_plan(
     plan_json.pop("_claims", None)
     plan_json.pop("_entities", None)
     plan_json.pop("_concepts", None)
+    plan_json.pop("_page_drafts", None)
 
     return {
         "id": str(plan.id),
@@ -584,26 +631,28 @@ async def approve_compilation_plan(
     from app.database.models import SourceCompilationPlan
 
     plan = (await db.execute(
-        select(SourceCompilationPlan).where(SourceCompilationPlan.source_id == source_id)
+        select(SourceCompilationPlan)
+        .where(SourceCompilationPlan.source_id == source_id)
+        .with_for_update()
     )).scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="No plan found for this source")
+    if plan.status == "regenerating":
+        raise HTTPException(
+            status_code=409,
+            detail="Plan is being regenerated. Wait for it to finish before approving.",
+        )
     if plan.status != "pending_review":
         raise HTTPException(
             status_code=400,
             detail=f"Plan is not pending review (status={plan.status})",
         )
 
-    if body.modified_plan:
-        # Preserve internal keys from original plan
-        internal_keys = {k: plan.plan_json[k] for k in ("_claims", "_entities", "_concepts") if k in plan.plan_json}
-        merged = {**body.modified_plan, **internal_keys}
-        plan.plan_json = merged
-
     plan.status = "approved"
     plan.reviewed_by = user.id
     plan.review_note = body.note
     plan.reviewed_at = datetime.now(timezone.utc)
+    await log_audit(db, user, "approve", "compilation_plan", str(plan.id), reason=body.note or None)
 
     source = await db.get(Source, source_id)
     if source:
@@ -624,6 +673,55 @@ async def approve_compilation_plan(
     return {"approved": True, "job_id": job.job_id if job else None}
 
 
+@router.post("/sources/{source_id}/plan/regenerate")
+async def regenerate_compilation_plan(
+    source_id: uuid.UUID,
+    body: PlanRegenerateRequest,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = require_permission("doc:edit"),
+):
+    """
+    Enqueue a background task to re-run planning with reviewer feedback.
+
+    Plan status transitions: pending_review/rejected → regenerating → pending_review.
+    Frontend should poll GET /sources/{id}/plan to detect completion (status flips
+    back to pending_review and plan content updates).
+    """
+    from app.database.models import SourceCompilationPlan
+
+    if not body.note.strip():
+        raise HTTPException(status_code=400, detail="Note is required to regenerate plan")
+
+    # SELECT FOR UPDATE — atomic state transition, prevents concurrent regenerate/approve.
+    plan = (await db.execute(
+        select(SourceCompilationPlan)
+        .where(SourceCompilationPlan.source_id == source_id)
+        .with_for_update()
+    )).scalar_one_or_none()
+    if not plan:
+        raise HTTPException(status_code=404, detail="No plan found for this source")
+    if plan.status not in ("pending_review", "rejected"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan cannot be regenerated (status={plan.status})",
+        )
+
+    plan.status = "regenerating"
+    plan.review_note = body.note[:1000]
+    await log_audit(db, user, "regenerate", "compilation_plan", str(plan.id), reason=body.note[:200])
+    await db.commit()
+
+    pool = await get_arq_pool()
+    job = await pool.enqueue_job("regenerate_plan_task", str(source_id), body.note)
+
+    logger.info(f"Plan regenerate queued for source {source_id} by user {user.id}, job: {job.job_id if job else 'N/A'}")
+    return {
+        "queued": True,
+        "status": plan.status,
+        "job_id": job.job_id if job else None,
+    }
+
+
 @router.post("/sources/{source_id}/plan/reject")
 async def reject_compilation_plan(
     source_id: uuid.UUID,
@@ -637,10 +735,17 @@ async def reject_compilation_plan(
     from app.database.models import SourceCompilationPlan
 
     plan = (await db.execute(
-        select(SourceCompilationPlan).where(SourceCompilationPlan.source_id == source_id)
+        select(SourceCompilationPlan)
+        .where(SourceCompilationPlan.source_id == source_id)
+        .with_for_update()
     )).scalar_one_or_none()
     if not plan:
         raise HTTPException(status_code=404, detail="No plan found for this source")
+    if plan.status == "regenerating":
+        raise HTTPException(
+            status_code=409,
+            detail="Plan is being regenerated. Wait for it to finish before rejecting.",
+        )
     if plan.status != "pending_review":
         raise HTTPException(
             status_code=400,
@@ -651,6 +756,7 @@ async def reject_compilation_plan(
     plan.reviewed_by = user.id
     plan.review_note = body.note
     plan.reviewed_at = datetime.now(timezone.utc)
+    await log_audit(db, user, "reject", "compilation_plan", str(plan.id), reason=body.note)
 
     source = await db.get(Source, source_id)
     if source:

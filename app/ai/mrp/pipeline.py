@@ -13,7 +13,6 @@ Phase 5 (COMMIT) is implemented inline here. It reuses existing wiki_service
 functions (apply_create / apply_update) and embedding_storage utilities.
 """
 
-import asyncio
 import uuid
 from typing import Optional
 
@@ -26,6 +25,24 @@ from app.ai.mrp.reducer import run_reduce_phase
 from app.ai.mrp.verifier import run_verify_phase
 from app.ai.mrp.writer import PageWriteResult, run_refine_phase
 from app.utils.progress import ProgressTracker
+
+
+async def _resolve_wiki_scopes(session: AsyncSession, source) -> list[tuple[str, Optional[uuid.UUID]]]:
+    """Return the list of (scope_type, scope_id) tuples to commit wiki pages into.
+
+    Project scope takes priority. If source has department assignments, one scope
+    per department. Falls back to global.
+    """
+    from app.database.models import SourceDepartment
+    if source.scope_type == "project":
+        return [("project", source.scope_id)]
+    rows = (await session.execute(
+        select(SourceDepartment.department_id).where(SourceDepartment.source_id == source.id)
+    )).all()
+    dept_ids = [r[0] for r in rows]
+    if dept_ids:
+        return [("department", did) for did in dept_ids]
+    return [("global", None)]
 
 
 # ---------------------------------------------------------------------------
@@ -49,7 +66,7 @@ async def run_commit_phase(
     fallback). All pages are flushed then committed in a single transaction.
     """
     from app.ai.mrp.merger import merge_page_content
-    from app.database.models import Source, SourceCompilationPlan
+    from app.database.models import Source
     from app.services import wiki_service
     from app.services.embedding_storage import (
         compute_content_hash,
@@ -57,11 +74,10 @@ async def run_commit_phase(
         upsert_page_embedding,
     )
 
-    scope_type = source.scope_type or "global"
-    scope_id = source.scope_id
+    wiki_scopes = await _resolve_wiki_scopes(session, source)
 
-    pages_created = 0
-    pages_updated = 0
+    total_created = 0
+    total_updated = 0
 
     # Provision LLM for merge operations
     from app.ai.registry import ProviderRegistry
@@ -72,112 +88,118 @@ async def run_commit_phase(
     except Exception as exc:
         logger.warning(f"MRP COMMIT: could not load LLM for merge: {exc}")
 
-    await tracker.update(95, f"Committing {len(page_results)} pages to wiki...")
+    await tracker.update(95, f"Committing {len(page_results)} pages to wiki ({len(wiki_scopes)} scope(s))...")
 
-    for pr in page_results:
-        try:
-            # Acquire advisory lock for this slug to prevent race conditions
-            from sqlalchemy import select, func
-            await session.execute(select(func.pg_advisory_xact_lock(func.hashtext(pr.slug))))
+    for scope_type, scope_id in wiki_scopes:
+        pages_created = 0
+        pages_updated = 0
 
-            if pr.action == "CREATE":
-                # Check if it was created by someone else after the plan was generated
-                existing = await wiki_service.get_page_by_slug(
-                    session, pr.slug, scope_type=scope_type, scope_id=scope_id
-                )
-                if existing is not None:
-                    # Fallback to update
-                    pr.action = "UPDATE"
-                else:
-                    page = await wiki_service.apply_create(
-                        session,
-                        slug=pr.slug,
-                        title=pr.title,
-                        page_type=pr.page_type,
-                        content_md=pr.content_md,
-                        summary=pr.summary,
-                        knowledge_type_slugs=[kt_slug] if kt_slug else [],
-                        source_ids=[source.id],
-                        scope_type=scope_type,
-                        scope_id=scope_id,
+        for pr in page_results:
+            try:
+                # Acquire advisory lock per (slug, scope) to prevent race conditions
+                from sqlalchemy import func, select
+                lock_key = func.hashtext(f"{pr.slug}:{scope_type}:{scope_id}")
+                await session.execute(select(func.pg_advisory_xact_lock(lock_key)))
+
+                # Reset action per scope — each scope processes independently
+                action = pr.action
+                page = None
+
+                if action == "CREATE":
+                    # Check if already created in this scope by a concurrent pipeline
+                    existing = await wiki_service.get_page_by_slug(
+                        session, pr.slug, scope_type=scope_type, scope_id=scope_id
                     )
-                    pages_created += 1
-
-            if pr.action == "UPDATE":
-                # UPDATE: merge new content with existing page
-                existing_page = await wiki_service.get_page_by_slug(
-                    session, pr.slug, scope_type=scope_type, scope_id=scope_id,
-                )
-                final_content = pr.content_md
-
-                if existing_page and existing_page.content_md and merge_llm:
-                    # Check if content comes from a different source
-                    existing_sources = set(str(sid) for sid in (existing_page.source_ids or []))
-                    is_new_source = str(source.id) not in existing_sources
-
-                    if is_new_source and len(existing_page.content_md.strip()) > 100:
-                        # Merge: existing page has substantial content from other sources
-                        final_content = await merge_page_content(
-                            merge_llm,
-                            existing_page.content_md,
-                            pr.content_md,
-                            pr.slug,
+                    if existing is not None:
+                        action = "UPDATE"
+                    else:
+                        page = await wiki_service.apply_create(
+                            session,
+                            slug=pr.slug,
+                            title=pr.title,
+                            page_type=pr.page_type,
+                            content_md=pr.content_md,
+                            summary=pr.summary,
+                            knowledge_type_slugs=[kt_slug] if kt_slug else [],
+                            source_ids=[source.id],
+                            scope_type=scope_type,
+                            scope_id=scope_id,
                         )
+                        pages_created += 1
 
-                page = await wiki_service.apply_update(
-                    session,
-                    slug=pr.slug,
-                    new_content_md=final_content,
-                    summary=pr.summary,
-                    title=pr.title,
-                    add_knowledge_type_slug=kt_slug,
-                    add_source_id=source.id,
-                    scope_type=scope_type,
-                    scope_id=scope_id,
-                )
-                if page is None:
-                    # Page disappeared — create it instead
-                    page = await wiki_service.apply_create(
+                if action == "UPDATE":
+                    existing_page = await wiki_service.get_page_by_slug(
+                        session, pr.slug, scope_type=scope_type, scope_id=scope_id,
+                    )
+                    final_content = pr.content_md
+
+                    if existing_page and existing_page.content_md and merge_llm:
+                        existing_sources = set(str(sid) for sid in (existing_page.source_ids or []))
+                        is_new_source = str(source.id) not in existing_sources
+
+                        if is_new_source and len(existing_page.content_md.strip()) > 100:
+                            final_content = await merge_page_content(
+                                merge_llm,
+                                existing_page.content_md,
+                                pr.content_md,
+                                pr.slug,
+                            )
+
+                    page = await wiki_service.apply_update(
                         session,
                         slug=pr.slug,
-                        title=pr.title,
-                        page_type=pr.page_type,
-                        content_md=pr.content_md,
+                        new_content_md=final_content,
                         summary=pr.summary,
-                        knowledge_type_slugs=[kt_slug] if kt_slug else [],
-                        source_ids=[source.id],
+                        title=pr.title,
+                        add_knowledge_type_slug=kt_slug,
+                        add_source_id=source.id,
                         scope_type=scope_type,
                         scope_id=scope_id,
                     )
-                    pages_created += 1
-                else:
-                    pages_updated += 1
+                    if page is None:
+                        page = await wiki_service.apply_create(
+                            session,
+                            slug=pr.slug,
+                            title=pr.title,
+                            page_type=pr.page_type,
+                            content_md=pr.content_md,
+                            summary=pr.summary,
+                            knowledge_type_slugs=[kt_slug] if kt_slug else [],
+                            source_ids=[source.id],
+                            scope_type=scope_type,
+                            scope_id=scope_id,
+                        )
+                        pages_created += 1
+                    else:
+                        pages_updated += 1
 
-            await session.flush()
+                await session.flush()
 
-            # Embed the page
-            if embedding_provider is not None and embedding_spec is not None and page is not None:
-                try:
-                    embed_text = embedding_input_text(pr.title, pr.summary, pr.content_md)
-                    vector = await embedding_provider.embed(embed_text)
-                    content_hash = compute_content_hash(pr.title, pr.summary, pr.content_md)
-                    await upsert_page_embedding(session, page.id, embedding_spec, vector, content_hash)
-                except Exception as embed_exc:
-                    logger.warning(f"MRP COMMIT embed failed for '{pr.slug}': {embed_exc}")
+                if embedding_provider is not None and embedding_spec is not None and page is not None:
+                    try:
+                        embed_text = embedding_input_text(pr.title, pr.summary, pr.content_md)
+                        vector = await embedding_provider.embed(embed_text)
+                        content_hash = compute_content_hash(pr.title, pr.summary, pr.content_md)
+                        await upsert_page_embedding(session, page.id, embedding_spec, vector, content_hash)
+                    except Exception as embed_exc:
+                        logger.warning(f"MRP COMMIT embed failed for '{pr.slug}' scope={scope_type}: {embed_exc}")
 
-        except Exception as exc:
-            logger.error(f"MRP COMMIT failed for '{pr.slug}': {exc}")
-            # Continue with remaining pages — don't fail entire commit
+            except Exception as exc:
+                logger.error(f"MRP COMMIT failed for '{pr.slug}' scope={scope_type}: {exc}")
 
-    # Regenerate index
-    await wiki_service.regenerate_index(session, scope_type=scope_type, scope_id=scope_id)
+        await wiki_service.regenerate_index(session, scope_type=scope_type, scope_id=scope_id)
 
-    # Activity log
-    log_entry = (
-        f"MRP: ingested '{source.title or source.file_name or str(source.id)}': "
-        f"+{pages_created} created, ~{pages_updated} updated"
-    )
-    await wiki_service.append_log(session, log_entry, scope_type=scope_type, scope_id=scope_id)
+        log_entry = (
+            f"MRP: ingested '{source.title or source.file_name or str(source.id)}': "
+            f"+{pages_created} created, ~{pages_updated} updated"
+        )
+        await wiki_service.append_log(session, log_entry, scope_type=scope_type, scope_id=scope_id)
+
+        total_created += pages_created
+        total_updated += pages_updated
+
+    pages_created = total_created
+    pages_updated = total_updated
 
     # Mark plan and source as done
     if plan is not None:
@@ -430,25 +452,31 @@ async def run_refine_pipeline(
             src.pipeline_phase = "verify"
         await session.commit()
     else:
-        logger.info(f"MRP: source={source_id} resuming at {current_phase} phase — skipping REFINE")
-        # On resume from 'verify' or 'commit' we can't recover page_results from DB
-        # (they're in-memory only). We must re-run REFINE from the plan.
-        src = await session.get(Source, source_id)
-        if src:
-            src.pipeline_phase = "refine"
-        await session.commit()
+        logger.info(f"MRP: source={source_id} resuming at {current_phase} phase — loading persisted drafts")
+        drafts = (plan.plan_json or {}).get("_page_drafts") or []
+        if drafts:
+            page_results = [PageWriteResult.from_dict(d) for d in drafts]
+            logger.info(f"MRP: loaded {len(page_results)} persisted page drafts for source={source_id}")
+        else:
+            logger.warning(
+                f"MRP: source={source_id} at {current_phase} phase but no drafts persisted — re-running REFINE"
+            )
+            src = await session.get(Source, source_id)
+            if src:
+                src.pipeline_phase = "refine"
+            await session.commit()
 
-        page_results = await run_refine_phase(
-            session=session,
-            source=source,
-            plan=plan,
-            chunk_extracts=chunk_extracts,
-            full_text=full_text,
-            llm=llm,
-            embedding_provider=embedding_provider,
-            kt_slug=kt_slug,
-            tracker=tracker,
-        )
+            page_results = await run_refine_phase(
+                session=session,
+                source=source,
+                plan=plan,
+                chunk_extracts=chunk_extracts,
+                full_text=full_text,
+                llm=llm,
+                embedding_provider=embedding_provider,
+                kt_slug=kt_slug,
+                tracker=tracker,
+            )
 
         src = await session.get(Source, source_id)
         if src:

@@ -39,10 +39,20 @@ _WIKILINK_RE = re.compile(r"\[\[([^\]\|]+)(?:\|[^\]]*)?]]")
 # ---------------------------------------------------------------------------
 
 def _scope_filter(scope_type: str = "global", scope_id: Optional[uuid.UUID] = None):
-    """Return SQLAlchemy WHERE clauses for scope filtering."""
+    """Return SQLAlchemy WHERE clauses for exact scope filtering."""
     if scope_id:
         return and_(WikiPage.scope_type == scope_type, WikiPage.scope_id == scope_id)
     return and_(WikiPage.scope_type == scope_type, WikiPage.scope_id.is_(None))
+
+
+def _scope_filter_with_dept(department_id: Optional[uuid.UUID] = None):
+    """OR-filter: global pages + department pages visible to the given dept member."""
+    if department_id:
+        return or_(
+            and_(WikiPage.scope_type == "global", WikiPage.scope_id.is_(None)),
+            and_(WikiPage.scope_type == "department", WikiPage.scope_id == department_id),
+        )
+    return _scope_filter("global")
 
 
 # ---------------------------------------------------------------------------
@@ -206,13 +216,18 @@ async def list_pages(
     offset: int = 0,
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
+    department_id: Optional[uuid.UUID] = None,
 ) -> list[WikiPage]:
-    """List pages with filtering within a specific scope. Reserved slugs excluded."""
+    """List pages with filtering within a scope. If department_id given, returns global + dept pages."""
+    scope_clause = (
+        _scope_filter_with_dept(department_id) if department_id is not None
+        else _scope_filter(scope_type, scope_id)
+    )
     stmt = (
         select(WikiPage)
         .where(
             WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
-            _scope_filter(scope_type, scope_id),
+            scope_clause,
         )
         .order_by(WikiPage.updated_at.desc())
         .limit(limit)
@@ -241,6 +256,7 @@ async def search_pages_semantic(
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
     spec_id: Optional[str] = None,
+    department_id: Optional[uuid.UUID] = None,
 ) -> list[tuple[WikiPage, float]]:
     """
     Cosine-similarity search over wiki page embeddings within a scope.
@@ -249,6 +265,9 @@ async def search_pages_semantic(
     The active embedding model spec determines which table to query and which
     `model_spec_id` rows to filter to. Pass `spec_id` explicitly to override —
     only used by tests and internal tooling.
+
+    If department_id is given, searches across global + department pages (for MCP/API read path).
+    Otherwise uses exact scope_type/scope_id matching (for pipeline write path).
 
     Returns (page, similarity) pairs sorted by similarity descending. Returns
     an empty list if no active embedding model is configured.
@@ -266,6 +285,11 @@ async def search_pages_semantic(
     spec = get_spec(spec_id)
     Emb = get_embedding_model_for_dim(spec.dimension)
 
+    scope_clause = (
+        _scope_filter_with_dept(department_id) if department_id is not None
+        else _scope_filter(scope_type, scope_id)
+    )
+
     stmt = (
         select(
             WikiPage,
@@ -276,7 +300,7 @@ async def search_pages_semantic(
             and_(
                 Emb.model_spec_id == spec.id,
                 WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
-                _scope_filter(scope_type, scope_id),
+                scope_clause,
             )
         )
         .order_by(Emb.embedding.cosine_distance(query_embedding))

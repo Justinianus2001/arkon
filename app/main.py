@@ -117,6 +117,7 @@ app.mount("/mcp", mcp_http_app)
 # --- REST API Routers ---
 from app.routers import (  # noqa: E402
     admin_embeddings,
+    admin_models,
     admin_settings,
     audit,
     auth,
@@ -141,6 +142,7 @@ app.include_router(wiki.router, prefix="/api", tags=["wiki"])
 app.include_router(wiki_images.router, prefix="/api", tags=["wiki"])
 app.include_router(admin_settings.router, prefix="/api", tags=["settings"])
 app.include_router(admin_embeddings.router, prefix="/api", tags=["settings"])
+app.include_router(admin_models.router, prefix="/api", tags=["settings"])
 app.include_router(rbac.router, prefix="/api", tags=["rbac"])
 app.include_router(knowledge_types.router, prefix="/api", tags=["knowledge-types"])
 app.include_router(projects.router, prefix="/api", tags=["projects"])

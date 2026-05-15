@@ -620,6 +620,7 @@ async def _write_page_complex(
     existing_content: Optional[str],
     full_text: str,
     session: AsyncSession,
+    session_lock: asyncio.Lock,
     source,
     all_plan_slugs: list[str],
 ) -> tuple[str, str, list[dict]]:
@@ -704,7 +705,8 @@ async def _write_page_complex(
                 break
             elif call.name == "read_kb_page":
                 slug = call.arguments.get("slug", "")
-                page = await wiki_service.get_page_by_slug(session, slug, scope_type=scope_type, scope_id=scope_id)
+                async with session_lock:
+                    page = await wiki_service.get_page_by_slug(session, slug, scope_type=scope_type, scope_id=scope_id)
                 if page:
                     result: Any = {"slug": page.slug, "title": page.title, "content_md": page.content_md}
                 else:
@@ -789,6 +791,7 @@ async def run_refine_phase(
     await tracker.update(78, f"Writing {len(pages_spec)} wiki pages...")
 
     semaphore = asyncio.Semaphore(MAX_WRITER_CONCURRENCY)
+    session_lock = asyncio.Lock()
 
     async def _write_one(plan_item: dict) -> Optional[PageWriteResult]:
         async with semaphore:
@@ -804,9 +807,10 @@ async def run_refine_phase(
             # Fetch existing content for UPDATE
             existing_content: Optional[str] = None
             if action == "UPDATE":
-                existing_page = await wiki_service.get_page_by_slug(
-                    session, slug, scope_type=scope_type, scope_id=scope_id,
-                )
+                async with session_lock:
+                    existing_page = await wiki_service.get_page_by_slug(
+                        session, slug, scope_type=scope_type, scope_id=scope_id,
+                    )
                 if existing_page:
                     existing_content = existing_page.content_md
 
@@ -823,7 +827,7 @@ async def run_refine_phase(
             try:
                 if is_complex:
                     content_md, summary, citations = await _write_page_complex(
-                        llm, plan_item, evidence, existing_content, full_text, session, source,
+                        llm, plan_item, evidence, existing_content, full_text, session, session_lock, source,
                         all_plan_slugs=all_plan_slugs,
                     )
                 else:

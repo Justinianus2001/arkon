@@ -15,6 +15,7 @@ the migration — clean them up first by keeping the lowest id and
 re-numbering the rest.
 """
 
+import sqlalchemy as sa
 from typing import Sequence, Union
 
 from alembic import op
@@ -26,6 +27,45 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
+    conn = op.get_bind()
+
+    # Find page_ids that have duplicate versions
+    result = conn.execute(sa.text(
+        "SELECT page_id FROM wiki_page_revisions GROUP BY page_id, version HAVING COUNT(*) > 1"
+    ))
+    page_ids = [str(row[0]) for row in result.fetchall()]
+
+    if page_ids:
+        page_ids_str = ", ".join(f"'{pid}'" for pid in page_ids)
+
+        # Renumber revisions for these pages consecutively based on created_at, id
+        conn.execute(sa.text(
+            f"""
+            WITH ranked_revisions AS (
+                SELECT id, CAST(ROW_NUMBER() OVER(PARTITION BY page_id ORDER BY created_at, id) AS INTEGER) as new_version
+                FROM wiki_page_revisions
+                WHERE page_id IN ({page_ids_str})
+            )
+            UPDATE wiki_page_revisions
+            SET version = ranked_revisions.new_version
+            FROM ranked_revisions
+            WHERE wiki_page_revisions.id = ranked_revisions.id
+            """
+        ))
+
+        # Update version in wiki_pages to match the new maximum version
+        conn.execute(sa.text(
+            f"""
+            UPDATE wiki_pages
+            SET version = (
+                SELECT COALESCE(MAX(version), 1)
+                FROM wiki_page_revisions
+                WHERE wiki_page_revisions.page_id = wiki_pages.id
+            )
+            WHERE id IN ({page_ids_str})
+            """
+        ))
+
     op.drop_index("ix_wiki_revisions_page_version", table_name="wiki_page_revisions")
     op.create_index(
         "uq_wiki_revisions_page_version",

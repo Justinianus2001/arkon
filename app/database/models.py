@@ -15,6 +15,7 @@ from pgvector.sqlalchemy import HALFVEC, Vector
 from sqlalchemy import (
     Boolean,
     DateTime,
+    Float,
     ForeignKey,
     Index,
     Integer,
@@ -59,8 +60,22 @@ class SkillContributionStatus(str, PyEnum):
     """Status of a skill contribution request."""
     DRAFT = "draft"
     PENDING = "pending"
+    NEEDS_REVISION = "needs_revision"
+    WITHDRAWN = "withdrawn"
     APPROVED = "approved"
     REJECTED = "rejected"
+
+
+# Status strings used by WikiPageDraft. Kept as a tuple (not Enum) because the
+# column was historically `String(20)` with free-form values; centralising the
+# set here lets services validate transitions consistently.
+WIKI_DRAFT_STATUSES: tuple[str, ...] = (
+    "pending",
+    "needs_revision",
+    "withdrawn",
+    "approved",
+    "rejected",
+)
 
 
 class Base(DeclarativeBase):
@@ -309,17 +324,24 @@ class WikiPage(Base):
 
 class WikiLink(Base):
     """
-    Derived edge between two wiki pages, parsed from `[[slug]]` patterns in content_md.
+    Derived edge from a wiki page to a target slug, parsed from `[[slug]]`
+    patterns in content_md. Origin is keyed by page_id so edges are scope-
+    disambiguated when the same slug exists in multiple scopes. Target stays
+    a slug because dangling links to not-yet-existing pages are valid.
     Refreshed after every page upsert by wiki_service.refresh_links().
     """
     __tablename__ = "wiki_links"
 
-    from_slug: Mapped[str] = mapped_column(String(300), nullable=False)
+    from_page_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("wiki_pages.id", ondelete="CASCADE"),
+        nullable=False,
+    )
     to_slug: Mapped[str] = mapped_column(String(300), nullable=False)
 
     __table_args__ = (
-        PrimaryKeyConstraint("from_slug", "to_slug"),
-        Index("ix_wiki_links_from_slug", "from_slug"),
+        PrimaryKeyConstraint("from_page_id", "to_slug"),
+        Index("ix_wiki_links_from_page_id", "from_page_id"),
         Index("ix_wiki_links_to_slug", "to_slug"),
     )
 
@@ -334,14 +356,35 @@ class WikiPageDraft(Base):
     __tablename__ = "wiki_page_drafts"
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
-    page_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("wiki_pages.id", ondelete="CASCADE"), nullable=False
+    # NULL only when draft_kind='create' — the page is materialised at approval.
+    page_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wiki_pages.id", ondelete="CASCADE"), nullable=True
     )
+    # 'edit' (default): modifies the page referenced by page_id.
+    # 'create': proposes a brand new page; suggested_metadata holds slug,
+    # title, page_type, knowledge_type_slugs, scope_type, scope_id.
+    draft_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="edit")
+    suggested_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
     author_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
     )
     content_md: Mapped[str] = mapped_column(Text, nullable=False)
     note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # version of the target page when this draft was authored; compared at
+    # approve-time to detect mid-air collisions (None = pre-migration drafts).
+    base_version: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    # Increments each time the author resubmits after needs_revision.
+    revision_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Reviewer's note when sending the draft back for revisions.
+    last_returned_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # pending | running | passed | warned | failed — set by AI pre-review worker.
+    ai_check_status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
+    # See app/services/ai_review/runner.py for the JSON shape.
+    ai_check_results: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    ai_checked_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    # pending | needs_revision | withdrawn | approved | rejected
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     # web_ui | mcp_claude_desktop | mcp_claude_code | mcp_other | api_direct
     source: Mapped[str] = mapped_column(String(40), nullable=False, default="web_ui")
@@ -394,7 +437,46 @@ class WikiPageRevision(Base):
 
     __table_args__ = (
         Index("ix_wiki_revisions_page_id", "page_id"),
-        Index("ix_wiki_revisions_page_version", "page_id", "version"),
+        # Unique constraint, not just an index — guards against the
+        # historical race where two concurrent approves could both INSERT a
+        # revision row at the same version. The advisory lock in
+        # wiki_service.approve_draft prevents this in normal operation; this
+        # constraint is the DB-level backstop.
+        Index("uq_wiki_revisions_page_version", "page_id", "version", unique=True),
+    )
+
+
+class WikiDraftRound(Base):
+    """
+    Snapshot of a draft's content for one review round. A new row is appended
+    every time a reviewer sends the draft back for revisions — capturing the
+    content the author had submitted and the note that bounced it back. The
+    next author resubmission updates the parent draft and creates the next
+    round on the *following* request_changes call.
+    """
+    __tablename__ = "wiki_draft_rounds"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    draft_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("wiki_page_drafts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    round_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    content_md: Mapped[str] = mapped_column(Text, nullable=False)
+    author_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    reviewer_return_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    # AI verdict at the time this round was sent back — frozen so reviewers
+    # can compare AI checks across rounds.
+    ai_check_results: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    submitted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_wiki_draft_rounds_draft_id", "draft_id", "round_no"),
     )
 
 
@@ -846,6 +928,51 @@ class AuditLog(Base):
     )
 
 
+class Notification(Base):
+    """
+    In-app notification delivered to one recipient. Created synchronously by
+    NotificationService when a contribution lifecycle event fires. Read state
+    is tracked per-row (read_at timestamp). No retention policy yet — caller
+    can prune by created_at if the table grows.
+    """
+    __tablename__ = "notifications"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4,
+    )
+    recipient_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # e.g. "wiki_draft.submitted", "skill_contribution.approved"
+    type: Mapped[str] = mapped_column(String(80), nullable=False)
+    subject: Mapped[str] = mapped_column(String(200), nullable=False)
+    body: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # target_type/target_id: a generic pointer (wiki_draft + UUID, etc.) so the
+    # frontend can deep-link without us joining at query time.
+    target_type: Mapped[str] = mapped_column(String(40), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(100), nullable=False)
+    actor_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Employee who caused the event (author/reviewer)",
+    )
+    read_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(),
+    )
+
+    __table_args__ = (
+        Index("ix_notifications_recipient_unread", "recipient_id", "read_at"),
+        Index("ix_notifications_created_at", "created_at"),
+        Index("ix_notifications_target", "target_type", "target_id"),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Multi-dimension wiki page embeddings
 # ---------------------------------------------------------------------------
@@ -967,6 +1094,10 @@ class SkillContribution(Base):
         String(20), default=SkillContributionStatus.DRAFT.value,
         index=True
     )
+    # Increments each time the contributor resubmits after needs_revision.
+    revision_round: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    # Reviewer's note when sending the contribution back for changes.
+    last_returned_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     scope_type: Mapped[str] = mapped_column(
         String(20), default="global",
         comment="Scope type for NEW skills: global or department",
@@ -994,5 +1125,98 @@ class SkillContribution(Base):
     __table_args__ = (
         Index("ix_skill_contributions_contributor_id", "contributor_id"),
         Index("ix_skill_contributions_status", "status"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# MCP query log — one row per MCP tool call (for usage analytics & gap detection)
+# ---------------------------------------------------------------------------
+
+class MCPQueryLog(Base):
+    __tablename__ = "mcp_query_log"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    employee_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="SET NULL"),
+        nullable=True,
+        comment="Caller; NULL if token resolution failed before call",
+    )
+    tool_name: Mapped[str] = mapped_column(
+        String(80), nullable=False,
+        comment="MCP tool invoked: search_wiki, read_wiki_page, propose_wiki_edit, ...",
+    )
+    query_text: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Search/query string when applicable",
+    )
+    result_count: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    scope_metadata: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="Department/project/filters used for the call",
+    )
+    result_ids: Mapped[Optional[list]] = mapped_column(
+        JSONB, nullable=True,
+        comment="IDs returned (wiki_page_id or source_id list)",
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="ok",
+        comment="ok | error | denied",
+    )
+    error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    __table_args__ = (
+        Index("ix_mcp_query_log_created_at", "created_at"),
+        Index("ix_mcp_query_log_employee_id", "employee_id"),
+        Index("ix_mcp_query_log_tool_name", "tool_name"),
+        Index("ix_mcp_query_log_zero_result", "created_at", "result_count"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stats daily rollup — pre-aggregated metrics for the admin dashboard
+# ---------------------------------------------------------------------------
+
+class StatsDailyRollup(Base):
+    """
+    One row per (date, metric_key, dimensions). value_numeric for scalar metrics;
+    value_json for top-N lists or structured payloads (top contributors, gap topics).
+    """
+    __tablename__ = "stats_daily_rollup"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
+    )
+    date: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False,
+        comment="UTC date the metric covers (midnight UTC)",
+    )
+    metric_key: Mapped[str] = mapped_column(
+        String(80), nullable=False,
+        comment="e.g. wiki.pages.total, mcp.queries.zero_result, draft.pending",
+    )
+    dimensions: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="{department_id, project_id, tool_name, source}",
+    )
+    dimensions_hash: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="",
+        comment="md5 of canonical-serialized dimensions; empty string when dimensions is NULL",
+    )
+    value_numeric: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    value_json: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    computed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    __table_args__ = (
+        UniqueConstraint("date", "metric_key", "dimensions_hash", name="uq_stats_rollup_keys"),
+        Index("ix_stats_rollup_date", "date"),
+        Index("ix_stats_rollup_metric", "metric_key", "date"),
     )
 

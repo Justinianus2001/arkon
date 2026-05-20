@@ -750,7 +750,14 @@ async def get_workspace_wiki_graph(
 
     slug_set = {r.slug for r in pages}
 
-    edges = (await db.execute(select(WikiLink.from_slug, WikiLink.to_slug))).all()
+    edges = (await db.execute(
+        select(WikiPage.slug.label("from_slug"), WikiLink.to_slug)
+        .join(WikiLink, WikiLink.from_page_id == WikiPage.id)
+        .where(
+            WikiPage.scope_type == "project",
+            WikiPage.scope_id == pid,
+        )
+    )).all()
 
     return {
         "nodes": [{"slug": r.slug, "title": r.title, "page_type": r.page_type} for r in pages],

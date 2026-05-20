@@ -279,6 +279,30 @@ async def delete_employee(
     return {"deleted": True}
 
 
+class DepartmentTransfer(BaseModel):
+    department_id: str
+
+
+@router.patch("/employees/{emp_id}/department")
+async def transfer_employee_department(
+    emp_id: str,
+    body: DepartmentTransfer,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = require_permission("org:employees:manage"),
+):
+    """Move an employee to a different department."""
+    emp = await db.get(Employee, uuid.UUID(emp_id))
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    dept = await db.get(Department, uuid.UUID(body.department_id))
+    if not dept:
+        raise HTTPException(404, "Department not found")
+    emp.department_id = dept.id
+    await log_audit(db, _user, "update", "employee", str(emp.id), reason=f"moved to dept={dept.name}")
+    await db.flush()
+    return {"id": str(emp.id), "department_id": str(emp.department_id)}
+
+
 @router.patch("/employees/{emp_id}/toggle")
 async def toggle_employee(
     emp_id: str,

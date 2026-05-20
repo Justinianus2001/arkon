@@ -12,11 +12,13 @@ import { WikiEditor } from "@/components/wiki/wiki-editor";
 import { WikiDraftBanner } from "@/components/wiki/wiki-draft-banner";
 import { wikiTypeGroupLabel } from "@/components/wiki/wiki-type-badge";
 import { WikiSearchDialog } from "@/components/wiki/wiki-search-dialog";
+import { WikiScopeSwitcher } from "@/components/wiki/wiki-scope-switcher";
+import { WikiCreatePageDialog } from "@/components/wiki/wiki-create-page-dialog";
+import { WikiScope } from "@/types/wiki";
 import { EmptyState } from "@/components/shared/empty-state";
 import { PageHeader } from "@/components/shared/page-header";
 import { Button } from "@/components/ui/button";
 import Link from "next/link";
-import ReactMarkdown from "react-markdown";
 
 const WORKSPACE_ROLE_LEVEL: Record<string, number> = {
   viewer: 0,
@@ -40,11 +42,52 @@ export default function WikiPageViewer() {
   const scopeType = searchParams.get("scopeType") || undefined;
   const scopeId = searchParams.get("scopeId") || undefined;
   const isScoped = !!scopeType && scopeType !== "global";
+  const isProjectScoped = isScoped && scopeType === "project";
+
+  // Where "back" navigates. Projects keep their dedicated workspace page;
+  // department-scoped pages return to the wiki landing with the scope preserved
+  // so the user lands back on that department's tree+index, not global.
+  const backHref = isProjectScoped
+    ? "/workspaces"
+    : isScoped
+      ? `/wiki?scope_type=${scopeType}&scope_id=${scopeId}`
+      : "/wiki";
+
+  // Suffix appended to in-page wiki links (backlinks, outlinks, [[wikilinks]])
+  // so navigation between related pages keeps the current scope context.
+  const scopeLinkSuffix = isScoped
+    ? `?scopeType=${scopeType}&scopeId=${scopeId}`
+    : "";
+
+  // Look up the display name for the current page's scope so the scope
+  // switcher trigger reads e.g. "Phòng Nhân sự" rather than just "department".
+  const [scopes, setScopes] = React.useState<WikiScope[]>([]);
+  React.useEffect(() => {
+    api<WikiScope[]>("/api/wiki/my-scopes")
+      .then((s) => setScopes(Array.isArray(s) ? s : []))
+      .catch(() => setScopes([]));
+  }, []);
+  const currentScope: WikiScope = React.useMemo(() => {
+    if (isScoped && scopeType && scopeId) {
+      const match = scopes.find(
+        (s) => s.scope_type === scopeType && s.scope_id === scopeId,
+      );
+      if (match) return match;
+      return { scope_type: scopeType, scope_id: scopeId, name: scopeType };
+    }
+    return { scope_type: "global", scope_id: null, name: "Global" };
+  }, [isScoped, scopeType, scopeId, scopes]);
 
   const [page, setPage] = React.useState<WikiPageDetail | null>(null);
   const [notFound, setNotFound] = React.useState(false);
   const [loading, setLoading] = React.useState(true);
   const [searchOpen, setSearchOpen] = React.useState(false);
+  const [createOpen, setCreateOpen] = React.useState(false);
+  const [dialogScope, setDialogScope] = React.useState<WikiScope | null>(null);
+  // Author-side: the draft the user is currently resubmitting (needs_revision).
+  // When set, the page replaces the read view with a WikiEditor pre-filled
+  // with the draft's previous content.
+  const [editingDraft, setEditingDraft] = React.useState<DraftResponse | null>(null);
 
   // Edit mode
   const [mode, setMode] = React.useState<"view" | "edit">("view");
@@ -55,27 +98,77 @@ export default function WikiPageViewer() {
   // ---------------------------------------------------------------------------
   // Permission helpers
   // ---------------------------------------------------------------------------
-  const wsRole = isScoped && scopeId ? getWorkspaceRole(scopeId) : null;
+  // Workspace role only applies to project-scoped pages — getWorkspaceRole
+  // looks up project memberships and returns null for department scope IDs.
+  const wsRole = isProjectScoped && scopeId ? getWorkspaceRole(scopeId) : null;
   const isGlobalAdmin = user?.role === "admin";
+  const isDeptScoped = scopeType === "department";
+  const isOwnDept =
+    isDeptScoped && !!scopeId && !!user?.department_id && user.department_id === scopeId;
 
-  // Can directly edit (PUT /wiki/pages/{slug})
+  // Can directly edit (PUT /wiki/pages/{slug}). Department-scoped pages
+  // require wiki:write:all — own_dept only grants propose access.
   const canEdit: boolean = (() => {
     if (!user) return false;
     if (isGlobalAdmin) return true;
-    if (isScoped) return roleAtLeast(wsRole, "editor");
+    if (isProjectScoped) return roleAtLeast(wsRole, "editor");
     return hasPermission("wiki:write:all");
   })();
 
-  // Can propose draft (POST /wiki/pages/{slug}/drafts)
+  // Can propose draft (POST /wiki/pages/{slug}/drafts).
+  // - Project: workspace contributor+
+  // - Department: own_dept perm AND the page is in user's department, OR write:all
+  // - Global: any wiki:write permission
   const canPropose: boolean = (() => {
     if (!user) return false;
-    if (canEdit) return true; // editors can also propose
-    if (isScoped) return roleAtLeast(wsRole, "contributor");
+    if (canEdit) return true; // editors can always propose
+    if (isProjectScoped) return roleAtLeast(wsRole, "contributor");
+    if (isDeptScoped) {
+      if (hasPermission("wiki:write:all")) return true;
+      return hasPermission("wiki:write:own_dept") && isOwnDept;
+    }
+    // Global
     return hasPermission("wiki:write:own_dept") || hasPermission("wiki:write:all");
   })();
 
   // Can review drafts
   const canReview: boolean = canEdit;
+
+  // Permission helper for the create-page action — mirrors the helper on
+  // /wiki landing so the dialog mode follows whatever scope is chosen.
+  const getCreateModeForScope = React.useCallback(
+    (scope: { scope_type: string; scope_id: string | null }): "direct" | "propose" | null => {
+      if (!user) return null;
+      const st = scope.scope_type;
+      const sid = scope.scope_id;
+      if (st === "project" && sid) {
+        const role = getWorkspaceRole(sid);
+        if (isGlobalAdmin || roleAtLeast(role, "editor")) return "direct";
+        if (roleAtLeast(role, "contributor")) return "propose";
+        return null;
+      }
+      if (st === "department" && sid) {
+        if (isGlobalAdmin || hasPermission("wiki:write:all")) return "direct";
+        if (hasPermission("wiki:write:own_dept") && user.department_id === sid) {
+          return "propose";
+        }
+        return null;
+      }
+      if (isGlobalAdmin || hasPermission("wiki:write:all")) return "direct";
+      if (hasPermission("wiki:write:own_dept")) return "propose";
+      return null;
+    },
+    [user, isGlobalAdmin, getWorkspaceRole, hasPermission],
+  );
+  const headerCreateMode = getCreateModeForScope({
+    scope_type: currentScope.scope_type,
+    scope_id: currentScope.scope_id ?? null,
+  });
+  const dialogTargetScope = dialogScope ?? currentScope;
+  const dialogMode = getCreateModeForScope({
+    scope_type: dialogTargetScope.scope_type,
+    scope_id: dialogTargetScope.scope_id ?? null,
+  });
 
   // ---------------------------------------------------------------------------
   // Load page
@@ -102,13 +195,20 @@ export default function WikiPageViewer() {
   // Load pending drafts (editors/admins only, after page loaded)
   // ---------------------------------------------------------------------------
   const fetchDrafts = React.useCallback(() => {
-    if (!page || !canReview) return;
+    if (!page) return;
+    // Backend returns reviewable drafts to reviewers and author-only drafts
+    // to everyone else — so the same fetch surfaces 'your pending draft'
+    // even when the user is not a reviewer of this page.
     api<DraftResponse[]>(
       `/api/wiki/pages/${encodeURIComponent(fullSlug)}/drafts${isScoped ? `?scope_type=${scopeType}&scope_id=${scopeId}` : ""}`
     )
-      .then((data) => setDrafts(data.filter((d) => d.status === "pending")))
+      .then((data) =>
+        setDrafts(
+          data.filter((d) => d.status === "pending" || d.status === "needs_revision"),
+        ),
+      )
       .catch(() => setDrafts([]));
-  }, [page, canReview, fullSlug, isScoped, scopeType, scopeId]);
+  }, [page, fullSlug, isScoped, scopeType, scopeId]);
 
   React.useEffect(() => {
     fetchDrafts();
@@ -132,6 +232,9 @@ export default function WikiPageViewer() {
   // Save handlers
   // ---------------------------------------------------------------------------
   const handleSaveEdit = async (content: string, note: string) => {
+    // Direct edit endpoint reads scope from query params (it accepts them via
+    // FastAPI Query). Pass both via the URL so the backend resolves the page
+    // in the correct scope even when the same slug exists elsewhere.
     const scopeParams = isScoped ? `?scope_type=${scopeType}&scope_id=${scopeId}` : "";
     const updated = await api<WikiPageDetail>(
       `/api/wiki/pages/${encodeURIComponent(fullSlug)}${scopeParams}`,
@@ -145,12 +248,21 @@ export default function WikiPageViewer() {
   };
 
   const handleSaveProposal = async (content: string, note: string) => {
-    const scopeParams = isScoped ? `?scope_type=${scopeType}&scope_id=${scopeId}` : "";
+    // propose_draft reads scope from the JSON body (Pydantic model, not Query).
+    // Sending the params via query did nothing — backend fell through to
+    // get_page_by_slug_any_scope, attaching the draft to whichever scope's
+    // copy of the slug happened to be returned first.
     await api(
-      `/api/wiki/pages/${encodeURIComponent(fullSlug)}/drafts${scopeParams}`,
+      `/api/wiki/pages/${encodeURIComponent(fullSlug)}/drafts`,
       {
         method: "POST",
-        body: { content_md: content, note: note || undefined },
+        body: {
+          content_md: content,
+          note: note || undefined,
+          scope_type: isScoped ? scopeType : "global",
+          scope_id: isScoped ? scopeId : undefined,
+          base_version: page?.version,
+        },
       }
     );
     setMode("view");
@@ -169,6 +281,25 @@ export default function WikiPageViewer() {
     setDrafts((prev) => prev.filter((d) => d.id !== draftId));
   };
 
+  const handleDraftWithdrawn = (draftId: string) => {
+    setDrafts((prev) => prev.filter((d) => d.id !== draftId));
+  };
+
+  const handleResubmitOpen = (draft: DraftResponse) => {
+    setEditingDraft(draft);
+  };
+
+  const handleResubmitSave = async (content: string, note: string) => {
+    if (!editingDraft) return;
+    await api(`/api/wiki/drafts/${editingDraft.id}/content`, {
+      method: "PATCH",
+      body: { content_md: content, note: note || undefined },
+    });
+    setEditingDraft(null);
+    // Refresh draft list so the banner shows the new pending status.
+    fetchDrafts();
+  };
+
   // ---------------------------------------------------------------------------
   // Render
   // ---------------------------------------------------------------------------
@@ -179,6 +310,7 @@ export default function WikiPageViewer() {
         description="Compiled knowledge from your organization's documents."
         action={
           <div className="flex items-center gap-2">
+            <WikiScopeSwitcher current={currentScope} />
             <Button
               variant="outline"
               onClick={() => setSearchOpen(true)}
@@ -190,11 +322,39 @@ export default function WikiPageViewer() {
                 ⌘K
               </kbd>
             </Button>
+            {headerCreateMode && (
+              <Button
+                variant="outline"
+                onClick={() => {
+                  setDialogScope(null);
+                  setCreateOpen(true);
+                }}
+                className="gap-2"
+                title={
+                  headerCreateMode === "direct"
+                    ? `Create a new page in ${currentScope.name}`
+                    : `Propose a new page in ${currentScope.name} (reviewer approves)`
+                }
+              >
+                <span className="material-symbols-outlined text-base">add</span>
+                {headerCreateMode === "direct" ? "New page" : "Propose page"}
+              </Button>
+            )}
+            {user && (
+              <Link
+                href="/wiki/queue"
+                className="inline-flex h-8 items-center gap-1.5 px-2.5 rounded-lg text-sm font-medium border border-border bg-background hover:bg-muted transition-colors"
+                title="Drafts you authored and drafts waiting for your review"
+              >
+                <span className="material-symbols-outlined" style={{ fontSize: 16 }}>edit_note</span>
+                Contributions
+              </Link>
+            )}
             <Link
               href="/wiki/graph"
-              className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+              className="inline-flex h-8 items-center gap-1.5 px-2.5 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
             >
-              <span className="material-symbols-outlined" style={{ fontSize: 14 }}>hub</span>
+              <span className="material-symbols-outlined" style={{ fontSize: 16 }}>hub</span>
               Graph View
             </Link>
           </div>
@@ -202,11 +362,32 @@ export default function WikiPageViewer() {
       />
 
       <div className="flex-1 flex gap-0 -mx-6 md:-mx-8 lg:-mx-10 -mb-6 md:-mb-8 lg:-mb-10 min-h-0 border-t border-border overflow-hidden">
-        {/* Left: Page Tree */}
+        {/* Left: Page Tree — same scope-grouped layout as /wiki. We do NOT
+            filter pagesUrl by scope so the sidebar is identical across all
+            wiki pages; the active page's scope bucket auto-expands. */}
         <WikiPageTree
           activeSlug={fullSlug}
-          pagesUrl={isScoped ? `/api/projects/${scopeId}/wiki?limit=200` : undefined}
-          linkQueryParams={isScoped ? `?scopeType=${scopeType}&scopeId=${scopeId}` : undefined}
+          groupByScope
+          activeScope={{
+            scope_type: scopeType ?? "global",
+            scope_id: scopeId ?? null,
+          }}
+          getCreateModeForScope={getCreateModeForScope}
+          onCreatePage={(scope) => {
+            const match = scopes.find(
+              (s) =>
+                s.scope_type === scope.scope_type &&
+                (s.scope_id ?? null) === (scope.scope_id ?? null),
+            );
+            setDialogScope(
+              match ?? {
+                scope_type: scope.scope_type,
+                scope_id: scope.scope_id,
+                name: scope.scope_type,
+              },
+            );
+            setCreateOpen(true);
+          }}
         />
 
         {/* Center: Content */}
@@ -241,22 +422,24 @@ export default function WikiPageViewer() {
             </div>
           ) : page ? (
             <div className="max-w-3xl mx-auto px-8 py-8">
-              {/* Breadcrumb & Back Button */}
+              {/* Breadcrumb & Back Button — project scope returns to /workspaces,
+                  department scope returns to /wiki with that department's scope
+                  preserved so the user lands on the dept's tree+index. */}
               <div className="flex items-center gap-3 mb-6">
                 <Link
-                  href={isScoped ? `/workspaces` : "/wiki"}
+                  href={backHref}
                   className="flex items-center justify-center w-8 h-8 rounded-full border border-border bg-background text-muted-foreground hover:bg-accent hover:text-foreground transition-colors shrink-0 shadow-sm"
-                  title={isScoped ? "Back to Workspace" : "Back to Wiki Index"}
+                  title={isProjectScoped ? "Back to Workspace" : "Back to Wiki"}
                 >
                   <span className="material-symbols-outlined text-[18px]">arrow_back</span>
                 </Link>
 
                 <nav className="flex items-center gap-1.5 text-xs text-muted-foreground">
                   <Link
-                    href={isScoped ? `/workspaces` : "/wiki"}
+                    href={backHref}
                     className="hover:text-foreground transition-colors font-medium"
                   >
-                    {isScoped ? "Workspace" : "Wiki"}
+                    {isProjectScoped ? "Workspace" : "Wiki"}
                   </Link>
                   <span className="material-symbols-outlined text-muted-foreground/50" style={{ fontSize: 14 }}>chevron_right</span>
                   <span className="capitalize font-medium">
@@ -275,13 +458,6 @@ export default function WikiPageViewer() {
                   <h1 className="font-heading text-4xl font-normal leading-tight text-foreground">
                     {page.title}
                   </h1>
-                  {page.summary && (
-                    <div className="mt-2 text-muted-foreground text-sm leading-6 [&_strong]:font-semibold [&_strong]:text-foreground [&_em]:italic">
-                      <ReactMarkdown components={{ p: ({ children }) => <>{children}</> }}>
-                        {page.summary}
-                      </ReactMarkdown>
-                    </div>
-                  )}
                 </div>
 
                 {mode === "view" && (canEdit || canPropose) && (
@@ -297,19 +473,32 @@ export default function WikiPageViewer() {
                 )}
               </div>
 
-              {/* Draft review banner (editors/admins, view mode only) */}
-              {mode === "view" && canReview && drafts.length > 0 && (
+              {/* Draft banner — visible to reviewers AND to authors of own drafts. */}
+              {mode === "view" && !editingDraft && drafts.length > 0 && (
                 <div className="mb-6">
                   <WikiDraftBanner
                     drafts={drafts}
+                    currentContent={page.content_md}
+                    currentUserId={user?.id ?? null}
                     onApproved={handleDraftApproved}
                     onRejected={handleDraftRejected}
+                    onResubmitDraft={handleResubmitOpen}
+                    onWithdrawn={handleDraftWithdrawn}
                   />
                 </div>
               )}
 
-              {/* Markdown body or Editor */}
-              {mode === "edit" ? (
+              {/* Markdown body / direct-edit / resubmit-draft editor */}
+              {editingDraft ? (
+                <WikiEditor
+                  initialContent={editingDraft.content_md}
+                  noteLabel="Resubmission note"
+                  notePlaceholder="What changed in this round?"
+                  saveLabel="Resubmit draft"
+                  onSave={handleResubmitSave}
+                  onCancel={() => setEditingDraft(null)}
+                />
+              ) : mode === "edit" ? (
                 <WikiEditor
                   initialContent={page.content_md}
                   noteLabel={canEdit ? "Change note" : "Proposal note"}
@@ -323,7 +512,7 @@ export default function WikiPageViewer() {
                   onCancel={() => setMode("view")}
                 />
               ) : (
-                <WikiContent markdown={page.content_md} />
+                <WikiContent markdown={page.content_md} linkSuffix={scopeLinkSuffix} />
               )}
             </div>
           ) : null}
@@ -332,12 +521,30 @@ export default function WikiPageViewer() {
         {/* Right: Sidebar (hidden on < lg, only in view mode) */}
         {page && mode === "view" && (
           <div className="hidden lg:block h-full">
-            <WikiSidebarRight slug={fullSlug} page={page} />
+            <WikiSidebarRight slug={fullSlug} page={page} linkSuffix={scopeLinkSuffix} />
           </div>
         )}
       </div>
 
       <WikiSearchDialog open={searchOpen} onOpenChange={setSearchOpen} />
+      {dialogMode && (
+        <WikiCreatePageDialog
+          open={createOpen}
+          onOpenChange={(o) => {
+            setCreateOpen(o);
+            if (!o) setDialogScope(null);
+          }}
+          mode={dialogMode}
+          defaultScope={dialogTargetScope}
+          scopes={scopes}
+          getCreateModeForScope={(s) =>
+            getCreateModeForScope({
+              scope_type: s.scope_type,
+              scope_id: s.scope_id ?? null,
+            })
+          }
+        />
+      )}
     </>
   );
 }

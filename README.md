@@ -63,7 +63,7 @@ Role-based access control at department + workspace level.
 </p>
 
 ### 🔌 MCP Server for Claude & Other AI Clients
-Employees connect Claude Desktop (or any MCP-compatible client) to Arkon with a personal token. The MCP server exposes:
+Employees connect Claude Desktop or Claude.ai to Arkon via **OAuth 2.1 + PKCE** — just add the server URL and sign in through the browser. No manual token copying required. The MCP server exposes:
 - **Wiki tools** - `search_wiki`, `read_wiki_page`, `list_wiki_pages`, `read_wiki_index`.
 - **Source drill-down** - `get_source`, `get_source_outline`, `get_source_pages`, `list_sources`.
 - **Edit workflow** - `propose_wiki_edit`, `edit_wiki_page`, `list_pending_drafts`, `review_draft`, `approve_draft`, `reject_draft`.
@@ -126,6 +126,11 @@ Arkon runs **7 Docker containers** (PostgreSQL + pgvector, Redis, MinIO, FastAPI
 
 ## 🚦 Quick Start (Docker)
 
+> [!NOTE]
+> **Arkon is built for teams, not individuals.** If you're looking for a personal knowledge setup, [Obsidian](https://obsidian.md) + Claude Skills is a much simpler fit.
+>
+> **Not a tech person?** Skip the self-hosting hassle — reach out for a **free guided demo** tailored for your team. No config, no Docker, just a walkthrough of what Arkon can do for your organization.
+
 **Prerequisites:** Docker & Docker Compose, plus an API key from your preferred AI provider (Anthropic, Google, or OpenAI).
 
 1. **Clone the repository:**
@@ -153,20 +158,26 @@ Arkon runs **7 Docker containers** (PostgreSQL + pgvector, Redis, MinIO, FastAPI
 
 ## 🔗 Connecting Claude
 
-After creating an employee account and generating an MCP token:
+In **Claude Desktop** or **Claude.ai → Settings → Connectors**, add a custom connector:
 
-```json
-{
-  "mcpServers": {
-    "arkon": {
-      "url": "https://your-arkon-server/mcp",
-      "headers": { "Authorization": "Bearer ark_xxxxxxxxxxxx" }
-    }
-  }
-}
+- **Name:** `Arkon`
+- **URL:** `https://your-arkon-server/mcp`
+
+Click **Connect** → a browser window opens with the Arkon login form → sign in with your Arkon credentials → done. Arkon uses OAuth 2.1 + PKCE so no manual token setup is required.
+
+**To make Claude consistently use Arkon**, add this to Claude's **Custom Instructions** (Settings → Custom Instructions):
+
+```
+Whenever answering questions related to the company — its processes, products,
+people, departments, policies, or projects — always search Arkon first using
+the search_wiki tool before relying on general knowledge.
 ```
 
-Drop it into `claude_desktop_config.json` and restart Claude Desktop. The employee's scoped knowledge is immediately available.
+For stronger enforcement, create a **Project** in Claude Desktop, attach Arkon as a connector, and paste the same text as Project Instructions.
+
+<p align="center">
+  <img src="docs/assets/arkon-in-use-of-claude.png" alt="Arkon in use with Claude Desktop" width="720">
+</p>
 
 → See [MCP & Claude](docs/MCP.md) for the complete tool reference.
 
@@ -182,9 +193,17 @@ Drop it into `claude_desktop_config.json` and restart Claude Desktop. The employ
 - [x] **Catalog-driven model selection** - LLM, embedding, and vision picked from a curated list with cost/context-window metadata.
 - [x] **Online embedding migration** - atomic re-embed with no search downtime.
 - [x] **Audit log** - privileged actions tracked.
+- [ ] **Rich media ingestion** - bulk folder upload with images, videos, and Excel/spreadsheet parsing baked into the MRP pipeline.
+- [x] **Usage analytics dashboard**
+- [ ] **External data import** - connectors for SharePoint, Google Drive, Notion, and other common org data sources.
 - [ ] **Arkon CLI** - one-command setup for employees.
 - [ ] **Notification system** - for draft reviews and plan approvals.
-- [ ] **Usage analytics dashboard** - cost + adoption per department.
+
+---
+
+## ⭐ Star History
+
+[![Star History Chart](https://api.star-history.com/svg?repos=nduckmink/arkon&type=Date)](https://star-history.com/#nduckmink/arkon&Date)
 
 ---
 
@@ -197,3 +216,17 @@ For enterprise support or custom integrations, please contact the maintainers.
 ---
 
 **Keywords:** *Enterprise AI, Model Context Protocol, MCP Server, Knowledge Management System, Self-hosted RAG, AI Knowledge Base, Claude MCP, LLM Context Management, Open Source Wiki.*
+
+---
+
+## 📬 Contact
+
+**Main Author**
+Minh Nguyen (Nguyễn Đức Minh) — Vietnam (GMT+7) · Fluent English
+✉️ [duckmink.bitsness@gmail.com](mailto:duckmink.bitsness@gmail.com)
+
+**Company**
+BITSNESS TECHNOLOGY AND SOLUTIONS COMPANY LIMITED
+✉️ [bitsness.ad@bitsness.vn](mailto:bitsness.ad@bitsness.vn)
+
+For enterprise inquiries, demo requests, or custom integrations — email us directly.

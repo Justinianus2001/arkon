@@ -11,19 +11,24 @@ import { ScopeBadge } from "@/components/shared/scope-badge";
 type Props = {
   slug: string;
   page: WikiPageDetail;
+  /** Suffix appended to /wiki/<slug> links (e.g. "?scopeType=...&scopeId=...")
+   *  so backlinks/outlinks preserve the current scope context. */
+  linkSuffix?: string;
 };
 
 function LinkItem({
   slug,
   direction,
+  linkSuffix = "",
 }: {
   slug: string;
   direction: "back" | "forward";
+  linkSuffix?: string;
 }) {
   const label = slug.split("/").pop() ?? slug;
   return (
     <Link
-      href={`/wiki/${slug}`}
+      href={`/wiki/${slug}${linkSuffix}`}
       className="flex items-center gap-2 px-2 py-1.5 rounded-lg text-xs text-muted-foreground hover:bg-accent/50 hover:text-foreground transition-colors group"
     >
       <span className="material-symbols-outlined text-xs text-muted-foreground group-hover:text-primary transition-colors">
@@ -69,7 +74,7 @@ function Section({
   );
 }
 
-export function WikiSidebarRight({ slug, page }: Props) {
+export function WikiSidebarRight({ slug, page, linkSuffix = "" }: Props) {
   const [graphData, setGraphData] = React.useState<WikiGraphData | null>(null);
 
   React.useEffect(() => {
@@ -158,12 +163,12 @@ export function WikiSidebarRight({ slug, page }: Props) {
           <>
             <Section title="Backlinks" icon="arrow_back" count={page.backlinks.length}>
               {page.backlinks.map((s) => (
-                <LinkItem key={s} slug={s} direction="back" />
+                <LinkItem key={s} slug={s} direction="back" linkSuffix={linkSuffix} />
               ))}
             </Section>
             <Section title="Outlinks" icon="arrow_forward" count={page.outlinks.length}>
               {page.outlinks.map((s) => (
-                <LinkItem key={s} slug={s} direction="forward" />
+                <LinkItem key={s} slug={s} direction="forward" linkSuffix={linkSuffix} />
               ))}
             </Section>
           </>

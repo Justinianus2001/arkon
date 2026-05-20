@@ -480,6 +480,13 @@ Rules:
 - For CREATE, slug must be new (type-prefixed, lowercase, hyphenated)
 - Always include exactly one page with page_type "source" for the document itself
 - Group closely related small entities onto the same page (max 3-4 per page)
+- BUT: if a primary entity is described through several distinct thematic
+  sections (e.g. "Product Positioning", "Target Customer Profile",
+  "Content Pillars") and those sections appear as concepts in the list
+  above, prefer creating a separate `concept` page for EACH such section
+  instead of collapsing all the section content onto the entity page.
+  The entity page should overview and link out (via [[concept/...]]) to
+  these section pages rather than reproducing their content inline.
 - priority 1 = highest importance (process first)
 - entity_names must match the names in the entities/concepts lists above
 - Target approximately {target_page_count} total pages (feel free to create more if the document is dense and contains many distinct concepts).

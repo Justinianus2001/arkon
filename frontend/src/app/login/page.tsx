@@ -104,7 +104,7 @@ export default function LoginPage() {
         </div>
 
         <p className="text-center text-xs text-muted-foreground mt-6">
-          Arkon v0.1 — On-Premise Deployment
+          Arkon v0.5 — On-Premise Deployment
         </p>
       </div>
     </div>

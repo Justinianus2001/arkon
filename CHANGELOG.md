@@ -5,6 +5,349 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.1] — 2026-05-20
+
+Hotfix for a race condition in the MRP REFINE phase that surfaced while
+compiling longer source documents (observed on
+`meeting-notes-260519-2124-chien…`). No schema migration, no API change.
+
+### Fixed
+
+- **MRP REFINE concurrent-session race** — Phase 3 fanned out up to
+  `MAX_WRITER_CONCURRENCY` page writers via `asyncio.gather`, all
+  sharing the orchestrator's single `AsyncSession`. SQLAlchemy
+  `AsyncSession` is not safe for concurrent use, so simultaneous
+  `get_page_by_slug` lookups (UPDATE fetches plus the `read_kb_page`
+  tool inside the complex writer's agent loop) raced and corrupted
+  the session, causing intermittent draft generation failures on
+  documents with several UPDATE pages or a large existing wiki.
+  Each `_write_one` now opens its own session from
+  `async_session_factory`; the orchestrator's session is reserved for
+  the final `plan.plan_json` commit.
+
+---
+
+## [0.7.0] — 2026-05-19
+
+Scaling the contribute/review workflow: review queue + bulk approve, author
+trust signals, expertise-based reviewer routing, outline-aware diff,
+gap-to-page deep-link, and external notification channels (email + webhook).
+No schema migration — all features build on existing tables.
+
+### Added
+
+- **Review queue page (`/wiki/queue`)** listing every draft the current
+  user can review across scopes, with status filter (pending /
+  needs_revision / approved / rejected). Supports multi-select +
+  bulk-approve; per-draft AI status chip, author trust chip, revision
+  round, and submission age. Header button on `/wiki` deep-links here.
+- **Bulk approve endpoint** `POST /wiki/drafts/bulk-approve` — processes
+  each draft independently (per-item conflict / permission / not-found
+  handling), commits the batch, and emits notifications for the
+  approved set. Result payload reports approved / skipped / errored
+  counts plus per-item messages.
+- **Author trust signals** — `DraftResponse.author_stats` now exposes
+  `{approved, rejected, needs_revision, total_reviewed, accuracy}` over
+  the author's lifetime drafts. Banner and queue both render a chip
+  coloured by tier (high / ok / low) with hover-tooltip detail.
+- **Expertise-based reviewer suggestions** —
+  `DraftResponse.suggested_reviewers` lists up to 3 employees ranked by
+  past edit / approval activity on pages with overlapping
+  `knowledge_type_slugs` OR in the same scope. Banner surfaces them so
+  reviewers know who normally handles a topic.
+- **Outline-aware diff view** — `WikiDraftDiff` groups hunks under their
+  nearest preceding heading. Unchanged sections collapse automatically;
+  changed sections stay open and are flagged in the section header.
+  Pre-heading content (intro / frontmatter) renders ungrouped.
+- **Knowledge-gap deep link** — the `/admin/statistics` Gaps tab's
+  "Create draft →" link routes to `/wiki?new=1&title=<topic>`, which now
+  auto-opens the create dialog with the gap topic pre-filled in the
+  title field.
+- **External notification channels (permissive)**
+  - **Email (SMTP)**: per-recipient delivery; multiple notifications in
+    the same request are batched into one email. Configured via
+    `smtp_enabled / smtp_host / smtp_port / smtp_username / smtp_password
+    / smtp_from / smtp_use_tls` keys in `app_config`. Sensitive keys
+    (`smtp_password`) are encrypted at rest via the existing
+    `ConfigService` Fernet layer.
+  - **Webhook (generic JSON POST)**: single endpoint receives
+    `{events: [{id, type, subject, body, target_type, target_id,
+    recipient_id, actor_id, created_at}]}`. Optional HMAC secret signs
+    the body in `X-Arkon-Signature: sha256=<hex>`.
+  - Both channels run **after request commit** via a FastAPI middleware
+    that drains a per-request notification staging buffer; errors are
+    logged and swallowed so the contribution flow never breaks.
+  - New settings panel **Notification channels** in `/settings` lets
+    admins toggle each channel, edit credentials, and save without
+    leaving the page.
+- New runtime dependency: `aiosmtplib>=3.0.0` for async SMTP.
+
+### Changed
+
+- `_can_review_draft` is now the canonical reviewer-permission check;
+  bulk-approve and the new queue both route through it so create drafts
+  and edit drafts behave the same way.
+- `notification_service.notify` / `notify_many` automatically stage
+  every created `Notification` on the current request's contextvar; no
+  per-route changes required for the new dispatch path.
+- `_is_sensitive(key)` in `ConfigService` recognises `smtp_password` and
+  `webhook_secret` so they round-trip encrypted.
+
+### Deferred to 0.8
+
+- Per-event channel routing (e.g. only ship `approved` events to email,
+  send everything to the webhook).
+- Auto-fast-track for high-trust authors (auto-approve after N hours
+  with no review). Trust signals exist; the automation does not.
+- Slack/Teams-native adapters (current webhook is intentionally generic).
+
+---
+
+## [0.6.0] — 2026-05-19
+
+Contribute / review vision pass. Adds an AI pre-review layer that annotates
+every wiki draft (PII, broken wikilinks, duplicates, tone / factual sniff),
+a side-by-side diff view in the reviewer banner, and the ability for any
+contributor to propose brand-new wiki pages. Permissive throughout — the AI
+flags, the human decides.
+
+### Added
+
+- **AI pre-review (permissive)** for wiki drafts. Four layers run on every
+  submit / resubmit:
+  - **L1 regex (sync)** — emails, phone numbers, national IDs, AWS / GitHub /
+    Anthropic / Google API keys, JWTs, private-key blocks. Suppressible
+    inline with `<!-- pii-allow: <reason> -->` markers above the match.
+  - **L2 structural (sync)** — broken wikilinks, self-links, length sanity,
+    non-incremental heading jumps, unclosed code fences.
+  - **L3 semantic (async)** — embedding similarity vs existing pages to
+    flag potential duplicates (>0.85 cosine).
+  - **L4 LLM judgment (async)** — tone consistency, page_type scope fit,
+    factual concerns. Uses the admin-configured LLM via `ProviderRegistry`.
+  - Results land in `wiki_page_drafts.ai_check_results` JSONB with a
+    `summary` and per-check entries. Status flows
+    `pending` → `running` → `passed` / `warned` / `failed`. **Nothing
+    blocks submission** — every flag is advisory. Disable globally with
+    the `ai_pre_review_enabled` config key.
+- **Async worker task** `ai_pre_review_draft_task` registered in
+  `WorkerSettings.functions`. L1/L2 run inside the request; L3/L4 are
+  enqueued and update the draft when done.
+- **Re-run on resubmit** — every author resubmission clears the AI state,
+  re-runs L1+L2 synchronously, re-enqueues L3+L4, and snapshots the prior
+  round's verdict to `wiki_draft_rounds.ai_check_results` so reviewers can
+  compare across rounds.
+- **Unified diff view** in the reviewer banner using `jsdiff`. New “Diff”
+  tab (default) renders unified ± lines with word-level highlighting for
+  changed lines and collapses long unchanged runs. Edit drafts only —
+  create drafts have nothing to diff against.
+- **AI check panel** appended below the diff/preview area. Collapsed shows
+  a one-line summary chip + tally; expanded lists every warn / fail check
+  with layer, message, and up to 5 example matches.
+- **`propose_wiki_create` (REST + MCP)** lets any contributor propose a
+  brand-new wiki page. The draft carries the suggested
+  `{slug, title, page_type, knowledge_type_slugs, scope_type, scope_id}`;
+  the parent page is materialised at approve time.
+- **`create_wiki_page` (REST + MCP)** lets workspace editors and global
+  `wiki:write:all` holders create pages directly without going through
+  review.
+- **Reviewer-side metadata overrides** on approve — `final_slug`,
+  `final_title`, `final_page_type`, `final_knowledge_type_slugs` —
+  applied when materialising a create draft. Slug collisions surface as
+  HTTP 409 with a clear hint.
+- **Polling for AI status** in the draft banner: while
+  `ai_check_status ∈ {pending, running}` the component polls the draft
+  every 3 seconds and refreshes the panel.
+
+### Changed
+
+- `WikiPageDraft.page_id` is now nullable — create drafts have no parent
+  page until approval materialises one.
+- `_can_review_draft` replaces page-keyed reviewer checks across all
+  draft endpoints so create drafts route correctly to global / workspace
+  reviewers without requiring an existing page.
+- The `arkon-edit` skill documents the create flow + AI pre-review +
+  `pii-allow` markers; `arkon-review` documents AI verdicts and metadata
+  overrides on create-draft approval.
+
+### Migrations
+
+- `025_ai_pre_review_and_create_drafts.py` — adds
+  `ai_check_status` / `ai_check_results` / `ai_checked_at` to
+  `wiki_page_drafts`; adds `ai_check_results` to `wiki_draft_rounds`;
+  adds `draft_kind` and `suggested_metadata` to `wiki_page_drafts`;
+  makes `wiki_page_drafts.page_id` nullable.
+
+### Deferred to 0.7
+
+- Gap-driven page-creation suggestions (mining `mcp_query_log` zero-result
+  searches for topics worth seeding pages from).
+- Email / webhook notification channels (in-app only for now).
+- Bulk-approve UI and a dedicated queue page.
+- Trust / reputation signals and expertise-based reviewer routing.
+
+---
+
+## [0.5.0] — 2026-05-19
+
+Contribute / review hardening, foundation pass. Adds a closed feedback loop
+between authors and reviewers (`needs_revision`), an in-app notification
+inbox, and a unified service for contribution state transitions across wiki
+drafts and skill contributions. Lays the backbone for the upcoming AI
+pre-review, diff view, and `propose_create_page` work in the next release.
+
+### Added
+
+- **`needs_revision` state for wiki drafts and skill contributions**: a
+  reviewer can now send a draft back with a note instead of being forced to
+  approve or reject. The author resubmits on the same draft —
+  `revision_round` increments and the prior submission is snapshotted to
+  the new `wiki_draft_rounds` table so reviewers can diff between rounds.
+- **`withdraw` action for authors**: an in-flight draft (pending or
+  needs_revision) can be retracted by its author without a reviewer touch.
+- **`ContributionService` (`app/services/contribution_service.py`)**:
+  thin state-machine wrapper with `WikiDraftAdapter` and
+  `SkillContributionAdapter`. Each lifecycle verb fires audit logs and
+  notifications uniformly so REST and MCP entry points behave the same.
+- **`NotificationService` + in-app inbox**: new `notifications` table,
+  `NotificationService` writer (sync DB inserts, audit_service pattern),
+  REST endpoints `GET /notifications`, `GET /notifications/unread-count`,
+  `POST /notifications/{id}/read`, `POST /notifications/read-all`.
+- **NotificationBell in the header**: badge + slide-in drawer with
+  mark-as-read controls; polls unread count every 30s.
+- **MCP tools for the new lifecycle**:
+  `request_changes_on_draft`, `resubmit_draft`, `withdraw_draft`. The
+  matching skills (`arkon-edit`, `arkon-review`) document the new flow.
+- **REST endpoints for wiki draft lifecycle**:
+  `POST /wiki/drafts/{id}/request-changes`,
+  `PATCH /wiki/drafts/{id}/content` (author resubmit),
+  `POST /wiki/drafts/{id}/withdraw`,
+  `GET /wiki/drafts/{id}/rounds` (per-round history).
+- **REST endpoints for skill contribution lifecycle**:
+  `POST /skill-contributions/{id}/request-changes`,
+  `POST /skill-contributions/{id}/resubmit`,
+  `POST /skill-contributions/{id}/withdraw`.
+- **WikiDraftBanner UX**: distinct palette + headline for
+  `needs_revision` vs `pending`, a “Request changes” button alongside
+  Approve / Reject, the reviewer’s return note surfaced inline, a
+  20-character minimum on rejection / request-changes notes, conflict
+  badge when `base_version < page.version`, and a round counter when
+  the draft has been through revisions.
+
+### Changed
+
+- **Skill contribution file edits no longer silently demote PENDING to
+  DRAFT.** Contributors must explicitly `withdraw` (or wait for a reviewer
+  to `request_changes`) before editing files on a contribution that is in
+  front of a reviewer. This closes the “draft moves underfoot mid-review”
+  hole flagged in the contribute/review code review.
+- **Notifications fire on every lifecycle event** — submit, approve,
+  reject, request_changes, resubmit, withdraw — across both REST and MCP
+  entry points.
+
+### Migrations
+
+- `024_contribution_lifecycle.py`: adds `revision_round` /
+  `last_returned_note` to `wiki_page_drafts` and `skill_contributions`,
+  creates `wiki_draft_rounds` (per-round snapshots) and `notifications`
+  (recipient-keyed inbox with `(recipient_id, read_at)` index for the
+  badge query).
+
+---
+
+## [0.4.0] — 2026-05-18
+
+A scope-aware refresh of the Wiki UX. Every wiki page already lived in a
+scope (`global`, `department`, `project`), but the UI treated same-slug
+pages from different scopes as duplicates and the index page only ever
+showed the global catalog. This release threads scope context through
+the URL, the page tree, the page detail view, and the ingestion pipeline.
+
+### Added
+
+- **Scope switcher on `/wiki`**: a dropdown listing the scopes the
+  current user can access. Selecting a scope updates the URL
+  (`/wiki?scope_type=&scope_id=`), refetches the matching `_index`
+  catalog and pages grid, and is shareable / reloadable.
+- **Scope-grouped page tree**: the sidebar in `/wiki` and the detail
+  viewer now groups pages by scope (`GLOBAL`, plus each department),
+  then by page type (`Entities`, `Concepts`, `Topics`, `Sources`).
+  Clicking a scope header opens that scope's wiki landing; the chevron
+  toggles expansion independently. The active scope and the bucket
+  containing the active page auto-expand on navigation.
+- **Scope-preserving navigation**: backlinks, outlinks, and inline
+  `[[wikilinks]]` carry the current page's scope params, so jumping
+  between related pages keeps the user inside the same scope context.
+  The detail back button returns to `/wiki?scope_type=&scope_id=` for
+  department-scoped pages (projects continue to return to
+  `/workspaces`).
+- **`GET /api/wiki/my-scopes`**: lists global plus each department and
+  project the requester can read. Used by the scope switcher.
+- **`scope_name` in wiki responses**: `/api/wiki/pages` joins the
+  `Project` and `Department` tables so each summary carries a
+  human-readable scope name (e.g. `"Phòng Nhân sự"`) alongside the raw
+  ID, removing the need for separate lookups on the client.
+- **Thematic-section concept pages during ingestion**: the MRP
+  extraction and planning prompts now recognise documents that describe
+  a primary entity through several distinct themes (e.g. *Product
+  Positioning*, *Target Customer Profile*, *Content Pillars*) and emit
+  a separate `concept` page per theme instead of dumping the content
+  into the entity page. The entity page links out to them with
+  `[[concept/...]]`.
+
+### Changed
+
+- `/api/wiki/pages` and `/api/wiki/index` accept optional
+  `scope_type` + `scope_id` query parameters. When omitted the original
+  behaviour is preserved (RBAC-filtered list, global index).
+- `ScopeBadge` accepts `scopeId: string | null` to match the relaxed
+  `WikiPageSummary` type.
+- Sidebar collapse/expand chevrons swapped for `left_panel_close` /
+  `left_panel_open` icons that don't look like a Back button.
+- The `/wiki` page tree no longer surfaces project-scoped pages —
+  workspaces remain reachable from `/workspaces` and from the scope
+  switcher, keeping the wiki sidebar focused on enterprise-wide
+  knowledge.
+- The wiki graph no longer draws the dashed convex-hull boundaries
+  around department and project clusters; nodes and edges stand on
+  their own.
+- The `Wiki` button previously added to department cards was removed
+  once the scope switcher and clickable tree scope headers landed —
+  redundant entry points were creating clutter.
+
+### Fixed
+
+- Department-scoped detail pages no longer fetch
+  `/api/projects/<id>/wiki` (which 404s on department IDs); the tree
+  uses the new general scope-aware `/api/wiki/pages` endpoint instead.
+- Clicking a backlink, outlink, or inline `[[wikilink]]` from a scoped
+  page used to drop scope context and load the flat "old" tree.
+- Navigating to a global wiki page used to render with the legacy flat
+  tree while `/wiki` showed the new grouped tree.
+- `DELETE /api/wiki/pages/<slug>` returned 404 for workspace pages
+  because the endpoint looked them up with the default global scope.
+  Even after that lookup was fixed, the cascade helper re-fetched the
+  row with the same default and silently no-op'd the actual delete,
+  returning `{"ok": true}` while the row remained in the database.
+  `delete_page_cascade` now takes the resolved `WikiPage` object so
+  no second lookup is performed.
+- The summary block under the page title piped `page.summary` straight
+  into ReactMarkdown without the `[[wikilink]]` preprocessing step
+  used by the main content renderer, so users saw raw `[[Arkon]]` and
+  bare `**...**` markers in the header of every page. Wikilinks now
+  resolve through the same preprocessor and inherit the active scope.
+
+### Backend
+
+- Frontend `WikiPageSummary` and Pydantic `WikiPageSummary` both gain
+  `scope_name: Optional[str]`; new shared `WikiScope` type for the
+  switcher payload.
+- `_build_wiki_scope_filter` is reused by both `/wiki/pages` and the
+  new `/wiki/my-scopes` endpoint.
+- `regenerate_index` is called with the deleted page's actual scope so
+  the right `_index` is rebuilt after a non-global delete.
+
+---
+
 ## [0.3.1] — 2026-05-14
 
 ### Added

@@ -38,14 +38,23 @@ def create_mcp_server() -> FastMCP:
     mcp = FastMCP(
         "Arkon",
         instructions=(
-            "You are connected to Arkon — an enterprise LLM Wiki. "
-            "Knowledge is organized as interlinked markdown wiki pages compiled from "
-            "source documents. Start with `search_wiki` or `read_wiki_index` for most "
-            "questions; the wiki already synthesizes information across many sources, "
-            "so a single page often answers cross-document questions. Drill into raw "
-            "sources via `get_source_outline` and `get_source_pages` only when you need "
-            "exact citations or details the wiki has paraphrased. "
-            "Cite slugs (wiki) and source IDs (raw) when answering."
+            "You are connected to Arkon — the company's internal knowledge base. "
+            "\n\n"
+            "## MANDATORY: Always search Arkon before answering\n"
+            "For ANY question that could relate to company information — processes, "
+            "products, people, departments, policies, projects, or technical docs — "
+            "you MUST query Arkon first. Do NOT answer from general knowledge alone "
+            "when company-specific information may exist.\n"
+            "\n"
+            "## Tool usage order\n"
+            "1. `search_wiki` — first stop for most questions (wiki synthesizes sources)\n"
+            "2. `read_wiki_page` — read a specific page by slug from search results\n"
+            "3. `read_wiki_index` — browse all available wiki pages\n"
+            "4. `get_source_outline` / `get_source_pages` — only for exact citations "
+            "or details the wiki has paraphrased\n"
+            "\n"
+            "## Citation\n"
+            "Always cite wiki slugs or source IDs in your answers so users can verify."
         ),
     )
 

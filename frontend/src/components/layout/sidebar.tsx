@@ -14,6 +14,7 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import { NotificationBell } from "@/components/notifications/notification-bell";
 
 /* ─── Types ─── */
 
@@ -63,8 +64,9 @@ const navSections: NavSection[] = [
   {
     id: "system",
     label: "System",
-    requiredPermissions: ["org:audit:read", "org:settings:read"],
+    requiredPermissions: ["org:audit:read", "org:settings:read", "org:settings:manage"],
     items: [
+      { label: "Statistics", href: "/admin/statistics", icon: "analytics", requiredPermissions: ["org:settings:manage"] },
       { label: "Audit Log", href: "/audit", icon: "policy", requiredPermissions: ["org:audit:read"] },
       { label: "Settings", href: "/settings", icon: "settings", requiredPermissions: ["org:settings:read"] },
     ],
@@ -324,9 +326,9 @@ function OrgHeader({
   };
 
   return (
-    <div className="px-2 py-1 mb-1">
+    <div className="px-2 py-1 mb-1 flex items-center gap-1">
       <DropdownMenu>
-        <DropdownMenuTrigger className="flex items-center gap-2.5 rounded-md px-1.5 py-1.5 hover:bg-black/[0.03] transition-colors cursor-pointer min-w-0 w-full">
+        <DropdownMenuTrigger className="flex items-center gap-2.5 rounded-md px-1.5 py-1.5 hover:bg-black/[0.03] transition-colors cursor-pointer min-w-0 flex-1">
           <Image
             src="/logo.png"
             alt="Arkon"
@@ -368,6 +370,9 @@ function OrgHeader({
           </DropdownMenuItem>
         </DropdownMenuContent>
       </DropdownMenu>
+      {/* Notification bell — sits in the sidebar header because the portal
+          layout has no top header bar. */}
+      <NotificationBell />
     </div>
   );
 }

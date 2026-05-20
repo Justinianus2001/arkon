@@ -41,11 +41,16 @@ class StorageService:
         """
         if self._presign_client is None:
             public = settings.minio_public_endpoint or settings.minio_endpoint
+            # When a public endpoint is explicitly set, we're behind a reverse
+            # proxy that terminates TLS — presigned URLs must use https://.
+            presign_secure = (
+                True if settings.minio_public_endpoint else settings.minio_secure
+            )
             client = Minio(
                 endpoint=public,
                 access_key=settings.minio_access_key,
                 secret_key=settings.minio_secret_key,
-                secure=settings.minio_secure,
+                secure=presign_secure,
             )
             client._region_map[settings.minio_bucket] = "us-east-1"
             self._presign_client = client

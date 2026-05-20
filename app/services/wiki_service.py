@@ -75,39 +75,68 @@ def extract_wikilinks(content_md: str) -> list[str]:
 
 async def refresh_links(
     session: AsyncSession,
+    from_page_id: uuid.UUID,
     from_slug: str,
     content_md: str,
 ) -> None:
     """
-    Replace all outgoing edges from `from_slug` with the wikilinks parsed from
-    its current `content_md`. Self-links and links pointing to the page itself
-    are dropped to keep the graph sane.
+    Replace all outgoing edges from the page identified by `from_page_id` with
+    wikilinks parsed from its current `content_md`. Self-links (matching the
+    page's own slug) are dropped to keep the graph sane.
     """
     await session.execute(
-        delete(WikiLink).where(WikiLink.from_slug == from_slug)
+        delete(WikiLink).where(WikiLink.from_page_id == from_page_id)
     )
     targets = [s for s in extract_wikilinks(content_md) if s != from_slug]
     if not targets:
         return
     await session.execute(
         pg_insert(WikiLink)
-        .values([{"from_slug": from_slug, "to_slug": t} for t in targets])
+        .values([{"from_page_id": from_page_id, "to_slug": t} for t in targets])
         .on_conflict_do_nothing()
     )
 
 
-async def get_backlinks(session: AsyncSession, slug: str) -> list[str]:
-    """Slugs of pages that link to `slug`."""
-    result = await session.execute(
-        select(WikiLink.from_slug).where(WikiLink.to_slug == slug)
+async def get_backlinks(
+    session: AsyncSession,
+    slug: str,
+    scope_type: Optional[str] = None,
+    scope_id: Optional[uuid.UUID] = None,
+) -> list[str]:
+    """Slugs of pages that link to `slug`.
+
+    If scope filters are given, only return slugs of origin pages in the same
+    scope OR in global scope (global referrers are visible from any scope).
+    """
+    stmt = (
+        select(WikiPage.slug)
+        .join(WikiLink, WikiLink.from_page_id == WikiPage.id)
+        .where(WikiLink.to_slug == slug)
     )
+    if scope_type is not None:
+        stmt = stmt.where(
+            or_(
+                and_(WikiPage.scope_type == scope_type, WikiPage.scope_id == scope_id) if scope_id is not None
+                else and_(WikiPage.scope_type == scope_type, WikiPage.scope_id.is_(None)),
+                and_(WikiPage.scope_type == "global", WikiPage.scope_id.is_(None)),
+            )
+        )
+    result = await session.execute(stmt.distinct())
     return [row[0] for row in result.all()]
 
 
-async def get_outlinks(session: AsyncSession, slug: str) -> list[str]:
-    """Slugs that `slug` links to."""
+async def get_outlinks(
+    session: AsyncSession,
+    slug: str,
+    scope_type: str = "global",
+    scope_id: Optional[uuid.UUID] = None,
+) -> list[str]:
+    """Slugs that the page (`slug`, scope) links to."""
+    page = await get_page_by_slug(session, slug, scope_type=scope_type, scope_id=scope_id)
+    if page is None:
+        return []
     result = await session.execute(
-        select(WikiLink.to_slug).where(WikiLink.from_slug == slug)
+        select(WikiLink.to_slug).where(WikiLink.from_page_id == page.id)
     )
     return [row[0] for row in result.all()]
 
@@ -122,18 +151,29 @@ async def get_neighborhood(
     Uses an undirected recursive CTE — useful for Obsidian-style graph view.
     """
     depth = max(1, min(depth, 3))  # cap at 3 hops to keep queries cheap
-    # Recursive CTE walking both directions; stop at depth.
+    # Recursive CTE walking both directions over (origin_slug, target_slug)
+    # tuples derived from wiki_links joined with wiki_pages on from_page_id.
+    # WITH RECURSIVE is required because `walk` self-references inside its
+    # own definition. Without the RECURSIVE keyword Postgres treats `walk` as
+    # not-yet-defined when it parses the second arm of the UNION, raising
+    # `relation "walk" does not exist`. The `edges` non-recursive CTE is
+    # allowed in the same WITH clause as long as RECURSIVE is set once.
     cte_sql = text(
         """
-        WITH RECURSIVE walk(slug, dist) AS (
+        WITH RECURSIVE edges AS (
+            SELECT wp.slug AS from_slug, wl.to_slug AS to_slug
+            FROM wiki_links wl
+            JOIN wiki_pages wp ON wp.id = wl.from_page_id
+        ),
+        walk(slug, dist) AS (
             SELECT CAST(:start AS varchar), 0
           UNION
             SELECT
-              CASE WHEN l.from_slug = w.slug THEN l.to_slug ELSE l.from_slug END,
+              CASE WHEN e.from_slug = w.slug THEN e.to_slug ELSE e.from_slug END,
               w.dist + 1
             FROM walk w
-            JOIN wiki_links l
-              ON l.from_slug = w.slug OR l.to_slug = w.slug
+            JOIN edges e
+              ON e.from_slug = w.slug OR e.to_slug = w.slug
             WHERE w.dist < :depth
         )
         SELECT DISTINCT slug FROM walk
@@ -153,8 +193,9 @@ async def get_neighborhood(
         for r in pages_result.all()
     ]
     edges_result = await session.execute(
-        select(WikiLink.from_slug, WikiLink.to_slug)
-        .where(and_(WikiLink.from_slug.in_(slugs), WikiLink.to_slug.in_(slugs)))
+        select(WikiPage.slug.label("from_slug"), WikiLink.to_slug)
+        .join(WikiLink, WikiLink.from_page_id == WikiPage.id)
+        .where(and_(WikiPage.slug.in_(slugs), WikiLink.to_slug.in_(slugs)))
     )
     edges = [{"from": r.from_slug, "to": r.to_slug} for r in edges_result.all()]
     return {"nodes": nodes, "edges": edges}
@@ -351,7 +392,7 @@ async def apply_create(
     _ = embedding  # backward-compat parameter, ignored
     session.add(page)
     await session.flush()
-    await refresh_links(session, slug, content_md)
+    await refresh_links(session, page.id, slug, content_md)
     session.add(WikiPageRevision(
         page_id=page.id, version=page.version,
         content_md=content_md, change_type="agent_compile",
@@ -400,7 +441,7 @@ async def apply_update(
     _ = embedding
     page.version = (page.version or 1) + 1
     await session.flush()
-    await refresh_links(session, slug, new_content_md)
+    await refresh_links(session, page.id, slug, new_content_md)
     session.add(WikiPageRevision(
         page_id=page.id, version=page.version,
         content_md=new_content_md, change_type="agent_compile",
@@ -549,7 +590,7 @@ async def append_log(
 
 async def delete_page_cascade(
     session: AsyncSession,
-    slug: str,
+    page: WikiPage,
 ) -> None:
     """
     Delete a wiki page and cascade-cleanup all references:
@@ -557,25 +598,53 @@ async def delete_page_cascade(
     2. Delete all incoming links pointing to this page
     3. Remove [[slug]] and [[slug|text]] wikilinks from pages that reference this one
     4. Delete the page itself
-    """
-    # 1+2: Remove all wikilink edges
-    await session.execute(
-        delete(WikiLink).where(
-            (WikiLink.from_slug == slug) | (WikiLink.to_slug == slug)
-        )
-    )
 
-    # 3: Find pages that reference this slug in their content and clean up
-    # Look for [[slug]] or [[slug|display text]] patterns
-    referring_pages = (await session.execute(
-        select(WikiPage).where(
-            WikiPage.content_md.contains(f"[[{slug}]]")
-            | WikiPage.content_md.contains(f"[[{slug}|")
+    Caller passes the already-resolved page so we never accidentally fall back
+    to a different scope's copy of the same slug.
+    """
+    slug = page.slug
+    del_scope_type = page.scope_type or "global"
+    del_scope_id = page.scope_id
+
+    # 1+2: Remove edges. Outgoing edges from this page cascade via FK. Incoming
+    # edges (to this slug) are removed only from referrers in the same scope
+    # OR from global referrers (which logically point at the deleted page if
+    # it is global) — leave edges in other scopes intact because they target
+    # *that* scope's same-slug page, not the one we're deleting.
+    if del_scope_type == "global":
+        # Deleting a global page invalidates ALL [[slug]] references because
+        # those links resolve to global by default. Clear all incoming edges.
+        await session.execute(
+            delete(WikiLink).where(WikiLink.to_slug == slug)
         )
-    )).scalars().all()
+    else:
+        same_scope_pages = select(WikiPage.id).where(
+            WikiPage.scope_type == del_scope_type,
+            WikiPage.scope_id == del_scope_id,
+        )
+        await session.execute(
+            delete(WikiLink).where(
+                WikiLink.to_slug == slug,
+                WikiLink.from_page_id.in_(same_scope_pages),
+            )
+        )
+
+    # 3: Find pages that reference this slug in their content and clean up.
+    # Scope the scrub the same way: only rewrite same-scope pages (and globals
+    # when deleting a global page).
+    ref_stmt = select(WikiPage).where(
+        WikiPage.content_md.contains(f"[[{slug}]]")
+        | WikiPage.content_md.contains(f"[[{slug}|")
+    )
+    if del_scope_type != "global":
+        ref_stmt = ref_stmt.where(
+            WikiPage.scope_type == del_scope_type,
+            WikiPage.scope_id == del_scope_id,
+        )
+    referring_pages = (await session.execute(ref_stmt)).scalars().all()
 
     for ref_page in referring_pages:
-        if ref_page.slug == slug:
+        if ref_page.id == page.id:
             continue
         cleaned = ref_page.content_md or ""
         # Replace [[slug|display]] with just display text
@@ -588,10 +657,8 @@ async def delete_page_cascade(
         cleaned = cleaned.replace(f"[[{slug}]]", slug.split("/")[-1])
         ref_page.content_md = cleaned
 
-    # 4: Delete the page
-    page = await get_page_by_slug(session, slug)
-    if page:
-        await session.delete(page)
+    # 4: Delete the page itself
+    await session.delete(page)
 
     await session.flush()
     logger.info(f"delete_page_cascade({slug}): deleted page + cleaned {len(referring_pages)} references")
@@ -632,16 +699,36 @@ async def detach_source_from_wiki(
 # Draft workflow
 # ---------------------------------------------------------------------------
 
+class DraftConflictError(Exception):
+    """Raised when a draft's base_version is older than the current page version."""
+    def __init__(self, current_version: int, base_version: int):
+        self.current_version = current_version
+        self.base_version = base_version
+        super().__init__(
+            f"Draft is based on v{base_version} but the page has advanced to "
+            f"v{current_version}. Re-base the draft against the latest content."
+        )
+
+
 async def create_draft(
     session: AsyncSession,
-    page_id: uuid.UUID,
+    page_id: Optional[uuid.UUID],
     author_id: uuid.UUID,
     content_md: str,
     note: Optional[str] = None,
     source: str = "web_ui",
     source_metadata: Optional[dict] = None,
+    base_version: Optional[int] = None,
+    draft_kind: str = "edit",
+    suggested_metadata: Optional[dict] = None,
 ) -> WikiPageDraft:
-    """Create a pending draft for editor review."""
+    """Create a pending draft for editor review.
+
+    For draft_kind='edit', page_id is required. For 'create', page_id stays
+    None and suggested_metadata holds the contributor's proposed slug/title/
+    page_type/knowledge_type_slugs/scope. The reviewer can override the
+    metadata at approve time before the page is materialised.
+    """
     draft = WikiPageDraft(
         page_id=page_id,
         author_id=author_id,
@@ -650,10 +737,26 @@ async def create_draft(
         status="pending",
         source=source,
         source_metadata=source_metadata,
+        base_version=base_version,
+        draft_kind=draft_kind,
+        suggested_metadata=suggested_metadata,
     )
     session.add(draft)
     await session.flush()
     return draft
+
+
+class CreateDraftSlugConflict(Exception):
+    """Raised when approving a create-draft whose slug already exists in scope."""
+    def __init__(self, slug: str, scope_type: str, scope_id: Optional[uuid.UUID]):
+        self.slug = slug
+        self.scope_type = scope_type
+        self.scope_id = scope_id
+        scope_label = scope_type if scope_id is None else f"{scope_type}:{scope_id}"
+        super().__init__(
+            f"Slug '{slug}' already exists in {scope_label}. "
+            "Override final_slug, or have the contributor edit the existing page instead."
+        )
 
 
 async def approve_draft(
@@ -662,31 +765,118 @@ async def approve_draft(
     reviewer_id: uuid.UUID,
     reviewer_note: Optional[str] = None,
     edited_content_md: Optional[str] = None,
+    allow_conflict: bool = False,
+    metadata_overrides: Optional[dict] = None,
 ) -> WikiPage:
     """
     Approve a pending draft. Writes the final content to wiki_pages.content_md,
     creates a revision, and marks the draft approved.
     If edited_content_md is provided, that is used instead of the original draft content.
+
+    For draft_kind='create' the page is materialised from
+    `draft.suggested_metadata` (or the reviewer-supplied `metadata_overrides`)
+    using `apply_create`. The reviewer may override slug / title / page_type /
+    knowledge_type_slugs before commit.
+
+    Raises DraftConflictError when an edit draft was authored against an older
+    page version than the current one, unless `allow_conflict=True` or
+    `edited_content_md` is supplied. Raises CreateDraftSlugConflict when a
+    create draft's chosen slug already exists in the target scope.
     """
-    page = await session.get(WikiPage, draft.page_id)
-    if page is None:
-        raise ValueError(f"Wiki page {draft.page_id} not found")
-
     final_content = edited_content_md.strip() if edited_content_md else draft.content_md
-    page.content_md = final_content
-    page.version = (page.version or 1) + 1
-    await session.flush()
-    await refresh_links(session, page.slug, final_content)
 
-    session.add(WikiPageRevision(
-        page_id=page.id,
-        version=page.version,
-        content_md=final_content,
-        change_type="draft_approved",
-        draft_id=draft.id,
-        changed_by_id=reviewer_id,
-        change_note=reviewer_note,
-    ))
+    # Serialise concurrent approves on the same page. Without this, two
+    # reviewers clicking Approve on different pending drafts of the same
+    # page within the same second can both read page.version=N, both set
+    # N+1, and both INSERT a WikiPageRevision(version=N+1) — leaving a
+    # duplicate revision row and a non-deterministic last-writer-wins for
+    # the page content. Lock by slug (when known) so we don't block the
+    # entire page table.
+    target_slug: Optional[str] = None
+    if draft.draft_kind == "create":
+        target_slug = (draft.suggested_metadata or {}).get("slug")
+    else:
+        existing_page = await session.get(WikiPage, draft.page_id) if draft.page_id else None
+        target_slug = existing_page.slug if existing_page else None
+    if target_slug:
+        await session.execute(
+            select(func.pg_advisory_xact_lock(func.hashtext(target_slug)))
+        )
+
+    if draft.draft_kind == "create":
+        meta = dict(draft.suggested_metadata or {})
+        overrides = metadata_overrides or {}
+        slug = (overrides.get("final_slug") or meta.get("slug") or "").strip()
+        title = (overrides.get("final_title") or meta.get("title") or "").strip()
+        page_type = overrides.get("final_page_type") or meta.get("page_type") or "concept"
+        kt_slugs = (
+            overrides.get("final_knowledge_type_slugs")
+            if overrides.get("final_knowledge_type_slugs") is not None
+            else meta.get("knowledge_type_slugs") or []
+        )
+        scope_type = meta.get("scope_type") or "global"
+        scope_id_raw = meta.get("scope_id")
+        try:
+            scope_id = uuid.UUID(scope_id_raw) if isinstance(scope_id_raw, str) else scope_id_raw
+        except ValueError:
+            scope_id = None
+
+        if not slug or slug in (INDEX_SLUG, LOG_SLUG):
+            raise ValueError(f"Invalid slug for new page: '{slug}'")
+        if not title:
+            raise ValueError("Title is required to materialise a new page")
+
+        existing = await get_page_by_slug(session, slug, scope_type=scope_type, scope_id=scope_id)
+        if existing is not None:
+            raise CreateDraftSlugConflict(slug, scope_type, scope_id)
+
+        page = await apply_create(
+            session,
+            slug=slug, title=title, page_type=page_type,
+            content_md=final_content, summary="",
+            knowledge_type_slugs=list(kt_slugs), source_ids=[],
+            scope_type=scope_type, scope_id=scope_id,
+        )
+        # Tag the create-approval revision with reviewer context.
+        session.add(WikiPageRevision(
+            page_id=page.id,
+            version=page.version,
+            content_md=final_content,
+            change_type="draft_approved_create",
+            draft_id=draft.id,
+            changed_by_id=reviewer_id,
+            change_note=reviewer_note,
+        ))
+        # Backfill draft.page_id so subsequent UI reads can join cleanly.
+        draft.page_id = page.id
+    else:
+        page = await session.get(WikiPage, draft.page_id) if draft.page_id else None
+        if page is None:
+            raise ValueError(f"Wiki page {draft.page_id} not found")
+
+        if (
+            not allow_conflict
+            and edited_content_md is None
+            and draft.base_version is not None
+            and page.version is not None
+            and draft.base_version < page.version
+        ):
+            raise DraftConflictError(page.version, draft.base_version)
+
+        page.content_md = final_content
+        page.version = (page.version or 1) + 1
+        await session.flush()
+        await refresh_links(session, page.id, page.slug, final_content)
+
+        session.add(WikiPageRevision(
+            page_id=page.id,
+            version=page.version,
+            content_md=final_content,
+            change_type="draft_approved",
+            draft_id=draft.id,
+            changed_by_id=reviewer_id,
+            change_note=reviewer_note,
+        ))
 
     draft.status = "approved"
     draft.reviewed_by_id = reviewer_id
@@ -725,7 +915,7 @@ async def direct_edit_page(
     page.content_md = content_md
     page.version = (page.version or 1) + 1
     await session.flush()
-    await refresh_links(session, page.slug, content_md)
+    await refresh_links(session, page.id, page.slug, content_md)
 
     session.add(WikiPageRevision(
         page_id=page.id,
@@ -761,7 +951,7 @@ async def rollback_to_revision(
     page.content_md = revision.content_md
     page.version = (page.version or 1) + 1
     await session.flush()
-    await refresh_links(session, page.slug, revision.content_md)
+    await refresh_links(session, page.id, page.slug, revision.content_md)
 
     session.add(WikiPageRevision(
         page_id=page.id,

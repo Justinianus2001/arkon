@@ -790,6 +790,8 @@ async def run_refine_phase(
 
     await tracker.update(78, f"Writing {len(pages_spec)} wiki pages...")
 
+    from app.database import async_session_factory
+
     semaphore = asyncio.Semaphore(MAX_WRITER_CONCURRENCY)
     session_lock = asyncio.Lock()
 
@@ -804,58 +806,62 @@ async def run_refine_phase(
             # Assemble evidence
             evidence = assemble_evidence(plan_item, all_claims, full_text)
 
-            # Fetch existing content for UPDATE
-            existing_content: Optional[str] = None
-            if action == "UPDATE":
-                async with session_lock:
+            # Each writer owns its own AsyncSession — SQLAlchemy AsyncSession is not
+            # safe for concurrent use, so sharing the orchestrator's session across
+            # the asyncio.gather fan-out previously caused race conditions when
+            # multiple writers hit the DB at the same time.
+            async with async_session_factory() as worker_session:
+                # Fetch existing content for UPDATE
+                existing_content: Optional[str] = None
+                if action == "UPDATE":
                     existing_page = await wiki_service.get_page_by_slug(
-                        session, slug, scope_type=scope_type, scope_id=scope_id,
+                        worker_session, slug, scope_type=scope_type, scope_id=scope_id,
                     )
-                if existing_page:
-                    existing_content = existing_page.content_md
+                    if existing_page:
+                        existing_content = existing_page.content_md
 
-            # Choose writer mode
-            is_complex = (
-                len(evidence) > WRITER_COMPLEX_THRESHOLD_EVIDENCE
-                or len(existing_content or "") > WRITER_COMPLEX_THRESHOLD_EXISTING_CHARS
-            )
+                # Choose writer mode
+                is_complex = (
+                    len(evidence) > WRITER_COMPLEX_THRESHOLD_EVIDENCE
+                    or len(existing_content or "") > WRITER_COMPLEX_THRESHOLD_EXISTING_CHARS
+                )
 
-            # Build source context for the writer
-            source_context = _build_source_context(full_text, evidence, llm=llm)
-            image_markers = _collect_relevant_image_markers(evidence, full_text)
+                # Build source context for the writer
+                source_context = _build_source_context(full_text, evidence, llm=llm)
+                image_markers = _collect_relevant_image_markers(evidence, full_text)
 
-            try:
-                if is_complex:
-                    content_md, summary, citations = await _write_page_complex(
-                        llm, plan_item, evidence, existing_content, full_text, session, session_lock, source,
-                        all_plan_slugs=all_plan_slugs,
-                    )
-                else:
-                    content_md, summary, citations = await _write_page_simple(
-                        llm, plan_item, evidence, existing_content,
-                        all_plan_slugs=all_plan_slugs,
-                        source_context=source_context,
-                        image_markers=image_markers,
-                    )
-            except Exception as e:
-                err_msg = f"{type(e).__name__}: {str(e)}"
-                logger.error(f"MRP REFINE writer failed for '{slug}': {err_msg}")
-                # Return minimal stub so COMMIT can still proceed
-                content_md = f"# {title}\n\n(Page generation failed: {err_msg[:200]})"
-                summary = title
-                citations = []
+                try:
+                    if is_complex:
+                        content_md, summary, citations = await _write_page_complex(
+                            llm, plan_item, evidence, existing_content, full_text, worker_session, source,
+                            all_plan_slugs=all_plan_slugs,
+                        )
+                    else:
+                        content_md, summary, citations = await _write_page_simple(
+                            llm, plan_item, evidence, existing_content,
+                            all_plan_slugs=all_plan_slugs,
+                            source_context=source_context,
+                            image_markers=image_markers,
+                        )
+                except Exception as e:
+                    err_msg = f"{type(e).__name__}: {str(e)}"
+                    logger.error(f"MRP REFINE writer failed for '{slug}': {err_msg}")
+                    # Return minimal stub so COMMIT can still proceed
+                    content_md = f"# {title}\n\n(Page generation failed: {err_msg[:200]})"
+                    summary = title
+                    citations = []
 
-            return PageWriteResult(
-                slug=slug,
-                title=title,
-                page_type=page_type,
-                action=action,
-                content_md=content_md,
-                summary=summary,
-                citations=citations,
-                entity_names=plan_item.get("entity_names", []),
-                related_kb_pages=related_kb_pages,
-            )
+                return PageWriteResult(
+                    slug=slug,
+                    title=title,
+                    page_type=page_type,
+                    action=action,
+                    content_md=content_md,
+                    summary=summary,
+                    citations=citations,
+                    entity_names=plan_item.get("entity_names", []),
+                    related_kb_pages=related_kb_pages,
+                )
 
     results = await asyncio.gather(*[_write_one(p) for p in pages_spec])
     page_results = [r for r in results if r is not None]

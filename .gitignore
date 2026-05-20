@@ -61,3 +61,6 @@ uv.lock
 
 # Ai Client
 .claude/
+
+# Nginx
+nginx/

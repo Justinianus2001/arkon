@@ -4,7 +4,7 @@ import React from "react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { EmptyState } from "@/components/shared/empty-state";
-import { ScopeMembersDialog } from "@/components/shared/scope-members-dialog";
+import { DeptMembersDialog } from "@/components/departments/dept-members-dialog";
 
 type Department = {
   id: string;
@@ -80,15 +80,15 @@ export function DepartmentCards({ departments, loading, onEdit, onRefresh }: Pro
             </p>
           )}
 
-          <div className="flex gap-2 mt-auto pt-2 border-t border-border">
+          <div className="flex flex-wrap gap-2 mt-auto pt-2 border-t border-border">
             <Button
               variant="ghost"
               size="sm"
               onClick={() => setScopeDept(dept)}
               className="text-xs"
             >
-              <span className="material-symbols-outlined text-sm mr-1">lock</span>
-              Access
+              <span className="material-symbols-outlined text-sm mr-1">group</span>
+              Members
             </Button>
             <Button
               variant="ghost"
@@ -113,12 +113,11 @@ export function DepartmentCards({ departments, loading, onEdit, onRefresh }: Pro
       ))}
 
       {scopeDept && (
-        <ScopeMembersDialog
+        <DeptMembersDialog
           open={!!scopeDept}
           onOpenChange={(open) => { if (!open) setScopeDept(null); }}
-          label={scopeDept.name}
-          scopeType="department"
-          scopeId={scopeDept.id}
+          deptId={scopeDept.id}
+          deptName={scopeDept.name}
         />
       )}
     </div>

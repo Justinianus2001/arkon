@@ -25,7 +25,7 @@ function wikiUrlTransform(url: string): string {
   return "";
 }
 
-function preprocessWikilinks(md: string): string {
+export function preprocessWikilinks(md: string): string {
   return md
     .replace(/\[\[([^\]|]+)\|([^\]]+)\]\]/g, "[$2](/wiki/$1)")
     .replace(/\[\[([^\]]+)\]\]/g, "[$1](/wiki/$1)");
@@ -71,9 +71,13 @@ function extractHeadings(md: string): { id: string; text: string; level: number 
 export function WikiContent({
   markdown,
   onWikiLinkClick,
+  linkSuffix = "",
 }: {
   markdown: string;
   onWikiLinkClick?: (slug: string) => void;
+  /** Suffix appended to /wiki/<slug> links rendered from `[[wikilinks]]`
+   *  so inline navigation preserves the current scope context. */
+  linkSuffix?: string;
 }) {
   const processed = preprocessWikilinks(markdown);
   const headings = React.useMemo(() => extractHeadings(markdown), [markdown]);
@@ -211,7 +215,7 @@ export function WikiContent({
                 }
                 return (
                   <Link
-                    href={href}
+                    href={`${href}${linkSuffix}`}
                     className="text-primary underline underline-offset-2 hover:text-primary/80 transition-colors"
                   >
                     {children}

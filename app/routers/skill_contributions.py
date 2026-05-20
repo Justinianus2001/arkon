@@ -24,14 +24,38 @@ from app.database.models import (
     SkillVersion,
 )
 from app.routers.skills import is_text_file
+from app.services import contribution_service
 from app.services.auth_service import (
     get_current_user,
     require_permission,
+)
+from app.services.contribution_service import (
+    InvalidTransition,
+    skill_contribution_adapter,
 )
 from app.services.permission_engine import _get_user_permissions
 from app.services.skill_service import SkillService
 
 router = APIRouter()
+
+# A contribution's files can only be edited while it is a personal draft or
+# has been sent back for revisions. PENDING means it's in front of a reviewer
+# — silently demoting back to draft (the previous behaviour) hid changes from
+# the reviewer mid-review, so callers must explicitly withdraw or get
+# request-changes first. APPROVED/REJECTED/WITHDRAWN are terminal.
+EDITABLE_STATUSES = (
+    SkillContributionStatus.DRAFT.value,
+    SkillContributionStatus.NEEDS_REVISION.value,
+)
+
+
+def _assert_editable(contribution: SkillContribution) -> None:
+    if contribution.status not in EDITABLE_STATUSES:
+        raise HTTPException(
+            400,
+            f"Cannot edit contribution while status='{contribution.status}'. "
+            "Withdraw it (or ask a reviewer to request changes) before editing.",
+        )
 
 class SkillContributionCreate(BaseModel):
     skill_id: Optional[uuid.UUID] = None
@@ -290,22 +314,18 @@ async def rename_skill_contribution_file(
     
     if user.role != "admin" and str(contribution.contributor_id) != str(user.id):
         raise HTTPException(403, "Access denied")
-    
-    if contribution.status == SkillContributionStatus.APPROVED.value:
-        raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
+
+    _assert_editable(contribution)
 
     parts = old_path.strip("/").split("/")
     if len(parts) == 1:
         raise HTTPException(400, "Cannot rename the root folder.")
-    
+
     if old_path.endswith("SKILL.md"):
         raise HTTPException(400, "Cannot rename SKILL.md.")
 
     full_old_path = f"{contribution.storage_path}{old_path.lstrip('/')}"
     full_new_path = f"{contribution.storage_path}{new_path.lstrip('/')}"
-    
-    if contribution.status == SkillContributionStatus.PENDING.value:
-        contribution.status = SkillContributionStatus.DRAFT.value
 
     storage_service.move_prefix(full_old_path, full_new_path)
     await db.commit()
@@ -326,14 +346,10 @@ async def delete_skill_contribution_file(
     
     if user.role != "admin" and str(contribution.contributor_id) != str(user.id):
         raise HTTPException(403, "Access denied")
-    
-    if contribution.status == SkillContributionStatus.APPROVED.value:
-        raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
+
+    _assert_editable(contribution)
 
     full_path = f"{contribution.storage_path}{path.lstrip('/')}"
-    
-    if contribution.status == SkillContributionStatus.PENDING.value:
-        contribution.status = SkillContributionStatus.DRAFT.value
 
     storage_service.delete_prefix(full_path)
     await db.commit()
@@ -355,9 +371,8 @@ async def upload_skill_contribution_file(
     
     if current_user.role != "admin" and str(contribution.contributor_id) != str(current_user.id):
         raise HTTPException(403, "Access denied")
-    
-    if contribution.status == SkillContributionStatus.APPROVED.value:
-        raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
+
+    _assert_editable(contribution)
 
     file_path = path if path else file.filename
     
@@ -394,9 +409,6 @@ async def upload_skill_contribution_file(
     full_path = f"{contribution.storage_path}{file_path.lstrip('/')}"
     
     try:
-        if contribution.status == SkillContributionStatus.PENDING.value:
-            contribution.status = SkillContributionStatus.DRAFT.value
-            
         content = await file.read()
         storage_service.upload_file(full_path, content, content_type=file.content_type)
         await db.commit()
@@ -421,9 +433,8 @@ async def put_skill_contribution_file(
     if current_user.role != "admin" and str(contribution.contributor_id) != str(current_user.id):
         raise HTTPException(403, "Access denied")
 
-    if contribution.status == SkillContributionStatus.APPROVED.value:
-        raise HTTPException(400, f"Cannot edit contribution in status: {contribution.status}")
-    
+    _assert_editable(contribution)
+
     file_path = request.path
     content = request.content
     
@@ -459,9 +470,6 @@ async def put_skill_contribution_file(
 
     full_path = f"{contribution.storage_path}{file_path.lstrip('/')}"
 
-    if contribution.status == SkillContributionStatus.PENDING.value:
-        contribution.status = SkillContributionStatus.DRAFT.value
-
     storage_service.upload_file(full_path, content.encode("utf-8"), content_type="text/plain")
     await db.commit()
     return {"status": "ok", "path": file_path, "contribution_status": contribution.status}
@@ -476,11 +484,18 @@ async def submit_skill_contribution(
     contribution = await db.get(SkillContribution, contribution_id)
     if not contribution:
         raise HTTPException(404, "Contribution not found")
-    
-    if contribution.status == SkillContributionStatus.APPROVED.value:
-        raise HTTPException(400, "Contribution already approved")
+
+    if contribution.status not in (
+        SkillContributionStatus.DRAFT.value,
+        SkillContributionStatus.NEEDS_REVISION.value,
+    ):
+        raise HTTPException(400, f"Cannot submit contribution in status: {contribution.status}")
 
     contribution = await SkillService.submit_contribution(db, contribution_id)
+    await contribution_service.notify_submitted(
+        db, skill_contribution_adapter, contribution, user,
+    )
+    await db.commit()
     return {"status": contribution.status}
 
 @router.post("/skill-contributions/{contribution_id}/approve")
@@ -519,15 +534,23 @@ async def approve_skill_contribution(
     final_scope_ids = req.final_scope_ids if req else None
 
     skill = await SkillService.approve_contribution(
-        db, 
-        contribution_id, 
+        db,
+        contribution_id,
         admin.id,
         final_scope_type=final_scope_type,
         final_scope_ids=final_scope_ids
     )
+    # Refresh and notify the contributor of the good news.
+    contribution = await db.get(SkillContribution, contribution_id)
+    if contribution:
+        await contribution_service.notify_approved(
+            db, skill_contribution_adapter, contribution, admin,
+            version_label=f"v{skill.current_version}",
+        )
+        await db.commit()
     return {
-        "status": "approved", 
-        "skill_id": skill.id, 
+        "status": "approved",
+        "skill_id": skill.id,
         "skill_slug": skill.slug,
         "version": skill.current_version
     }
@@ -540,9 +563,79 @@ async def reject_skill_contribution(
 ):
     """Reject a skill contribution request (moves back to draft)."""
     contribution = await SkillService.reject_contribution(db, contribution_id)
-    if contribution.status in [SkillContributionStatus.APPROVED.value,SkillContributionStatus.REJECTED.value]:
+    if contribution.status in [SkillContributionStatus.APPROVED.value, SkillContributionStatus.REJECTED.value]:
         raise HTTPException(400, "Contribution already approved")
-    
+    await contribution_service.notify_rejected(
+        db, skill_contribution_adapter, contribution, admin,
+    )
+    await db.commit()
+    return {"status": contribution.status}
+
+
+# ---------------------------------------------------------------------------
+# needs_revision flow — request changes, resubmit, withdraw
+# ---------------------------------------------------------------------------
+
+class RequestChangesSkillRequest(BaseModel):
+    reviewer_note: str
+
+
+@router.post("/skill-contributions/{contribution_id}/request-changes")
+async def request_changes_on_skill_contribution(
+    contribution_id: uuid.UUID,
+    req: RequestChangesSkillRequest,
+    db: AsyncSession = Depends(get_db),
+    admin: Employee = require_permission("skill:contribution:review"),
+):
+    """Send a pending skill contribution back to its contributor for changes."""
+    contribution = await db.get(SkillContribution, contribution_id)
+    if not contribution:
+        raise HTTPException(404, "Contribution not found")
+    try:
+        await contribution_service.request_changes(
+            db, skill_contribution_adapter, contribution, admin, req.reviewer_note,
+        )
+    except InvalidTransition as e:
+        raise HTTPException(400, str(e))
+    await db.commit()
+    return {"status": contribution.status, "revision_round": contribution.revision_round}
+
+
+@router.post("/skill-contributions/{contribution_id}/resubmit")
+async def resubmit_skill_contribution(
+    contribution_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = Depends(get_current_user),
+):
+    """Contributor resubmits after changes. Flips status back to pending."""
+    contribution = await db.get(SkillContribution, contribution_id)
+    if not contribution:
+        raise HTTPException(404, "Contribution not found")
+    try:
+        await contribution_service.resubmit_skill_contribution(db, contribution, user)
+    except InvalidTransition as e:
+        raise HTTPException(400, str(e))
+    await db.commit()
+    return {"status": contribution.status, "revision_round": contribution.revision_round}
+
+
+@router.post("/skill-contributions/{contribution_id}/withdraw")
+async def withdraw_skill_contribution(
+    contribution_id: uuid.UUID,
+    db: AsyncSession = Depends(get_db),
+    user: Employee = Depends(get_current_user),
+):
+    """Contributor withdraws a pending or needs_revision contribution."""
+    contribution = await db.get(SkillContribution, contribution_id)
+    if not contribution:
+        raise HTTPException(404, "Contribution not found")
+    try:
+        await contribution_service.withdraw(
+            db, skill_contribution_adapter, contribution, user,
+        )
+    except InvalidTransition as e:
+        raise HTTPException(403, str(e))
+    await db.commit()
     return {"status": contribution.status}
 
 @router.get("/skill-contributions/{contribution_id}/diff-status")

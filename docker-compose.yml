@@ -74,12 +74,27 @@ services:
 
   # ── Application ───────────────────────────────────────────────
 
+  migrator:
+    <<: *backend
+    container_name: arkon_migrator
+    command: alembic upgrade head
+    restart: "no"
+
   api:
     <<: *backend
     container_name: arkon_api
+    depends_on:
+      migrator:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
     ports:
       - "5055:5055"
-    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 5055
+    command: python -m uvicorn app.main:app --host 0.0.0.0 --port 5055 --proxy-headers --forwarded-allow-ips='*'
     healthcheck:
       test: ["CMD", "python", "-c",
              "import urllib.request; urllib.request.urlopen('http://localhost:5055/health')"]

@@ -4,7 +4,7 @@ export type ScopeType = "global" | "project" | "department" | "team";
 
 type Props = {
   scopeType?: ScopeType | string;
-  scopeId?: string;
+  scopeId?: string | null;
   className?: string;
 };
 

@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 import { useAuth } from "@/lib/auth";
 import { PageHeader } from "@/components/shared/page-header";
 import { EmbeddingSettingsCard } from "@/components/settings/embedding-settings-card";
+import { NotificationChannelsCard } from "@/components/settings/notification-channels-card";
 import {
   ModelCatalogCard,
   type ModelSpec,
@@ -95,6 +96,8 @@ export default function SettingsPage() {
           apiKeyConfigKey="vision_api_key"
           renderMeta={visionMeta}
         />
+
+        <NotificationChannelsCard />
       </div>
     </>
   );

@@ -1,39 +1,78 @@
 # MCP & Claude Integration
 
-Arkon exposes a Model Context Protocol (MCP) server at `/mcp`. Employees connect Claude Desktop — or any MCP-compatible client — using a personal token. Claude then has access to the compiled wiki, raw source documents, and AI skills, all filtered to the employee's permission scope.
+Arkon exposes a Model Context Protocol (MCP) server at `/mcp`. Employees connect Claude Desktop — or any MCP-compatible client — and Claude gets access to the compiled wiki, raw source documents, and AI skills, all filtered to the employee's permission scope.
 
 ---
 
 ## Connecting Claude Desktop
 
-### Step 1 — Generate an MCP token
+Arkon uses **OAuth 2.1 with PKCE** — employees authenticate through a browser login instead of manually copying tokens into config files.
 
-In the Admin Portal: **Employees → [employee name] → Generate Token**
-
-The token starts with `ark_` and is shown only once. Copy it before closing.
-
-### Step 2 — Add to Claude Desktop config
+### Step 1 — Add Arkon to Claude Desktop config
 
 Locate the Claude Desktop config file:
 - **macOS:** `~/Library/Application Support/Claude/claude_desktop_config.json`
 - **Windows:** `%APPDATA%\Claude\claude_desktop_config.json`
 
-Add the Arkon server:
+Add the Arkon server — just the URL, no token needed:
 
 ```json
 {
   "mcpServers": {
     "arkon": {
-      "url": "https://your-arkon-server/mcp",
-      "headers": {
-        "Authorization": "Bearer ark_xxxxxxxxxxxxxxxxxxxx"
-      }
+      "url": "https://your-arkon-server/mcp"
     }
   }
 }
 ```
 
-For local development:
+### Step 2 — Restart Claude Desktop and connect
+
+Restart Claude Desktop. When you open a new chat, Claude will prompt you to connect to Arkon. Click **Connect** — a browser window opens with the Arkon login form.
+
+### Step 3 — Sign in
+
+Enter your Arkon email and password. After a successful login, the browser closes and Claude Desktop is connected. Arkon tools will appear in Claude's tool list.
+
+> **Behind the scenes:** Arkon implements RFC 8414 (OAuth Authorization Server Metadata), RFC 7591 (Dynamic Client Registration), and Authorization Code + PKCE (RFC 7636). Claude Desktop discovers the OAuth endpoints automatically from `/.well-known/oauth-authorization-server` and handles the full flow.
+
+---
+
+## Connecting Claude.ai (web)
+
+Claude.ai supports remote MCP connectors with OAuth. Go to **Claude.ai → Settings → Connectors → Add custom connector**:
+
+| Field | Value |
+|---|---|
+| Name | `Arkon` |
+| Remote MCP server URL | `https://your-arkon-server/mcp` |
+| OAuth Client ID | *(leave blank)* |
+| OAuth Client Secret | *(leave blank)* |
+
+Click **Add** — Claude.ai will discover the OAuth endpoints and redirect you to the Arkon login form.
+
+---
+
+## Authentication
+
+Every MCP request is authenticated via bearer token resolved from the OAuth flow. The token is tied to an employee identity that determines:
+- Which knowledge types the employee can access
+- Which departments' documents are visible
+- Which workspaces they are a member of
+- Whether they have write/review permissions
+
+Tokens can be revoked at any time from the Admin Portal (**Employees → [employee] → Revoke Token**).
+
+### Legacy: manual Bearer token (local dev / API testing)
+
+For local development or direct API testing you can still use a token directly. Generate one from the Admin Portal (**Employees → [employee] → Generate Token**) and pass it as a header:
+
+```
+Authorization: Bearer ark_xxxxxxxxxxxxxxxxxxxx
+```
+
+Or add it to `claude_desktop_config.json` manually:
+
 ```json
 {
   "mcpServers": {
@@ -47,27 +86,38 @@ For local development:
 }
 ```
 
-### Step 3 — Restart Claude Desktop
-
-Arkon tools will appear in Claude's tool list. The employee's wiki knowledge is immediately available.
+> **Note:** Claude Desktop's UI does not support custom headers directly — this only works by editing the config file manually.
 
 ---
 
-## Authentication
+## Getting Claude to consistently use Arkon
 
-Every MCP request is authenticated via bearer token:
+Claude doesn't always call MCP tools automatically. Two ways to improve this:
+
+### 1. MCP server instructions (built-in)
+
+Arkon's MCP server already sends instructions to Claude on connect, telling it to query Arkon first before answering company-related questions. This works automatically with no setup.
+
+### 2. Claude Desktop Custom Instructions (recommended)
+
+In Claude Desktop, go to **Settings → Custom Instructions** and add:
 
 ```
-Authorization: Bearer ark_xxxxxxxxxxxxxxxxxxxx
+Whenever answering questions related to the company — its processes, products,
+people, departments, policies, or projects — always search Arkon first using
+the search_wiki tool before relying on general knowledge.
 ```
 
-The token is resolved to an employee identity that determines:
-- Which knowledge types the employee can access
-- Which departments' documents are visible
-- Which workspaces they are a member of
-- Whether they have write/review permissions
+### 3. Claude Desktop Project Instructions (most effective)
 
-Tokens can be revoked at any time from the Admin Portal.
+Create a **Project** in Claude Desktop, add Arkon as a connector within that Project, and set Project Instructions. These act as a true system prompt scoped to that project:
+
+```
+You have access to the company knowledge base via Arkon.
+Before answering any question that might have a company-specific answer,
+call search_wiki to check Arkon. Always cite the wiki slug or source ID
+in your answer so the user can verify.
+```
 
 ---
 
@@ -277,13 +327,28 @@ For the exact wording from the original document, I can check:
 
 ---
 
+## Token management
+
+| Action | Where |
+|---|---|
+| View token status | Admin Portal → Employees → [employee] → Tokens |
+| Revoke token | Admin Portal → Employees → [employee] → Revoke Token |
+| Generate token manually | Admin Portal → Employees → [employee] → Generate Token |
+
+Self-service: employees can also manage their own token at **Profile → MCP Token**.
+
+---
+
 ## Troubleshooting MCP connections
 
 | Issue | Solution |
 |---|---|
-| Tools don't appear in Claude | Restart Claude Desktop after editing the config |
-| "Authentication required" error | Check that `Authorization: Bearer ark_...` header is set correctly |
-| "Invalid or inactive token" | Token may have been revoked; generate a new one |
-| Tools return empty results | Employee may have no accessible knowledge types — check their role in the portal |
-| Connection refused | Ensure the Arkon API is running and accessible from the client network |
+| "Couldn't connect" at start of OAuth flow | Arkon server not reachable, or OAuth endpoints not deployed — verify `GET /.well-known/oauth-authorization-server` returns JSON |
+| Login form shows `http://` URLs instead of `https://` | Uvicorn not started with `--proxy-headers` — ensure `X-Forwarded-Proto` is forwarded by your reverse proxy |
+| "Couldn't connect" after login | Token exchange failed — check server logs for errors in `/oauth/token` |
+| Tools don't appear in Claude | Restart Claude Desktop after config changes |
+| "Invalid or inactive token" | Token revoked — reconnect via OAuth to get a new one |
+| Tools return empty results | Employee has no accessible knowledge types — check their role in the Admin Portal |
+| Connection refused | Arkon API not running or not reachable from the client network |
 | HTTPS certificate errors | Configure a valid TLS certificate on your Arkon server |
+| Claude doesn't use Arkon tools | Add instructions in Claude Desktop Custom Instructions or Project Instructions (see above) |

@@ -110,6 +110,23 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+
+# --- Notification dispatch middleware ---
+# Initialise the per-request notification staging bucket at the start of every
+# HTTP request; flush to external channels (email, webhook) after the response
+# is built. Fire-and-forget — errors are swallowed by the dispatcher.
+
+@app.middleware("http")
+async def _notification_dispatch_mw(request, call_next):
+    from app.services import notification_service
+    notification_service.init_request_dispatch_scope()
+    response = await call_next(request)
+    try:
+        await notification_service.dispatch_pending()
+    except Exception as e:  # pragma: no cover — defensive, dispatcher already catches
+        logger.warning(f"Notification dispatch middleware failed: {e}")
+    return response
+
 # --- Mount MCP Server ---
 # Claude Desktop connects to: https://your-server/mcp
 app.mount("/mcp", mcp_http_app)
@@ -119,10 +136,13 @@ from app.routers import (  # noqa: E402
     admin_embeddings,
     admin_models,
     admin_settings,
+    admin_stats,
     audit,
     auth,
     knowledge_types,
     notes,
+    notifications,
+    oauth,
     projects,
     rbac,
     roles,
@@ -134,6 +154,8 @@ from app.routers import (  # noqa: E402
     wiki_images,
 )
 
+app.include_router(oauth.wellknown_router)
+app.include_router(oauth.router, prefix="/oauth", tags=["oauth"])
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(sources.router, prefix="/api", tags=["sources"])
 app.include_router(notes.router, prefix="/api", tags=["notes"])
@@ -143,6 +165,7 @@ app.include_router(wiki_images.router, prefix="/api", tags=["wiki"])
 app.include_router(admin_settings.router, prefix="/api", tags=["settings"])
 app.include_router(admin_embeddings.router, prefix="/api", tags=["settings"])
 app.include_router(admin_models.router, prefix="/api", tags=["settings"])
+app.include_router(admin_stats.router, prefix="/api", tags=["statistics"])
 app.include_router(rbac.router, prefix="/api", tags=["rbac"])
 app.include_router(knowledge_types.router, prefix="/api", tags=["knowledge-types"])
 app.include_router(projects.router, prefix="/api", tags=["projects"])
@@ -150,6 +173,7 @@ app.include_router(roles.router, prefix="/api", tags=["roles"])
 app.include_router(audit.router, prefix="/api", tags=["audit"])
 app.include_router(skills.router, prefix="/api", tags=["skills"])
 app.include_router(skill_contributions.router, prefix="/api", tags=["skill-contributions"])
+app.include_router(notifications.router, prefix="/api", tags=["notifications"])
 
 
 @app.get("/")

@@ -218,24 +218,42 @@ Use the `access_token` as `Authorization: Bearer <token>` for all admin API call
 ### MCP (Claude Desktop)
 | Path | Auth | Description |
 |---|---|---|
-| `/mcp` | `Bearer ark_xxx` (MCP token) | MCP endpoint for Claude Desktop |
+| `/mcp` | OAuth 2.1 / Bearer token | MCP endpoint for Claude Desktop |
+| `/.well-known/oauth-authorization-server` | Public | OAuth server metadata (RFC 8414) |
+| `/oauth/authorize` | Public | OAuth login form |
+| `/oauth/token` | Public | OAuth token exchange |
+| `/oauth/register` | Public | Dynamic client registration (RFC 7591) |
 
 ## 10. Connect Claude Desktop
 
-After generating an MCP token for an employee, add to Claude Desktop config (`claude_desktop_config.json`):
+Add Arkon to `claude_desktop_config.json` — just the URL, no token needed:
+
+```json
+{
+  "mcpServers": {
+    "arkon": {
+      "url": "http://localhost:5055/mcp"
+    }
+  }
+}
+```
+
+Restart Claude Desktop → click **Connect** → a browser opens with the Arkon login form → sign in → done.
+
+For manual Bearer token (API testing only):
 
 ```json
 {
   "mcpServers": {
     "arkon": {
       "url": "http://localhost:5055/mcp",
-      "headers": {
-        "Authorization": "Bearer ark_xxxx..."
-      }
+      "headers": { "Authorization": "Bearer ark_xxxx..." }
     }
   }
 }
 ```
+
+See [docs/MCP.md](MCP.md) for full connection details and troubleshooting.
 
 ## Troubleshooting
 

@@ -28,7 +28,10 @@ def _derive_fernet_key(secret: str) -> bytes:
 def _is_sensitive(key: str) -> bool:
     """A key is sensitive if it stores raw credentials/API keys."""
     return (
-        key in {"embedding_api_key", "llm_api_key", "vision_api_key"}
+        key in {
+            "embedding_api_key", "llm_api_key", "vision_api_key",
+            "smtp_password", "webhook_secret",
+        }
         or key.startswith("embedding_api_key__")  # per-provider keys
     )
 

@@ -7,9 +7,34 @@ Two ways to run Arkon: **Docker** (recommended for production) or **Development*
 ## Option A — Docker (Production)
 
 ### Prerequisites
+
+**Software**
 - Docker Engine 24+
 - Docker Compose v2+
 - An API key for your AI provider (Google, OpenAI, or Anthropic)
+
+**Server — recommended specs**
+
+| | **Starter** | **Team** | **Enterprise** |
+|---|:---:|:---:|:---:|
+| **Team size** | 1–20 | 20–100 | 100+ |
+| **vCPU** | 2 cores | 4 cores | 8+ cores |
+| **RAM** | 4 GB | 8 GB | 16+ GB |
+| **Storage** | 40 GB SSD | 100 GB SSD | 250+ GB NVMe |
+| **OS** | Ubuntu 22.04+ | Ubuntu 22.04+ | Ubuntu 22.04+ |
+
+> RAM is the primary bottleneck — the MRP pipeline workers load large LLM context windows during wiki compilation. All AI inference is external (Anthropic / Google / OpenAI), so no GPU is required.
+
+**Domain & HTTPS — required for MCP**
+
+Claude Desktop and Claude.ai connect to Arkon's MCP server using OAuth 2.1, which requires HTTPS. You need:
+
+- A **public domain** pointing to your server (e.g. `arkon.yourcompany.com`)
+- A **valid TLS certificate** — Certbot/Let's Encrypt works fine
+- A **reverse proxy** (Nginx recommended) forwarding traffic to the containers
+- The API specifically needs `X-Forwarded-Proto` passed through so OAuth URLs are generated with `https://`
+
+> For local development without a domain, use a manual Bearer token instead of OAuth. See [MCP & Claude](MCP.md).
 
 ### 1. Clone and configure
 
@@ -198,60 +223,104 @@ Open `http://<server-ip>:3119` from your browser and log in.
 
 ### Optional: Nginx reverse proxy (custom domain + SSL)
 
-If you have a domain and want HTTPS, put Nginx in front:
+Required for MCP with Claude Desktop / Claude.ai — OAuth 2.1 needs HTTPS.
+
+**Recommended DNS setup**
+
+| Record | Points to | Purpose |
+|---|---|---|
+| `arkon.yourcompany.com` | server IP | Frontend + API + MCP |
+| `minio.yourcompany.com` | server IP | MinIO presigned file URLs |
+
+You can serve frontend and API from the same domain using path routing (shown below), or use separate subdomains — either works.
+
+**Nginx config** (`/etc/nginx/sites-available/arkon`)
 
 ```nginx
-# /etc/nginx/sites-available/arkon
+# Redirect HTTP → HTTPS
 server {
     listen 80;
-    server_name arkon.yourcompany.com;
+    server_name arkon.yourcompany.com minio.yourcompany.com;
     return 301 https://$host$request_uri;
 }
 
+# API + MCP server
 server {
-    listen 443 ssl;
+    listen 443 ssl http2;
     server_name arkon.yourcompany.com;
 
     ssl_certificate     /etc/letsencrypt/live/arkon.yourcompany.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/arkon.yourcompany.com/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
 
-    # Frontend
-    location / {
-        proxy_pass http://localhost:3119;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
+    add_header X-Frame-Options        "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
 
-    # API
-    location /api/ {
-        proxy_pass http://localhost:5055;
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-    }
+    client_max_body_size 100M;
 
-    # MCP
+    # MCP endpoint (Streamable HTTP — no SSE buffering needed)
     location /mcp {
-        proxy_pass http://localhost:5055;
-        proxy_set_header Host $host;
+        proxy_pass http://127.0.0.1:5055;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;   # required for OAuth https:// URLs
+        proxy_set_header Connection        "";
+        proxy_read_timeout 300s;
+    }
+
+    # OAuth endpoints + REST API
+    location / {
+        proxy_pass http://127.0.0.1:5055;
+        proxy_http_version 1.1;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Real-IP         $remote_addr;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;   # required for OAuth https:// URLs
+        proxy_set_header Upgrade           $http_upgrade;
+        proxy_set_header Connection        "upgrade";
+        proxy_read_timeout 300s;
     }
 }
 
-# MinIO (for presigned URLs)
+# MinIO (for presigned file URLs)
 server {
-    listen 443 ssl;
+    listen 443 ssl http2;
     server_name minio.yourcompany.com;
 
     ssl_certificate     /etc/letsencrypt/live/minio.yourcompany.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/minio.yourcompany.com/privkey.pem;
+    include             /etc/letsencrypt/options-ssl-nginx.conf;
+    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
+
+    client_max_body_size 500M;
 
     location / {
-        proxy_pass http://localhost:9000;
+        proxy_pass http://127.0.0.1:9000;
         proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     }
 }
 ```
 
-With HTTPS, update `.env.docker`:
+> **`X-Forwarded-Proto $scheme` is critical.** Without it, Arkon's OAuth metadata endpoint returns `http://` URLs, and Claude Desktop will fail to complete the OAuth flow.
+
+Enable the site and get certificates:
+
+```bash
+sudo ln -s /etc/nginx/sites-available/arkon /etc/nginx/sites-enabled/
+sudo nginx -t
+
+sudo apt install certbot python3-certbot-nginx
+sudo certbot --nginx -d arkon.yourcompany.com -d minio.yourcompany.com
+
+sudo systemctl reload nginx
+```
+
+Update `.env.docker` to use your domain:
 
 ```env
 NEXT_PUBLIC_API_URL=https://arkon.yourcompany.com
@@ -260,14 +329,7 @@ MINIO_SECURE=true
 CORS_ORIGINS=https://arkon.yourcompany.com
 ```
 
-Then get a certificate with Certbot:
-
-```bash
-sudo apt install certbot python3-certbot-nginx
-sudo certbot --nginx -d arkon.yourcompany.com -d minio.yourcompany.com
-```
-
-Restart containers after changing env:
+Rebuild and restart:
 
 ```bash
 docker compose --env-file .env.docker up -d --build
@@ -405,13 +467,23 @@ Knowledge Base → Upload → select file or paste URL → choose knowledge type
 
 Watch the progress indicator. Once complete, click Wiki to browse the compiled pages.
 
-### 5. Create an employee and generate an MCP token
+### 5. Create employees
 Admin Portal → Employees → New Employee → assign department and role.
 
-On the employee detail page, click **Generate Token** to create their MCP token.
+Employees connect to Arkon via OAuth — no manual token generation needed. They sign in through the browser when they first connect Claude Desktop or Claude.ai.
 
-### 6. Connect Claude Desktop
-See [MCP & Claude](MCP.md) for the connection guide.
+> If you need a Bearer token for API testing or local dev (no HTTPS), use **Employee → Generate Token** on the employee detail page.
+
+### 6. Connect Claude Desktop or Claude.ai
+
+In **Claude Desktop** or **Claude.ai → Settings → Connectors**, add a custom connector:
+
+- **Name:** `Arkon`
+- **URL:** `https://arkon.yourcompany.com/mcp`
+
+Click **Connect** → browser opens Arkon login form → sign in → done.
+
+See [MCP & Claude](MCP.md) for the full connection guide, tool reference, and tips on getting Claude to consistently use Arkon.
 
 ---
 
@@ -456,6 +528,9 @@ AI provider settings (embedding, LLM, vision, API keys) are configured through t
 | CORS errors in browser | Add frontend URL to `CORS_ORIGINS` in `.env.docker` (or `.env.local` for dev) |
 | `requires Python 3.11` | Use `py -3.11 -m venv .venv` to select correct version |
 | MCP connection refused | Ensure the API is accessible from outside (check firewall/proxy) |
+| OAuth "Couldn't connect" in Claude Desktop | Server not reachable, or `/.well-known/oauth-authorization-server` returning 404 — verify the API is running and Nginx is routing correctly |
+| OAuth login form shows `http://` URLs | Nginx not forwarding `X-Forwarded-Proto` — add `proxy_set_header X-Forwarded-Proto $scheme;` to both `/mcp` and `/` location blocks |
+| Claude Desktop connected but tools not used | Add instructions to Claude's Custom Instructions or a Project — see [MCP & Claude](MCP.md) |
 | MinIO `SignatureDoesNotMatch` | Credentials mismatch — likely caused by running `docker compose up` without `--env-file .env.docker`, which makes Docker Compose use your local `.env` to initialise MinIO. Fix: `docker compose down -v` then `docker compose --env-file .env.docker up -d --build` |
 | MinIO `Invalid Request (invalid hostname)` | `MINIO_ENDPOINT` contains an underscore (e.g. `arkon_minio`). Use the Docker Compose service name instead: `minio:9000` |
 | Images/files not loading in browser (`ERR_NAME_NOT_RESOLVED`) | Presigned URLs are pointing to an internal hostname. Set `MINIO_PUBLIC_ENDPOINT` to a browser-accessible address: `localhost:9000` for local Docker, `<server-ip>:9000` for a remote server |

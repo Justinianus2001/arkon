@@ -46,13 +46,68 @@ def _scope_filter(scope_type: str = "global", scope_id: Optional[uuid.UUID] = No
 
 
 def _scope_filter_with_dept(department_id: Optional[uuid.UUID] = None):
-    """OR-filter: global pages + department pages visible to the given dept member."""
+    """OR-filter: global pages + department pages visible to the given dept member.
+
+    DEPRECATED for MCP read paths — does NOT include project-scoped pages,
+    which made wiki pages of workspaces invisible to their own members. Use
+    `_scope_filter_for_identity` instead.
+    """
     if department_id:
         return or_(
             and_(WikiPage.scope_type == "global", WikiPage.scope_id.is_(None)),
             and_(WikiPage.scope_type == "department", WikiPage.scope_id == department_id),
         )
     return _scope_filter("global")
+
+
+def _scope_filter_for_identity(
+    department_id: Optional[uuid.UUID] = None,
+    project_ids: Optional[list[uuid.UUID]] = None,
+):
+    """OR-filter for the MCP read path: every wiki page the user can see.
+
+    Includes:
+      - All global pages.
+      - Department pages of the user's own department.
+      - Project pages of every workspace the user is a member of.
+
+    Without the project branch, members of a workspace cannot find their own
+    workspace's wiki pages via search — they fall through to raw-source
+    drill-down and assume the page doesn't exist.
+    """
+    clauses = [and_(WikiPage.scope_type == "global", WikiPage.scope_id.is_(None))]
+    if department_id is not None:
+        clauses.append(
+            and_(WikiPage.scope_type == "department", WikiPage.scope_id == department_id)
+        )
+    if project_ids:
+        clauses.append(
+            and_(WikiPage.scope_type == "project", WikiPage.scope_id.in_(project_ids))
+        )
+    return or_(*clauses)
+
+
+def _inverse_scope_filter_for_identity(
+    department_id: Optional[uuid.UUID] = None,
+    project_ids: Optional[list[uuid.UUID]] = None,
+):
+    """Pages OUTSIDE the user's accessible scope — used by out-of-scope hints.
+
+    Excludes global pages (everyone sees those) so the inverse is just:
+      - Department pages of OTHER departments.
+      - Project pages of workspaces the user is NOT a member of.
+    """
+    project_clause = (
+        and_(WikiPage.scope_type == "project", WikiPage.scope_id.notin_(project_ids))
+        if project_ids
+        else WikiPage.scope_type == "project"
+    )
+    dept_clause = (
+        and_(WikiPage.scope_type == "department", WikiPage.scope_id != department_id)
+        if department_id is not None
+        else WikiPage.scope_type == "department"
+    )
+    return or_(dept_clause, project_clause)
 
 
 # ---------------------------------------------------------------------------
@@ -258,22 +313,32 @@ async def list_pages(
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
     department_id: Optional[uuid.UUID] = None,
+    project_ids: Optional[list[uuid.UUID]] = None,
+    all_scopes: bool = False,
 ) -> list[WikiPage]:
-    """List pages with filtering within a scope. If department_id given, returns global + dept pages."""
-    scope_clause = (
-        _scope_filter_with_dept(department_id) if department_id is not None
-        else _scope_filter(scope_type, scope_id)
-    )
+    """List pages with filtering within a scope.
+
+    Scope behaviour:
+      - `all_scopes=True`: no scope filter at all (admin bypass).
+      - `department_id` (and optionally `project_ids`) given: union of global
+        + user's department + every workspace the user is a member of.
+      - Otherwise: exact `scope_type`/`scope_id` (pipeline write path).
+    """
+    if all_scopes:
+        scope_clause = None
+    elif department_id is not None or project_ids:
+        scope_clause = _scope_filter_for_identity(department_id, project_ids)
+    else:
+        scope_clause = _scope_filter(scope_type, scope_id)
     stmt = (
         select(WikiPage)
-        .where(
-            WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
-            scope_clause,
-        )
+        .where(WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]))
         .order_by(WikiPage.updated_at.desc())
         .limit(limit)
         .offset(offset)
     )
+    if scope_clause is not None:
+        stmt = stmt.where(scope_clause)
     if page_type:
         stmt = stmt.where(WikiPage.page_type == page_type)
     if knowledge_type_slug:
@@ -298,6 +363,9 @@ async def search_pages_semantic(
     scope_id: Optional[uuid.UUID] = None,
     spec_id: Optional[str] = None,
     department_id: Optional[uuid.UUID] = None,
+    project_ids: Optional[list[uuid.UUID]] = None,
+    inverse_scope: bool = False,
+    all_scopes: bool = False,
 ) -> list[tuple[WikiPage, float]]:
     """
     Cosine-similarity search over wiki page embeddings within a scope.
@@ -307,8 +375,13 @@ async def search_pages_semantic(
     `model_spec_id` rows to filter to. Pass `spec_id` explicitly to override —
     only used by tests and internal tooling.
 
-    If department_id is given, searches across global + department pages (for MCP/API read path).
-    Otherwise uses exact scope_type/scope_id matching (for pipeline write path).
+    Scope behaviour:
+      - If `department_id` or `project_ids` is given: returns pages from
+        global + user's department + user's workspaces (MCP read path).
+      - If `inverse_scope=True`: returns pages OUTSIDE that scope (other
+        departments, workspaces the user isn't a member of). Used to surface
+        "you don't have access" hints.
+      - Otherwise uses exact scope_type/scope_id matching (pipeline write path).
 
     Returns (page, similarity) pairs sorted by similarity descending. Returns
     an empty list if no active embedding model is configured.
@@ -326,10 +399,21 @@ async def search_pages_semantic(
     spec = get_spec(spec_id)
     Emb = get_embedding_model_for_dim(spec.dimension)
 
-    scope_clause = (
-        _scope_filter_with_dept(department_id) if department_id is not None
-        else _scope_filter(scope_type, scope_id)
-    )
+    if all_scopes and not inverse_scope:
+        scope_clause = None
+    elif inverse_scope:
+        scope_clause = _inverse_scope_filter_for_identity(department_id, project_ids)
+    elif department_id is not None or project_ids:
+        scope_clause = _scope_filter_for_identity(department_id, project_ids)
+    else:
+        scope_clause = _scope_filter(scope_type, scope_id)
+
+    where_clauses = [
+        Emb.model_spec_id == spec.id,
+        WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
+    ]
+    if scope_clause is not None:
+        where_clauses.append(scope_clause)
 
     stmt = (
         select(
@@ -337,13 +421,7 @@ async def search_pages_semantic(
             (1 - Emb.embedding.cosine_distance(query_embedding)).label("similarity"),
         )
         .join(Emb, Emb.page_id == WikiPage.id)
-        .where(
-            and_(
-                Emb.model_spec_id == spec.id,
-                WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
-                scope_clause,
-            )
-        )
+        .where(and_(*where_clauses))
         .order_by(Emb.embedding.cosine_distance(query_embedding))
         .limit(top_k)
     )
@@ -793,6 +871,7 @@ async def approve_draft(
     # the page content. Lock by slug (when known) so we don't block the
     # entire page table.
     target_slug: Optional[str] = None
+    existing_page: Optional[WikiPage] = None
     if draft.draft_kind == "create":
         target_slug = (draft.suggested_metadata or {}).get("slug")
     else:
@@ -802,6 +881,11 @@ async def approve_draft(
         await session.execute(
             select(func.pg_advisory_xact_lock(func.hashtext(target_slug)))
         )
+        # The page row was loaded BEFORE the lock; another reviewer may have
+        # bumped its version while we waited. Refresh from DB so version /
+        # content_md reflect the committed state inside the critical section.
+        if existing_page is not None:
+            await session.refresh(existing_page)
 
     if draft.draft_kind == "create":
         meta = dict(draft.suggested_metadata or {})
@@ -818,7 +902,11 @@ async def approve_draft(
         scope_id_raw = meta.get("scope_id")
         try:
             scope_id = uuid.UUID(scope_id_raw) if isinstance(scope_id_raw, str) else scope_id_raw
-        except ValueError:
+        except (ValueError, TypeError):
+            scope_id = None
+        if scope_id is not None and not isinstance(scope_id, uuid.UUID):
+            # Hand-crafted metadata with a non-string non-UUID (e.g. int)
+            # shouldn't propagate downstream. Treat as missing scope.
             scope_id = None
 
         if not slug or slug in (INDEX_SLUG, LOG_SLUG):

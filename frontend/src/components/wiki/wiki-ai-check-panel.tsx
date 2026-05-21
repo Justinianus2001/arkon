@@ -18,11 +18,13 @@ function statusBadge(status: AiCheckStatus | string) {
       return { label: "AI: critical flags", classes: "bg-rose-100 dark:bg-rose-900/40 text-rose-700 dark:text-rose-200", icon: "report" };
     case "running":
       return { label: "AI: running…", classes: "bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-200", icon: "progress_activity" };
+    case "queued":
+      return { label: "AI: queued", classes: "bg-blue-100 dark:bg-blue-900/40 text-blue-700 dark:text-blue-200", icon: "schedule" };
     case "skipped":
       return { label: "AI: skipped", classes: "bg-muted text-muted-foreground", icon: "skip_next" };
     case "pending":
     default:
-      return { label: "AI: queued", classes: "bg-muted text-muted-foreground", icon: "schedule" };
+      return { label: "AI: pending", classes: "bg-muted text-muted-foreground", icon: "schedule" };
   }
 }
 
@@ -102,7 +104,7 @@ export function WikiAiCheckPanel({ status, results }: Props) {
       >
         <span
           className={`material-symbols-outlined ${
-            status === "running" ? "animate-spin" : ""
+            status === "running" || status === "queued" ? "animate-spin" : ""
           }`}
           style={{ fontSize: 16 }}
         >
@@ -126,7 +128,11 @@ export function WikiAiCheckPanel({ status, results }: Props) {
         <div className="px-4 pb-3 space-y-3">
           {!results ? (
             <p className="text-xs text-muted-foreground italic">
-              AI pre-review {status === "running" ? "in progress" : "has not run yet"}.
+              AI pre-review {status === "running"
+                ? "in progress"
+                : status === "queued"
+                  ? "queued — worker will pick it up shortly"
+                  : "has not run yet"}.
             </p>
           ) : (
             <>

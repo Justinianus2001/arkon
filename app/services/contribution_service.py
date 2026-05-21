@@ -46,12 +46,15 @@ from app.services.audit_service import log_audit
 from app.services.notification_service import NotificationType
 
 
-async def _run_ai_sync_and_enqueue(db, draft: WikiPageDraft) -> None:
-    """Run L1+L2 AI checks synchronously and enqueue the L3+L4 worker job.
+async def _enqueue_ai_review(db, draft: WikiPageDraft) -> None:
+    """Queue the AI pre-review worker job for a draft.
 
-    Permissive: never raises out of this function — AI is best-effort and
-    must never break the contribution path. Skips entirely if the global
-    `ai_pre_review_enabled` config flag is set to "false".
+    All four check layers (L1 regex, L2 structural, L3 semantic, L4 LLM) run
+    inside the arq worker — submit path stays fast and unblockable.
+
+    Permissive: never raises. Skips entirely if `ai_pre_review_enabled` config
+    is "false". If enqueue fails (e.g. Redis down) status flips to "skipped"
+    so the UI never gets stuck on a transient state.
     """
     from loguru import logger
     try:
@@ -66,47 +69,23 @@ async def _run_ai_sync_and_enqueue(db, draft: WikiPageDraft) -> None:
         # Config service failure shouldn't break submit — proceed.
         pass
 
-    try:
-        from app.services.ai_review import run_sync_checks
-        page = await db.get(WikiPage, draft.page_id) if draft.page_id else None
-        scope_type = page.scope_type if page else (
-            (draft.suggested_metadata or {}).get("scope_type") or "global"
-        )
-        scope_id_val = page.scope_id if page else (
-            (draft.suggested_metadata or {}).get("scope_id")
-        )
-        try:
-            scope_id = uuid.UUID(scope_id_val) if isinstance(scope_id_val, str) else scope_id_val
-        except (ValueError, AttributeError):
-            scope_id = None
+    draft.ai_check_status = "queued"
+    draft.ai_check_results = None
 
-        results = await run_sync_checks(
-            db, content_md=draft.content_md,
-            self_slug=page.slug if page else (draft.suggested_metadata or {}).get("slug"),
-            self_page_id=draft.page_id,
-            scope_type=scope_type,
-            scope_id=scope_id,
-        )
-        draft.ai_check_results = results
-        summary = results["summary"]
-        # Status reflects sync-only verdict until the worker fills in L3+L4.
-        if summary["fail"] > 0:
-            draft.ai_check_status = "failed"
-        elif summary["warn"] > 0:
-            draft.ai_check_status = "warned"
-        else:
-            draft.ai_check_status = "running"  # waiting for async layers
-    except Exception as e:
-        logger.warning(f"AI sync checks failed for draft {draft.id}: {e}")
-        draft.ai_check_status = "skipped"
-
-    # Enqueue async layers. Failure (Redis down) just leaves the sync verdict.
     try:
         from app.worker import get_arq_pool
         pool = await get_arq_pool()
-        await pool.enqueue_job("ai_pre_review_draft_task", str(draft.id))
+        # Pass revision_round so the worker can detect if the draft was
+        # resubmitted (round bumped) while it was running and skip its
+        # stale verdict instead of overwriting the newer one.
+        await pool.enqueue_job(
+            "ai_pre_review_draft_task",
+            str(draft.id),
+            int(draft.revision_round or 0),
+        )
     except Exception as e:
-        logger.warning(f"AI async enqueue failed for draft {draft.id}: {e}")
+        logger.warning(f"AI review enqueue failed for draft {draft.id}: {e}")
+        draft.ai_check_status = "skipped"
 
 
 class InvalidTransition(Exception):
@@ -263,7 +242,7 @@ async def notify_submitted(
     # Trigger AI pre-review on wiki drafts only — skill contributions have a
     # different content model (file tree in MinIO) and aren't in scope yet.
     if isinstance(obj, WikiPageDraft):
-        await _run_ai_sync_and_enqueue(db, obj)
+        await _enqueue_ai_review(db, obj)
 
     recipients = await adapter.reviewers(db, obj)
     await notification_service.notify_many(
@@ -348,7 +327,7 @@ async def resubmit_wiki_draft(
     draft.ai_checked_at = None
     adapter.bump_revision_round(draft)
     adapter.set_status(draft, "pending")
-    await _run_ai_sync_and_enqueue(db, draft)
+    await _enqueue_ai_review(db, draft)
 
     await log_audit(
         db, author, "resubmit", adapter.artifact_type, str(draft.id),
@@ -474,27 +453,35 @@ async def notify_approved(
             )
         )
         # Group by author so a user with 2 sibling drafts gets 1 notification.
+        # Build one batched INSERT via notify_each instead of N round-trips.
+        items: list[dict] = []
         seen_authors: set[uuid.UUID] = set()
+        body_text = (
+            f"{reviewer.name or reviewer.email} approved another draft on "
+            "this page. Your draft will flag as conflicting on the next "
+            "approve — re-base or withdraw."
+        )
+        subject_text = (
+            f"Page advanced while your draft was pending: "
+            f"{adapter.display_name(obj)}{suffix}"
+        )
         for sibling_author_id, sibling_id in sibling_rows.all():
             if not sibling_author_id or sibling_author_id == author_id:
-                continue  # don't ping the author we already notified
+                continue
             if sibling_author_id in seen_authors:
                 continue
             seen_authors.add(sibling_author_id)
-            await notification_service.notify(
-                db, recipient_id=sibling_author_id,
-                type=adapter.types.approved,  # same type — the author's draft is now stale
-                subject=(
-                    f"Page advanced while your draft was pending: "
-                    f"{adapter.display_name(obj)}{suffix}"
-                ),
-                body=(
-                    f"{reviewer.name or reviewer.email} approved another draft on "
-                    "this page. Your draft will flag as conflicting on the next "
-                    "approve — re-base or withdraw."
-                ),
+            items.append({
+                "recipient_id": sibling_author_id,
+                "subject": subject_text,
+                "body": body_text,
+                "target_id": str(sibling_id),
+            })
+        if items:
+            await notification_service.notify_each(
+                db, items=items,
+                type=adapter.types.approved,
                 target_type=adapter.artifact_type,
-                target_id=str(sibling_id),  # link to the sibling's own draft
                 actor_id=reviewer.id,
             )
 

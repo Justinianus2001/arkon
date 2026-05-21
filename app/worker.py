@@ -879,6 +879,50 @@ async def regenerate_plan_task(ctx: dict, source_id: str, user_note: str):
                 await session.commit()
 
 
+async def sweep_stuck_ai_review_cron(ctx: dict):
+    """Periodic safety net: flip any draft stuck in ai_check_status='running'
+    for longer than the worker job_timeout back to 'skipped'.
+
+    A draft can get stuck if the worker process is SIGKILL/OOM-killed AFTER
+    committing status='running' but BEFORE finishing the checks — the
+    try/except in the runner only catches Python exceptions, not process
+    death. Without this sweep the UI shows a perpetual "running" spinner.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import or_, select, update
+
+    from app.database import async_session_factory
+    from app.database.models import WikiPageDraft
+
+    # Anything still "running" beyond 2x the job timeout (or 30 min, whichever
+    # is larger) is almost certainly a dead worker. Use updated_at since the
+    # runner doesn't bump ai_checked_at until it writes the final verdict.
+    timeout_sec = max(int(settings.worker_job_timeout) * 2, 1800)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_sec)
+
+    async with async_session_factory() as session:
+        stmt = (
+            update(WikiPageDraft)
+            .where(
+                WikiPageDraft.ai_check_status == "running",
+                or_(
+                    WikiPageDraft.updated_at < cutoff,
+                    WikiPageDraft.updated_at.is_(None),
+                ),
+            )
+            .values(ai_check_status="skipped")
+        )
+        result = await session.execute(stmt)
+        await session.commit()
+        n = result.rowcount or 0
+        if n:
+            logger.warning(
+                f"sweep_stuck_ai_review_cron: reset {n} draft(s) stuck in "
+                f"'running' for >{timeout_sec}s"
+            )
+
+
 async def daily_stats_rollup_cron(ctx: dict):
     """
     Cronjob: recompute admin Statistics rollups for yesterday (UTC).
@@ -1015,16 +1059,19 @@ async def caption_images_task(ctx: dict, source_id: str):
     logger.info(f"caption_images_task: enqueued ingest_map_reduce_task for {source_id}")
 
 
-async def ai_pre_review_draft_task(ctx: dict, draft_id: str) -> None:
-    """Run the async (L3 + L4) layers of the AI pre-review on a wiki draft.
+async def ai_pre_review_draft_task(
+    ctx: dict, draft_id: str, expected_round: Optional[int] = None,
+) -> None:
+    """Run all four AI pre-review layers on a wiki draft.
 
-    L1 + L2 already ran synchronously when the draft was created; this job
-    fills in semantic similarity + LLM judgment and updates ai_check_status.
+    `expected_round` is the draft's revision_round at enqueue time — used by
+    the runner to drop stale verdicts when the author resubmits mid-flight.
+    Optional for backward-compat with jobs enqueued by older code.
     Permissive: never blocks the draft regardless of verdict.
     """
     from app.services.ai_review import run_async_checks
     _ = ctx
-    await run_async_checks(draft_id)
+    await run_async_checks(draft_id, expected_round=expected_round)
 
 
 class WorkerSettings:
@@ -1049,6 +1096,9 @@ class WorkerSettings:
 
     cron_jobs = [
         cron(daily_stats_rollup_cron, hour=2, minute=0),
+        # Every 10 minutes — quick recovery from stuck 'running' AI reviews
+        # caused by hard worker death (OOM, SIGKILL, container restart).
+        cron(sweep_stuck_ai_review_cron, minute={0, 10, 20, 30, 40, 50}),
     ]
 
     @staticmethod

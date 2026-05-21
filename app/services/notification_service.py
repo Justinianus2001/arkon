@@ -72,6 +72,48 @@ async def notify(
     return n
 
 
+async def notify_each(
+    db: AsyncSession,
+    items: list[dict],
+    type: str,
+    target_type: str,
+    actor_id: Optional[uuid.UUID] = None,
+    exclude_actor: bool = True,
+) -> list[Notification]:
+    """Insert one notification per item — each item has its own subject / body /
+    target_id. Used when recipients need distinct payloads (e.g. sibling-draft
+    notifications that link back to each author's own draft).
+
+    Item shape: {"recipient_id": UUID, "subject": str, "body": str, "target_id": str}
+
+    Single batched INSERT via SQLAlchemy `add_all` — much cheaper than calling
+    `notify()` in a loop for large fan-outs.
+    """
+    out: list[Notification] = []
+    seen: set[uuid.UUID] = set()
+    for item in items:
+        rid = item.get("recipient_id")
+        if rid is None or rid in seen:
+            continue
+        if exclude_actor and actor_id is not None and rid == actor_id:
+            continue
+        seen.add(rid)
+        out.append(Notification(
+            recipient_id=rid,
+            type=type,
+            subject=item.get("subject", ""),
+            body=item.get("body", ""),
+            target_type=target_type,
+            target_id=str(item.get("target_id") or ""),
+            actor_id=actor_id,
+        ))
+    if not out:
+        return out
+    db.add_all(out)
+    _stage_for_dispatch(db, out)
+    return out
+
+
 async def notify_many(
     db: AsyncSession,
     recipient_ids: Iterable[uuid.UUID],

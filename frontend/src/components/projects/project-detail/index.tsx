@@ -1,7 +1,8 @@
 "use client";
 
-import React, { useEffect, useState, useCallback, useMemo } from "react";
+import React, { useEffect, useState, useCallback } from "react";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { WikiPageSummary } from "@/types/wiki";
@@ -18,6 +19,7 @@ type Props = {
 };
 
 export function ProjectDetail({ project, isAdmin, onBack }: Props) {
+  const { getWorkspaceRole } = useAuth();
   const [members, setMembers] = useState<Member[]>([]);
   const [sources, setSources] = useState<ProjectSource[]>([]);
   const [allEmployees, setAllEmployees] = useState<Employee[]>([]);
@@ -28,23 +30,45 @@ export function ProjectDetail({ project, isAdmin, onBack }: Props) {
   const [wikiLoading, setWikiLoading] = useState(false);
   const [wikiIndexMd, setWikiIndexMd] = useState<string | null>(null);
 
+  // Workspace-level admin: either an org admin or someone explicitly given
+  // the workspace `admin` role. The candidate-picker endpoints are scoped to
+  // this, not org-level `org:employees:read`.
+  const workspaceRole = getWorkspaceRole(project.id);
+  const canAdminWorkspace = isAdmin || workspaceRole === "admin";
+  const canEditWorkspace =
+    canAdminWorkspace || workspaceRole === "editor";
+
   const load = useCallback(async () => {
-    try {
-      const [m, s, emp, src] = await Promise.all([
-        api<Member[]>(`/api/projects/${project.id}/members`),
-        api<ProjectSource[]>(`/api/projects/${project.id}/sources`),
-        api<{items: Employee[]}>("/api/employees?page_size=500"),
-        api<{items: Source[]}>("/api/sources?page_size=500"),
-      ]);
-      setMembers(m);
-      setSources(s);
-      setAllEmployees(emp.items || []);
-      setAllSources(src.items || []);
-    } catch (err) {
-      console.error(err);
+    // Members + sources of THIS workspace — any workspace member can read.
+    // Candidate lists — gated by workspace role (admin for members, editor+
+    // for sources). Use allSettled so a 403 on a candidate fetch (viewer
+    // opens the page) doesn't sink the whole load.
+    const [mRes, sRes, empRes, srcRes] = await Promise.allSettled([
+      api<Member[]>(`/api/projects/${project.id}/members`),
+      api<ProjectSource[]>(`/api/projects/${project.id}/sources`),
+      canAdminWorkspace
+        ? api<Employee[]>(`/api/projects/${project.id}/members/candidates?limit=500`)
+        : Promise.resolve([] as Employee[]),
+      canEditWorkspace
+        ? api<Source[]>(`/api/projects/${project.id}/sources/candidates?limit=500`)
+        : Promise.resolve([] as Source[]),
+    ]);
+
+    if (mRes.status === "fulfilled") setMembers(mRes.value);
+    if (sRes.status === "fulfilled") setSources(sRes.value);
+    if (empRes.status === "fulfilled") setAllEmployees(empRes.value || []);
+    if (srcRes.status === "fulfilled") setAllSources(srcRes.value || []);
+
+    // Only surface an error when the CORE lists fail — partial failure of
+    // candidate pickers is normal for non-admin viewers and would be
+    // confusing to flag as "Failed to load project details".
+    if (mRes.status === "rejected" || sRes.status === "rejected") {
+      console.error("Project core load failed", mRes, sRes);
       setError("Failed to load project details");
+    } else {
+      setError(null);
     }
-  }, [project.id]);
+  }, [project.id, canAdminWorkspace, canEditWorkspace]);
 
   const loadWiki = useCallback(async () => {
     setWikiLoading(true);
@@ -92,10 +116,11 @@ export function ProjectDetail({ project, isAdmin, onBack }: Props) {
     return () => clearInterval(interval);
   }, [sources, loadProjectSources, loadWiki]);
 
-  const memberIds = new Set(members.map((m) => m.employee_id));
-  const sourceIds = new Set(sources.map((s) => s.source_id));
-  const availableEmployees = allEmployees.filter((e) => !memberIds.has(e.id));
-  const availableSources = allSources.filter((s) => !sourceIds.has(s.id));
+  // Candidate endpoints already exclude current members / linked sources, so
+  // these are just direct passthroughs now. Keep the names for callsite
+  // compatibility.
+  const availableEmployees = allEmployees;
+  const availableSources = allSources;
 
   const tabConfig = [
     { key: "wiki" as const, label: "Wiki", count: wikiPages.length, icon: "auto_stories" },
@@ -169,7 +194,7 @@ export function ProjectDetail({ project, isAdmin, onBack }: Props) {
         <MembersTab
           project={project}
           members={members}
-          isAdmin={isAdmin}
+          isAdmin={canAdminWorkspace}
           availableEmployees={availableEmployees}
           onChanged={load}
           onError={setError}
@@ -180,7 +205,7 @@ export function ProjectDetail({ project, isAdmin, onBack }: Props) {
         <SourcesTab
           project={project}
           sources={sources}
-          isAdmin={isAdmin}
+          isAdmin={canEditWorkspace}
           availableSources={availableSources}
           onChanged={load}
           onError={setError}

@@ -5,6 +5,69 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [0.7.2] — 2026-05-20
+
+Critical-review batch: data-integrity, race, and security findings from a
+fresh audit of the draft lifecycle, MCP auth, and AI pre-review surfaces.
+
+### Security
+
+- **MCP tokens hashed at rest (migration 027)** — `employees.mcp_token` was
+  stored in plaintext and looked up via direct equality. A DB read therefore
+  exposed every active token. New columns `mcp_token_hash`
+  (HMAC-SHA256+pepper), `mcp_token_prefix` (UI display), and
+  `mcp_token_rotated_at` replace the lookup path. The migration NULLs every
+  existing plaintext token so **all users must rotate their MCP token via
+  the portal after deploy**. Configure `MCP_TOKEN_PEPPER` in env before
+  rolling out. Self-service `POST /my/mcp-token` now always issues a fresh
+  token (no read-back path).
+
+### Fixed
+
+- **`bulk_approve_drafts` poisoned session** — when one draft's approve
+  raised mid-flush, the outer AsyncSession entered a `PendingRollbackError`
+  state and silently failed every subsequent iteration. Each draft now runs
+  inside its own SAVEPOINT (`db.begin_nested()`), so a single failure
+  rolls back only that draft and the rest of the batch commits cleanly.
+- **`approve_draft` lost-update race** — two reviewers approving distinct
+  drafts on the same page could both observe `version=N` before the
+  advisory lock and then race to write `N+1`. The page row is now
+  `session.refresh()`-ed inside the locked critical section so writers
+  see committed state.
+- **`scope_id` parsing crash on non-string values** — `_can_review_draft`
+  and `_enqueue_ai_review` now catch `TypeError` and reject non-UUID
+  values defensively instead of leaking junk down to `get_workspace_role`.
+
+### Changed
+
+- **AI pre-review fully async** — submit/resubmit no longer runs any check
+  layer inline. The arq worker now executes L1 (regex), L2 (structural),
+  L3 (semantic), and L4 (LLM) end-to-end. Drafts initially surface as
+  `ai_check_status="queued"`; if Redis is unreachable the status flips to
+  `"skipped"` rather than getting stuck on `"running"`. Eliminates the
+  per-request LLM call that previously held a FastAPI worker for seconds
+  on every draft submission.
+- **MCP `last_connected` debounced** — the auth path used to issue a
+  `UPDATE employees SET last_connected = now()` + `COMMIT` on every tool
+  call, generating one DB write per Claude Desktop request. Updates are
+  now rate-limited to once per 60 s per employee; the commit is also
+  skipped entirely when no write occurred.
+- **Sibling-draft notifications batched** — `notify_approved` now uses a
+  new `notify_each` helper to emit all cross-author notifications in a
+  single `add_all` instead of N round-trips.
+- **MCP `create_wiki_page` whitespace check** — added the `isspace`
+  guard that `propose_wiki_create` already had, plus consistent
+  `slug.strip()` at both entry points.
+
+### Notes
+
+- Item "project-membership grants access regardless of
+  `allowed_knowledge_types`" was confirmed as **intent** during review.
+  `apply_scope_filter`'s docstring now explicitly says so to deter a
+  future accidental flip to AND semantics.
+
+---
+
 ## [0.7.1] — 2026-05-20
 
 Hotfix for a race condition in the MRP REFINE phase that surfaced while

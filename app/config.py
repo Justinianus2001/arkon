@@ -35,6 +35,13 @@ class Settings(BaseSettings):
         default="admin123",
         description="Password for the initial admin account",
     )
+    mcp_token_pepper: str = Field(
+        default="change-me-to-a-random-pepper",
+        description=(
+            "HMAC pepper used to hash MCP bearer tokens at rest. "
+            "Rotating this invalidates every existing token — set once and keep stable."
+        ),
+    )
 
     # --- MinIO ---
     minio_endpoint: str = Field(default="localhost:9000")

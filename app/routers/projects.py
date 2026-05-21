@@ -294,6 +294,24 @@ class AddMemberBody(BaseModel):
     role: str = "viewer"
 
 
+class BulkAddMembersBody(BaseModel):
+    employee_ids: list[str]
+    role: str = "viewer"
+
+
+class BulkAddItemResult(BaseModel):
+    employee_id: str
+    status: str  # "added" | "skipped" | "error"
+    message: Optional[str] = None
+
+
+class BulkAddResponse(BaseModel):
+    results: list[BulkAddItemResult]
+    added: int
+    skipped: int
+    errored: int
+
+
 class UpdateMemberBody(BaseModel):
     role: str
 
@@ -322,6 +340,65 @@ async def list_members(
             added_at=m.added_at.isoformat(),
         )
         for m in members
+    ]
+
+
+class CandidateEmployeeOut(BaseModel):
+    id: str
+    name: str
+    email: str
+    department_name: str = ""
+
+
+@router.get(
+    "/projects/{project_id}/members/candidates",
+    response_model=list[CandidateEmployeeOut],
+)
+async def list_member_candidates(
+    project_id: str,
+    search: Optional[str] = None,
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = Depends(get_current_user),
+):
+    """Employees who are NOT yet members of this workspace.
+
+    Scoped permission: workspace admin only — the only role that can
+    actually add members. We surface this list here (instead of pointing the
+    frontend at the org-wide `/api/employees` endpoint) so workspace admins
+    don't need the org-level `org:employees:read` permission just to invite
+    a colleague.
+    """
+    await _get_project_or_404(db, project_id)
+    await _require_workspace_role(db, _user, project_id, WorkspaceRole.ADMIN.value)
+
+    member_ids_stmt = select(ProjectMember.employee_id).where(
+        ProjectMember.project_id == uuid.UUID(project_id)
+    )
+
+    stmt = (
+        select(Employee)
+        .options(selectinload(Employee.department))
+        .where(
+            Employee.is_active.is_(True),
+            Employee.id.notin_(member_ids_stmt),
+        )
+        .order_by(Employee.name)
+        .limit(max(1, min(limit, 500)))
+    )
+    if search:
+        like = f"%{search.strip()}%"
+        stmt = stmt.where(Employee.name.ilike(like) | Employee.email.ilike(like))
+
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        CandidateEmployeeOut(
+            id=str(e.id),
+            name=e.name,
+            email=e.email,
+            department_name=e.department.name if e.department else "",
+        )
+        for e in rows
     ]
 
 
@@ -358,6 +435,96 @@ async def add_member(
     db.add(member)
     await db.flush()
     return {"added": True}
+
+
+@router.post(
+    "/projects/{project_id}/members/bulk",
+    response_model=BulkAddResponse,
+    status_code=200,
+)
+async def bulk_add_members(
+    project_id: str,
+    body: BulkAddMembersBody,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = Depends(get_current_user),
+):
+    """Add many employees to a workspace in one request.
+
+    Each employee is processed independently. The whole batch commits at the
+    end so partial successes persist even when some employees error (e.g.
+    already a member, employee not found).
+    """
+    await _get_project_or_404(db, project_id)
+    await _require_workspace_role(db, _user, project_id, WorkspaceRole.ADMIN.value)
+
+    valid_roles = {r.value for r in WorkspaceRole}
+    if body.role not in valid_roles:
+        raise HTTPException(400, f"Role must be one of: {sorted(valid_roles)}")
+
+    proj_uuid = uuid.UUID(project_id)
+    results: list[BulkAddItemResult] = []
+    added = skipped = errored = 0
+    seen: set[str] = set()
+
+    for raw_id in body.employee_ids:
+        if raw_id in seen:
+            # Duplicate in the same request — count as skipped, don't double-insert.
+            results.append(BulkAddItemResult(
+                employee_id=raw_id, status="skipped", message="Duplicate in request",
+            ))
+            skipped += 1
+            continue
+        seen.add(raw_id)
+
+        try:
+            emp_uuid = uuid.UUID(raw_id)
+        except (ValueError, TypeError):
+            results.append(BulkAddItemResult(
+                employee_id=raw_id, status="error", message="Invalid employee ID",
+            ))
+            errored += 1
+            continue
+
+        emp = await db.get(Employee, emp_uuid)
+        if not emp:
+            results.append(BulkAddItemResult(
+                employee_id=raw_id, status="error", message="Employee not found",
+            ))
+            errored += 1
+            continue
+
+        existing = await db.get(ProjectMember, (proj_uuid, emp_uuid))
+        if existing:
+            results.append(BulkAddItemResult(
+                employee_id=raw_id, status="skipped",
+                message=f"Already a {existing.role}",
+            ))
+            skipped += 1
+            continue
+
+        # Each insert in its own SAVEPOINT so an IntegrityError (e.g. race with
+        # a concurrent insert) on one employee doesn't poison the rest of the
+        # batch in the outer transaction.
+        try:
+            async with db.begin_nested():
+                db.add(ProjectMember(
+                    project_id=proj_uuid,
+                    employee_id=emp_uuid,
+                    role=body.role,
+                ))
+            results.append(BulkAddItemResult(
+                employee_id=raw_id, status="added",
+            ))
+            added += 1
+        except Exception as e:
+            results.append(BulkAddItemResult(
+                employee_id=raw_id, status="error", message=str(e),
+            ))
+            errored += 1
+
+    return BulkAddResponse(
+        results=results, added=added, skipped=skipped, errored=errored,
+    )
 
 
 @router.delete("/projects/{project_id}/members/{employee_id}")
@@ -481,6 +648,71 @@ async def list_project_sources(
                 added_at=s.created_at.isoformat(),
             ))
     return out
+
+
+class CandidateSourceOut(BaseModel):
+    id: str
+    title: Optional[str] = None
+    file_name: Optional[str] = None
+    url: Optional[str] = None
+    knowledge_type_name: str = ""
+    source_type: Optional[str] = None
+    status: str
+
+
+@router.get(
+    "/projects/{project_id}/sources/candidates",
+    response_model=list[CandidateSourceOut],
+)
+async def list_source_candidates(
+    project_id: str,
+    search: Optional[str] = None,
+    limit: int = 200,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = Depends(get_current_user),
+):
+    """Sources NOT yet linked to this workspace.
+
+    Workspace editor+ — same role that can `POST /sources` to attach one.
+    Same rationale as `members/candidates`: keep the picker scoped to a
+    workspace role so editors don't need org-level read permission.
+    """
+    from app.database.models import KnowledgeType
+    await _get_project_or_404(db, project_id)
+    await _require_workspace_role(db, _user, project_id, WorkspaceRole.EDITOR.value)
+
+    linked_ids_stmt = select(ProjectSource.source_id).where(
+        ProjectSource.project_id == uuid.UUID(project_id)
+    )
+    stmt = (
+        select(Source)
+        .options(selectinload(Source.knowledge_type))
+        .where(Source.id.notin_(linked_ids_stmt))
+        .order_by(Source.created_at.desc())
+        .limit(max(1, min(limit, 500)))
+    )
+    if search:
+        like = f"%{search.strip()}%"
+        stmt = stmt.where(
+            Source.title.ilike(like)
+            | Source.file_name.ilike(like)
+            | Source.url.ilike(like)
+        )
+
+    rows = (await db.execute(stmt)).scalars().all()
+    _ = KnowledgeType  # selectinload above takes care of it
+    return [
+        CandidateSourceOut(
+            id=str(s.id),
+            title=s.title,
+            file_name=s.file_name,
+            url=s.url,
+            knowledge_type_name=s.knowledge_type.name if s.knowledge_type else "",
+            source_type=s.source_type,
+            status=s.status,
+        )
+        for s in rows
+    ]
 
 
 @router.post("/projects/{project_id}/sources", status_code=201)

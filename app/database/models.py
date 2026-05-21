@@ -24,6 +24,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.dialects.postgresql import ENUM as PgEnum
@@ -633,9 +634,23 @@ class Employee(Base):
         UUID(as_uuid=True), ForeignKey("roles.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Legacy plaintext column — kept nullable for one release so a rollback is
+    # possible. The hashed column below is authoritative; new code never reads
+    # or writes mcp_token. Drop in a follow-up migration.
     mcp_token: Mapped[Optional[str]] = mapped_column(
         String(500), unique=True,
-        comment="Bearer token for MCP authentication",
+        comment="DEPRECATED — legacy plaintext token, no longer read or written",
+    )
+    mcp_token_hash: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True,
+        comment="HMAC-SHA256(pepper, token) — primary lookup key for MCP auth",
+    )
+    mcp_token_prefix: Mapped[Optional[str]] = mapped_column(
+        String(12), nullable=True,
+        comment="First 12 chars of the token for UI display (e.g. ark_aBcD…)",
+    )
+    mcp_token_rotated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
     )
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     last_connected: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
@@ -652,6 +667,12 @@ class Employee(Base):
 
     __table_args__ = (
         Index("ix_employees_mcp_token", "mcp_token"),
+        Index(
+            "ix_employees_mcp_token_hash",
+            "mcp_token_hash",
+            unique=True,
+            postgresql_where=text("mcp_token_hash IS NOT NULL"),
+        ),
         Index("ix_employees_department_id", "department_id"),
         Index("ix_employees_email", "email"),
     )

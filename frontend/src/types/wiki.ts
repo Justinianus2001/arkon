@@ -60,7 +60,7 @@ export type DraftStatus =
 
 export type DraftKind = "edit" | "create";
 
-export type AiCheckStatus = "pending" | "running" | "passed" | "warned" | "failed" | "skipped";
+export type AiCheckStatus = "pending" | "queued" | "running" | "passed" | "warned" | "failed" | "skipped";
 
 export type AiCheckItem = {
   id: string;

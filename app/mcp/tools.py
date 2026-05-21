@@ -49,7 +49,11 @@ async def _get_identity():
         identity = await auth_svc.verify_token(token)
         if identity is None:
             return None, "Invalid or inactive MCP token. Contact your administrator."
-        await session.commit()
+        # Only commit when verify_token actually bumped last_connected;
+        # otherwise this is a pure read and an empty COMMIT round-trips Redis
+        # latency for nothing on every MCP tool call.
+        if auth_svc.bumped_last_connected:
+            await session.commit()
 
     current_identity.set(identity)
     return identity, None
@@ -138,6 +142,72 @@ async def _can_contribute_to_page(session: AsyncSession, employee, page) -> bool
 
 
 # ---------------------------------------------------------------------------
+# Out-of-scope hint (Tier 1 — count + scope name, no titles/content leaked)
+# ---------------------------------------------------------------------------
+
+async def _format_oos_hint(session: AsyncSession, oos_hits: list) -> str:
+    """Aggregate out-of-scope search hits into a short "ask for access" hint.
+
+    Intentionally leaks ONLY (count, scope_type, scope_name) — never titles
+    or summaries — to avoid information disclosure across department or
+    workspace boundaries. A page title can itself be sensitive
+    (e.g. "Q1 layoffs — Engineering").
+    """
+    if not oos_hits:
+        return ""
+
+    from collections import Counter
+
+    from app.database.models import Department, Project
+
+    # Group by (scope_type, scope_id) → count.
+    buckets: Counter[tuple[str, str | None]] = Counter()
+    for page, _sim in oos_hits:
+        scope_type = page.scope_type or "global"
+        if scope_type == "global":
+            continue  # global pages should already be visible; defensive skip
+        scope_id = str(page.scope_id) if page.scope_id else None
+        buckets[(scope_type, scope_id)] += 1
+
+    if not buckets:
+        return ""
+
+    # Resolve human-readable scope labels.
+    labels: dict[tuple[str, str | None], str] = {}
+    for (scope_type, scope_id) in buckets.keys():
+        label: str | None = None
+        if scope_id:
+            import uuid as _uuid
+            try:
+                sid = _uuid.UUID(scope_id)
+            except (ValueError, TypeError):
+                sid = None
+            if sid is not None:
+                if scope_type == "department":
+                    d = await session.get(Department, sid)
+                    label = d.name if d else None
+                elif scope_type == "project":
+                    p = await session.get(Project, sid)
+                    label = p.name if p else None
+        labels[(scope_type, scope_id)] = label or "(unknown)"
+
+    lines = ["**Out-of-scope matches** — matching page(s) exist outside your access:"]
+    for (scope_type, scope_id), count in buckets.most_common():
+        label = labels[(scope_type, scope_id)]
+        if scope_type == "department":
+            lines.append(
+                f"- {count} page(s) in department **{label}** — "
+                f"contact the {label} department admin to request access."
+            )
+        elif scope_type == "project":
+            lines.append(
+                f"- {count} page(s) in workspace **{label}** — "
+                f"contact the workspace admin to be added as a member."
+            )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
 # Tool registration
 # ---------------------------------------------------------------------------
 
@@ -158,6 +228,12 @@ def register_tools(mcp: FastMCP):
         pages are persistent, interlinked summaries compiled from many sources,
         so they often answer cross-document questions in one read.
 
+        If the response includes an "Out-of-scope matches" section, pages
+        matching the query exist but live in a department or workspace the
+        caller is not a member of. Mention this back to the user so they can
+        request access from the listed scope's admin instead of assuming the
+        knowledge is missing.
+
         Args:
             query: Natural language search query.
             top_k: Maximum number of pages to return (default: 10, max: 50).
@@ -166,6 +242,8 @@ def register_tools(mcp: FastMCP):
             A ranked list of page slugs with titles, summaries, and similarity.
             Read the full page with `read_wiki_page(slug)`.
         """
+        import uuid as uuid_mod
+
         identity, err = await _get_identity()
         if err:
             return err
@@ -176,6 +254,8 @@ def register_tools(mcp: FastMCP):
         from app.ai.registry import ProviderRegistry
         from app.database import async_session_factory
         from app.services import wiki_service
+
+        proj_uuids = [uuid_mod.UUID(p) for p in identity.project_ids] or None
 
         async with async_session_factory() as session:
             registry = ProviderRegistry(session)
@@ -188,10 +268,30 @@ def register_tools(mcp: FastMCP):
                 top_k=top_k,
                 allowed_kt_slugs=identity.allowed_knowledge_types,
                 department_id=identity.department_id,
+                project_ids=proj_uuids,
+                all_scopes=identity.is_admin,
             )
 
+            # Out-of-scope peek — admins already see everything, so the hint
+            # only fires for non-admins. Limit to a small fixed sample so an
+            # adversary can't enumerate the entire org's page list via search.
+            oos_hint = ""
+            if not identity.is_admin:
+                oos_hits = await wiki_service.search_pages_semantic(
+                    session,
+                    query_embedding=query_embedding,
+                    top_k=5,
+                    department_id=identity.department_id,
+                    project_ids=proj_uuids,
+                    inverse_scope=True,
+                )
+                oos_hint = await _format_oos_hint(session, oos_hits)
+
         if not hits:
-            return f"No wiki pages found for: \"{query}\""
+            base = f"No wiki pages found for: \"{query}\""
+            if oos_hint:
+                return f"{base}\n\n{oos_hint}"
+            return base
 
         lines = [f"**Wiki search — {len(hits)} result(s) for: \"{query}\"**\n"]
         for page, sim in hits:
@@ -210,6 +310,9 @@ def register_tools(mcp: FastMCP):
             lines.append(entry)
 
         lines.append("\n_Use `read_wiki_page(slug)` to read the full markdown._")
+        if oos_hint:
+            lines.append("")
+            lines.append(oos_hint)
         return "\n".join(lines)
 
     @mcp.tool()
@@ -260,23 +363,79 @@ def register_tools(mcp: FastMCP):
         from app.database import async_session_factory
         from app.services import wiki_service
 
+        import uuid as uuid_mod
+        from sqlalchemy import select as sa_select
+
+        from app.database.models import Department, Project, WikiPage
+
+        proj_uuids = [uuid_mod.UUID(p) for p in identity.project_ids]
+
         async with async_session_factory() as session:
-            # Try exact slug in global scope first, then fall back to dept scope
+            # Try global → department → user's workspaces (in that order).
             page = await wiki_service.get_page_by_slug(
                 session, slug, allowed_kt_slugs=identity.allowed_knowledge_types,
             )
-            if not page:
+            if not page and identity.department_id is not None:
                 page = await wiki_service.get_page_by_slug(
                     session, slug,
                     allowed_kt_slugs=identity.allowed_knowledge_types,
                     scope_type="department",
                     scope_id=identity.department_id,
                 )
+            if not page and proj_uuids:
+                # Walk the user's workspaces until we hit a matching slug.
+                for pid in proj_uuids:
+                    page = await wiki_service.get_page_by_slug(
+                        session, slug,
+                        allowed_kt_slugs=identity.allowed_knowledge_types,
+                        scope_type="project",
+                        scope_id=pid,
+                    )
+                    if page:
+                        break
+
             if not page:
+                # Out-of-scope hint: does the slug exist in a scope the caller
+                # CAN'T access? If so, leak only the scope label (no content).
+                if not identity.is_admin:
+                    excluded_proj_ids = proj_uuids
+                    stmt = sa_select(WikiPage).where(WikiPage.slug == slug)
+                    others = (await session.execute(stmt)).scalars().all()
+                    inaccessible = [
+                        p for p in others
+                        if (
+                            (p.scope_type == "department" and p.scope_id != identity.department_id)
+                            or (
+                                p.scope_type == "project"
+                                and p.scope_id not in excluded_proj_ids
+                            )
+                        )
+                    ]
+                    if inaccessible:
+                        labels: list[str] = []
+                        for p in inaccessible:
+                            if p.scope_type == "department" and p.scope_id:
+                                d = await session.get(Department, p.scope_id)
+                                labels.append(
+                                    f"department **{d.name if d else '(unknown)'}**"
+                                )
+                            elif p.scope_type == "project" and p.scope_id:
+                                pr = await session.get(Project, p.scope_id)
+                                labels.append(
+                                    f"workspace **{pr.name if pr else '(unknown)'}**"
+                                )
+                        # Dedup while preserving order.
+                        seen: set[str] = set()
+                        unique_labels = [
+                            x for x in labels if not (x in seen or seen.add(x))
+                        ]
+                        joined = ", ".join(unique_labels)
+                        return (
+                            f"Wiki page `{slug}` exists in {joined} but you don't "
+                            f"have access. Contact the scope's admin to request access."
+                        )
                 return f"Wiki page not found or out of scope: `{slug}`"
-            # Access check: deny dept pages from other departments
-            if page.scope_type == "department" and page.scope_id != identity.department_id:
-                return f"Wiki page not found or out of scope: `{slug}`"
+
             backlinks = await wiki_service.get_backlinks(
                 session, slug, page.scope_type, page.scope_id,
             )
@@ -308,6 +467,8 @@ def register_tools(mcp: FastMCP):
         Returns:
             Slug, title, summary, type, and KnowledgeType slugs for each page.
         """
+        import uuid as uuid_mod
+
         identity, err = await _get_identity()
         if err:
             return err
@@ -315,6 +476,8 @@ def register_tools(mcp: FastMCP):
 
         from app.database import async_session_factory
         from app.services import wiki_service
+
+        proj_uuids = [uuid_mod.UUID(p) for p in identity.project_ids] or None
 
         async with async_session_factory() as session:
             pages = await wiki_service.list_pages(
@@ -325,6 +488,8 @@ def register_tools(mcp: FastMCP):
                 limit=limit,
                 offset=offset,
                 department_id=identity.department_id,
+                project_ids=proj_uuids,
+                all_scopes=identity.is_admin,
             )
 
         if not pages:
@@ -1476,6 +1641,7 @@ def register_tools(mcp: FastMCP):
 
         if not slug or not title or not content_md.strip():
             return "Error: slug, title, and content_md are required."
+        slug = slug.strip()
         if slug in ("_index", "_log"):
             return "Error: '_index' and '_log' are reserved slugs."
         if len(content_md) > 50_000:
@@ -1596,8 +1762,11 @@ def register_tools(mcp: FastMCP):
 
         if not slug or not title or not content_md.strip():
             return "Error: slug, title, and content_md are required."
+        slug = slug.strip()
         if slug in ("_index", "_log"):
             return "Error: '_index' and '_log' are reserved slugs."
+        if any(c.isspace() for c in slug):
+            return "Error: slug must not contain whitespace."
         if page_type not in wiki_service.PAGE_TYPES:
             return f"Error: page_type must be one of {sorted(wiki_service.PAGE_TYPES)}."
         if scope_type not in ("global", "department", "project"):

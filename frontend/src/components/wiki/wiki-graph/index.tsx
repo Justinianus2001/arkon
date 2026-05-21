@@ -48,6 +48,95 @@ const EDGE_HIGHLIGHT = "#c2652a";
 const LABEL_COLOR = "#3a302a";
 const BG_COLOR = "#faf5ee";
 
+// Above this many scopes the legend grows a filter input + scrollable list.
+// Below it, the flat list is fine and a search box would just add noise.
+const SCOPE_LIST_SCROLL_THRESHOLD = 8;
+
+type ScopeCount = { label: string; count: number; scopeType: string };
+
+function ScopeLegendSection({ scopeCounts }: { scopeCounts: ScopeCount[] }) {
+  const [query, setQuery] = React.useState("");
+  const showFilter = scopeCounts.length > SCOPE_LIST_SCROLL_THRESHOLD;
+
+  const visible = React.useMemo(() => {
+    const q = query.trim().toLowerCase();
+    if (!q) return scopeCounts;
+    return scopeCounts.filter((s) => s.label.toLowerCase().includes(q));
+  }, [scopeCounts, query]);
+
+  return (
+    <>
+      <div className="mt-2 pt-2 border-t border-border/50 mb-1.5 font-semibold text-foreground text-xs flex items-center justify-between gap-2">
+        <span>Scope</span>
+        <span className="text-[10px] font-normal text-muted-foreground/70 tabular-nums">
+          {showFilter && query
+            ? `${visible.length}/${scopeCounts.length}`
+            : scopeCounts.length}
+        </span>
+      </div>
+      {showFilter && (
+        <div className="mb-1.5 relative">
+          <span
+            className="material-symbols-outlined absolute left-1.5 top-1/2 -translate-y-1/2 text-muted-foreground/60 pointer-events-none"
+            style={{ fontSize: 12 }}
+          >
+            search
+          </span>
+          <input
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Filter scopes…"
+            className="w-full h-6 pl-5 pr-5 text-[11px] rounded border border-border/60 bg-background/70 focus:bg-background outline-none focus:border-primary/40 transition-colors"
+          />
+          {query && (
+            <button
+              type="button"
+              onClick={() => setQuery("")}
+              className="absolute right-1 top-1/2 -translate-y-1/2 text-muted-foreground/60 hover:text-foreground"
+              aria-label="Clear filter"
+            >
+              <span className="material-symbols-outlined" style={{ fontSize: 12 }}>
+                close
+              </span>
+            </button>
+          )}
+        </div>
+      )}
+      <div
+        className={`flex flex-col gap-1 ${
+          showFilter ? "max-h-44 overflow-y-auto pr-0.5" : ""
+        }`}
+      >
+        {visible.length === 0 ? (
+          <p className="text-[11px] text-muted-foreground/60 italic px-1 py-0.5">
+            No matching scopes.
+          </p>
+        ) : (
+          visible.map(({ label, count, scopeType }) => (
+            <div
+              key={label}
+              className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-accent/30 transition-colors"
+            >
+              <span
+                className="material-symbols-outlined text-muted-foreground"
+                style={{ fontSize: 12 }}
+              >
+                {scopeType === "project"
+                  ? "folder_special"
+                  : scopeType === "department"
+                  ? "business"
+                  : "public"}
+              </span>
+              <span className="text-muted-foreground truncate">{label}</span>
+              <span className="text-muted-foreground/60 ml-auto tabular-nums">{count}</span>
+            </div>
+          ))
+        )}
+      </div>
+    </>
+  );
+}
+
 export function WikiGraph({
   nodes: rawNodes,
   edges: rawEdges,
@@ -571,32 +660,7 @@ export function WikiGraph({
               ))}
           </div>
           {scopeCounts.length > 0 && (
-            <>
-              <div className="mt-2 pt-2 border-t border-border/50 mb-1.5 font-semibold text-foreground text-xs">
-                Scope
-              </div>
-              <div className="flex flex-col gap-1">
-                {scopeCounts.map(({ label, count, scopeType }) => (
-                  <div
-                    key={label}
-                    className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-accent/30 transition-colors"
-                  >
-                    <span
-                      className="material-symbols-outlined text-muted-foreground"
-                      style={{ fontSize: 12 }}
-                    >
-                      {scopeType === "project"
-                        ? "folder_special"
-                        : scopeType === "department"
-                        ? "business"
-                        : "public"}
-                    </span>
-                    <span className="text-muted-foreground truncate">{label}</span>
-                    <span className="text-muted-foreground/60 ml-auto tabular-nums">{count}</span>
-                  </div>
-                ))}
-              </div>
-            </>
+            <ScopeLegendSection scopeCounts={scopeCounts} />
           )}
         </div>
       )}

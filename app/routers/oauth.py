@@ -44,6 +44,37 @@ async def oauth_metadata(request: Request):
 
 
 # ---------------------------------------------------------------------------
+# OAuth Protected Resource metadata (RFC 9728)
+#
+# Advertises that /mcp is an OAuth-protected resource and points clients
+# (Claude Desktop, etc.) at the authorization server. Returned in the
+# WWW-Authenticate header on 401 responses from /mcp so clients can
+# auto-discover the OAuth flow.
+# ---------------------------------------------------------------------------
+
+@wellknown_router.get("/.well-known/oauth-protected-resource")
+async def oauth_protected_resource_metadata(request: Request):
+    base = str(request.base_url).rstrip("/")
+    return {
+        "resource": f"{base}/mcp",
+        "authorization_servers": [base],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": [],
+        "resource_name": "Arkon MCP",
+        "resource_documentation": f"{base}/docs",
+    }
+
+
+# RFC 9728 §3.1 encodes the resource path into the well-known URL: for
+# resource https://host/mcp the metadata location is
+# /.well-known/oauth-protected-resource/mcp. Serve the same document there
+# so clients that follow that convention also find it.
+@wellknown_router.get("/.well-known/oauth-protected-resource/mcp")
+async def oauth_protected_resource_metadata_path_suffix(request: Request):
+    return await oauth_protected_resource_metadata(request)
+
+
+# ---------------------------------------------------------------------------
 # Dynamic client registration (RFC 7591)
 # ---------------------------------------------------------------------------
 

@@ -4,6 +4,7 @@ export type GraphNode = SimulationNodeDatum & {
   slug: string;
   title: string;
   page_type: string;
+  status?: string;
   scope_type?: string;
   scope_name?: string | null;
   degree?: number;
@@ -18,6 +19,7 @@ export type NodeInput = {
   slug: string;
   title: string;
   page_type: string;
+  status?: string;
   scope_type?: string;
   scope_id?: string | null;
   scope_name?: string | null;

@@ -18,6 +18,13 @@ from fastmcp import FastMCP
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.mcp.logging import current_identity, logged_tool
+from app.mcp.permissions import (
+    ANY_AUTHENTICATED,
+    CAN_CONTRIBUTE_WIKI,
+    CAN_CREATE_WIKI_DIRECT,
+    CAN_REVIEW_WIKI,
+    kb_tool,
+)
 
 # ---------------------------------------------------------------------------
 # Auth helpers
@@ -136,7 +143,7 @@ async def _can_contribute_to_page(session: AsyncSession, employee, page) -> bool
             return True
         return (
             "wiki:write:own_dept" in perms
-            and employee.department_id == page.scope_id
+            and page.scope_id in employee.department_ids
         )
     return has_any_permission(list(perms), "wiki", "write")
 
@@ -218,7 +225,7 @@ def register_tools(mcp: FastMCP):
     # Wiki layer — synthesized markdown pages compiled from sources
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("search_wiki", query_arg="query")
     async def search_wiki(query: str, top_k: int = 10) -> str:
         """
@@ -267,7 +274,7 @@ def register_tools(mcp: FastMCP):
                 query_embedding=query_embedding,
                 top_k=top_k,
                 allowed_kt_slugs=identity.allowed_knowledge_types,
-                department_id=identity.department_id,
+                department_ids=identity.department_ids,
                 project_ids=proj_uuids,
                 all_scopes=identity.is_admin,
             )
@@ -281,7 +288,7 @@ def register_tools(mcp: FastMCP):
                     session,
                     query_embedding=query_embedding,
                     top_k=5,
-                    department_id=identity.department_id,
+                    department_ids=identity.department_ids,
                     project_ids=proj_uuids,
                     inverse_scope=True,
                 )
@@ -315,7 +322,7 @@ def register_tools(mcp: FastMCP):
             lines.append(oos_hint)
         return "\n".join(lines)
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("read_wiki_index")
     async def read_wiki_index() -> str:
         """
@@ -340,7 +347,7 @@ def register_tools(mcp: FastMCP):
             return "_(wiki index not initialized yet)_"
         return page.content_md
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("read_wiki_page", query_arg="slug")
     async def read_wiki_page(slug: str) -> str:
         """
@@ -375,13 +382,17 @@ def register_tools(mcp: FastMCP):
             page = await wiki_service.get_page_by_slug(
                 session, slug, allowed_kt_slugs=identity.allowed_knowledge_types,
             )
-            if not page and identity.department_id is not None:
-                page = await wiki_service.get_page_by_slug(
-                    session, slug,
-                    allowed_kt_slugs=identity.allowed_knowledge_types,
-                    scope_type="department",
-                    scope_id=identity.department_id,
-                )
+            if not page and identity.department_ids:
+                # Walk the user's departments until we hit a matching slug.
+                for did in identity.department_ids:
+                    page = await wiki_service.get_page_by_slug(
+                        session, slug,
+                        allowed_kt_slugs=identity.allowed_knowledge_types,
+                        scope_type="department",
+                        scope_id=did,
+                    )
+                    if page:
+                        break
             if not page and proj_uuids:
                 # Walk the user's workspaces until we hit a matching slug.
                 for pid in proj_uuids:
@@ -404,7 +415,7 @@ def register_tools(mcp: FastMCP):
                     inaccessible = [
                         p for p in others
                         if (
-                            (p.scope_type == "department" and p.scope_id != identity.department_id)
+                            (p.scope_type == "department" and p.scope_id not in identity.department_ids)
                             or (
                                 p.scope_type == "project"
                                 and p.scope_id not in excluded_proj_ids
@@ -447,20 +458,22 @@ def register_tools(mcp: FastMCP):
             )
         return body
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("list_wiki_pages")
     async def list_wiki_pages(
         page_type: Optional[str] = None,
         knowledge_type: Optional[str] = None,
+        query: Optional[str] = None,
         limit: int = 50,
         offset: int = 0,
     ) -> str:
         """
-        Browse wiki pages with filters. Reserved pages (`_index`, `_log`) are excluded.
+        Browse wiki pages with filters and text search. Reserved pages (`_index`, `_log`) are excluded.
 
         Args:
             page_type: Filter by type — "entity", "concept", "topic", "source".
             knowledge_type: Filter by KnowledgeType slug.
+            query: Optional substring search query (case-insensitive) matched against title, slug, and content.
             limit: Max pages to return (default: 50).
             offset: Number of pages to skip for pagination (default: 0).
 
@@ -485,9 +498,10 @@ def register_tools(mcp: FastMCP):
                 page_type=page_type,
                 knowledge_type_slug=knowledge_type,
                 allowed_kt_slugs=identity.allowed_knowledge_types,
+                query=query,
                 limit=limit,
                 offset=offset,
-                department_id=identity.department_id,
+                department_ids=identity.department_ids,
                 project_ids=proj_uuids,
                 all_scopes=identity.is_admin,
             )
@@ -508,7 +522,7 @@ def register_tools(mcp: FastMCP):
     # Raw source drill-down (PageIndex-inspired)
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("get_source", query_arg="source_id")
     async def get_source(source_id: str) -> str:
         """
@@ -569,7 +583,7 @@ def register_tools(mcp: FastMCP):
             lines.append(f"- **Added:** {source.created_at.strftime('%Y-%m-%d %H:%M')}")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("get_source_outline", query_arg="source_id")
     async def get_source_outline(source_id: str) -> str:
         """
@@ -621,7 +635,7 @@ def register_tools(mcp: FastMCP):
         _walk(outline)
         return "\n".join(lines)
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("get_source_pages", query_arg="source_id")
     async def get_source_pages(source_id: str, pages: str) -> str:
         """
@@ -677,24 +691,128 @@ def register_tools(mcp: FastMCP):
             parts.append(f"--- page {s['page']} ---\n{s['content']}")
         return "\n\n".join(parts)
 
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
+    @logged_tool("search_source_content", query_arg="query")
+    async def search_source_content(
+        query: str,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> str:
+        """
+        Search inside the full text of raw source documents.
+
+        Use this tool when the wiki summarizes or paraphases too much and you
+        need to search across all raw text documents to locate specific terms,
+        clauses, product codes, or quotes.
+
+        Args:
+            query: Exact keyword or phrase to search for in document contents.
+            limit: Max sources to return matches for (default: 10).
+            offset: Number of sources to skip for pagination (default: 0).
+
+        Returns:
+            Matched source documents, their matching page numbers, and highlighted context snippets.
+        """
+        import re
+        from sqlalchemy import select
+
+        from app.database import async_session_factory
+        from app.database.models import Source
+        from app.services.mcp_auth_service import apply_scope_filter
+
+        identity, err = await _get_identity()
+        if err:
+            return err
+        assert identity is not None
+
+        query = query.strip()
+        if not query:
+            return "Error: query parameter must not be empty."
+
+        async with async_session_factory() as session:
+            stmt = select(Source).where(
+                Source.status == "ready",
+                Source.full_text.ilike(f"%{query}%")
+            )
+            stmt = apply_scope_filter(stmt, identity).offset(offset).limit(limit)
+            sources = (await session.execute(stmt)).scalars().all()
+
+        if not sources:
+            return f"No document content matches found for: \"{query}\""
+
+        try:
+            pattern = re.compile(re.escape(query), re.IGNORECASE)
+        except Exception:
+            pattern = None
+
+        lines = [f"**Content search results for: \"{query}\"**\n"]
+        for s in sources:
+            text = s.full_text or ""
+            offsets = s.page_offsets or []
+            title = s.title or s.file_name or s.url or "Untitled Source"
+
+            matches_in_doc = []
+            if pattern:
+                for match in pattern.finditer(text):
+                    start_char = match.start()
+                    page_num = 1
+                    if offsets:
+                        for idx, off in enumerate(offsets):
+                            if start_char < off:
+                                page_num = idx
+                                break
+                            page_num = len(offsets)
+
+                    start_window = max(0, start_char - 80)
+                    end_window = min(len(text), match.end() + 80)
+                    snippet = text[start_window:end_window].strip().replace("\n", " ")
+                    if start_window > 0:
+                        snippet = "..." + snippet
+                    if end_window < len(text):
+                        snippet = snippet + "..."
+
+                    # Highlight the query using bold Markdown
+                    highlighted_snippet = re.sub(
+                        re.escape(query),
+                        lambda m: f"**{m.group(0)}**",
+                        snippet,
+                        flags=re.IGNORECASE
+                    )
+
+                    matches_in_doc.append((page_num, highlighted_snippet))
+                    if len(matches_in_doc) >= 3:
+                        break
+
+            lines.append(f"### {title} (ID: `{s.id}`)")
+            if matches_in_doc:
+                for p_num, snip in matches_in_doc:
+                    lines.append(f"- **Page {p_num}**: {snip}")
+            else:
+                lines.append("- Keyword matches found in full text.")
+            lines.append("")
+
+        return "\n".join(lines)
+
     # =========================================================================
     # Source/Type browsing
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("list_sources")
     async def list_sources(
         status: str = "ready",
         knowledge_type: Optional[str] = None,
+        query: Optional[str] = None,
         limit: int = 20,
         offset: int = 0,
     ) -> str:
         """
-        List raw source documents with optional filters.
+        List raw source documents with optional filters and text search.
 
         Args:
             status: "ready", "processing", "error", or "all".
             knowledge_type: Filter by KnowledgeType slug.
+            query: Optional text query (case-insensitive) to search in title, filename, or URL.
             limit: Max sources to return (default: 20).
             offset: Number of sources to skip for pagination (default: 0).
         """
@@ -724,6 +842,12 @@ def register_tools(mcp: FastMCP):
                 )).scalar()
                 if kt_id:
                     stmt = stmt.where(Source.knowledge_type_id == kt_id)
+            if query:
+                stmt = stmt.where(
+                    Source.title.ilike(f"%{query}%") |
+                    Source.file_name.ilike(f"%{query}%") |
+                    Source.url.ilike(f"%{query}%")
+                )
             stmt = apply_scope_filter(stmt, identity).offset(offset).limit(limit)
             sources = (await session.execute(stmt)).scalars().all()
 
@@ -731,6 +855,8 @@ def register_tools(mcp: FastMCP):
             msg = "No documents found"
             if knowledge_type:
                 msg += f" of type '{knowledge_type}'"
+            if query:
+                msg += f" matching '{query}'"
             return msg + "."
 
         from collections import defaultdict
@@ -747,7 +873,7 @@ def register_tools(mcp: FastMCP):
                 lines.append(f"- **{title}** (ID: `{s.id}`)")
         return "\n".join(lines)
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("list_knowledge_types")
     async def list_knowledge_types() -> str:
         """
@@ -793,7 +919,7 @@ def register_tools(mcp: FastMCP):
             return "No accessible knowledge types found for your scope."
         return "\n".join(lines)
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=ANY_AUTHENTICATED)
     @logged_tool("get_knowledge_type_docs", query_arg="knowledge_type_slug")
     async def get_knowledge_type_docs(knowledge_type_slug: str, limit: int = 10) -> str:
         """
@@ -849,7 +975,7 @@ def register_tools(mcp: FastMCP):
     # Tier 2 — Contribute (member-level, requires review)
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_CONTRIBUTE_WIKI)
     @logged_tool("propose_wiki_edit", query_arg="slug")
     async def propose_wiki_edit(
         slug: str,
@@ -971,7 +1097,7 @@ def register_tools(mcp: FastMCP):
     # Tier 3 — Direct Edit (editor/admin only, no review)
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_CREATE_WIKI_DIRECT)
     @logged_tool("edit_wiki_page", query_arg="slug")
     async def edit_wiki_page(
         slug: str,
@@ -1073,7 +1199,7 @@ def register_tools(mcp: FastMCP):
     # Tier 4 — Review (editor/admin only)
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_REVIEW_WIKI)
     @logged_tool("list_pending_drafts")
     async def list_pending_drafts(
         workspace_id: Optional[str] = None,
@@ -1163,7 +1289,7 @@ def register_tools(mcp: FastMCP):
             return "No pending drafts found."
         return f"**{len(lines)} pending draft(s):**\n\n" + "\n".join(lines)
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_REVIEW_WIKI)
     @logged_tool("review_draft", query_arg="draft_id")
     async def review_draft(draft_id: str) -> str:
         """
@@ -1228,7 +1354,7 @@ def register_tools(mcp: FastMCP):
             f"### Current page content (v{page.version})\n\n{page.content_md or '_(empty)_'}"
         )
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_REVIEW_WIKI)
     @logged_tool("approve_draft", query_arg="draft_id")
     async def approve_draft(
         draft_id: str,
@@ -1329,7 +1455,7 @@ def register_tools(mcp: FastMCP):
 
         return f"Draft `{draft_id}` approved. Page `{page.slug}` updated to v{page.version}."
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_REVIEW_WIKI)
     @logged_tool("reject_draft", query_arg="draft_id")
     async def reject_draft(draft_id: str, reviewer_note: str) -> str:
         """
@@ -1398,7 +1524,7 @@ def register_tools(mcp: FastMCP):
     # Tier 5 — needs_revision flow (request changes / resubmit / withdraw)
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_REVIEW_WIKI)
     @logged_tool("request_changes_on_draft", query_arg="draft_id")
     async def request_changes_on_draft(draft_id: str, reviewer_note: str) -> str:
         """
@@ -1470,7 +1596,7 @@ def register_tools(mcp: FastMCP):
             f"The author can resubmit when ready."
         )
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_CONTRIBUTE_WIKI)
     @logged_tool("resubmit_draft", query_arg="draft_id")
     async def resubmit_draft(
         draft_id: str,
@@ -1538,7 +1664,7 @@ def register_tools(mcp: FastMCP):
             "Reviewers have been notified."
         )
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_CONTRIBUTE_WIKI)
     @logged_tool("withdraw_draft", query_arg="draft_id")
     async def withdraw_draft(draft_id: str) -> str:
         """
@@ -1598,7 +1724,7 @@ def register_tools(mcp: FastMCP):
     # Tier 6 — Create new pages (propose for contributors, direct for editors)
     # =========================================================================
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_CONTRIBUTE_WIKI)
     @logged_tool("propose_wiki_create", query_arg="slug")
     async def propose_wiki_create(
         slug: str,
@@ -1680,7 +1806,7 @@ def register_tools(mcp: FastMCP):
                         return "Error: requires contributor role or above in this workspace."
                 elif scope_type == "department" and sid:
                     if "wiki:write:all" not in perms and not (
-                        "wiki:write:own_dept" in perms and employee.department_id == sid
+                        "wiki:write:own_dept" in perms and sid in employee.department_ids
                     ):
                         return "Error: insufficient permission to propose pages in this department."
                 else:
@@ -1724,7 +1850,7 @@ def register_tools(mcp: FastMCP):
             f"Note: {note or '(none)'}"
         )
 
-    @mcp.tool()
+    @kb_tool(mcp, requires=CAN_CREATE_WIKI_DIRECT)
     @logged_tool("create_wiki_page", query_arg="slug")
     async def create_wiki_page(
         slug: str,

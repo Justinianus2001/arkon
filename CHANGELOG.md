@@ -5,6 +5,162 @@ Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **MCP `tools/list` now scopes by bearer-token identity.** Reviewer- and
+  contributor-tier tools no longer appear in the catalog for callers who
+  couldn't use them. Read-only employees see the read surface only;
+  workspace contributors additionally see propose/resubmit/withdraw;
+  workspace editors and `wiki:write:all` holders see the review queue
+  and direct-write tools; admins see everything. Unauthenticated and
+  invalid-token callers see only the read surface, with an
+  "Authenticate to use" hint prepended to each tool description so the
+  client can guide the user back to token configuration. Implemented as
+  a FastMCP middleware (`ScopedToolsMiddleware`) reading a per-tool
+  `ToolRequirement` declared via the new `@kb_tool` decorator —
+  per-resource checks inside tool bodies are unchanged and remain the
+  security boundary. Role changes require an MCP reconnect to take
+  effect.
+- `ResolvedIdentity` now carries `workspace_roles: dict[str, str]`
+  (workspace_id → role) so visibility predicates run without an extra
+  DB round-trip per `tools/list`.
+
+---
+
+## [0.7.4] — 2026-05-20
+
+Member-management overhaul, dedicated wiki review console, and an MCP
+scope-leak fix that had been making project-scoped wiki pages invisible
+to their own workspace members. Three new features and two bug fixes
+on top of the 0.7.3 critical-review pass.
+
+### Added
+
+- **Dedicated 3-pane wiki review console at `/wiki/review`** — built for
+  high-volume reviewers who would otherwise burn one full page navigation
+  per draft. Left pane lists the queue with `To review` / `Mine` scope
+  toggle and status filter; center pane shows the diff / proposed /
+  current tabs with a compare-with dropdown across sibling drafts on the
+  same page; right pane carries author stats, AI pre-review verdict, and
+  the action stack. URL state (`?draft=&status=&mine=`) is the source of
+  truth so deep links and browser history work. Keyboard shortcuts:
+  `j`/`k` next-prev, `a` approve, `c` request changes, `r` reject,
+  `Esc` cancel, `?` help overlay. The existing `WikiDraftBanner` on
+  `/wiki/[slug]` is intentionally kept for casual reviewers.
+- **Bulk workspace member invite** — typeahead + chips multi-select
+  replaces the one-add-per-click picker. Type to filter by name/email,
+  `↑↓` navigate, `Enter` pick, `Backspace` pop the last chip. A single
+  role applies to the whole batch. New backend endpoint
+  `POST /api/projects/{id}/members/bulk` accepts `{employee_ids, role}`
+  and processes each row in its own SAVEPOINT so a duplicate /
+  IntegrityError / missing employee in the batch doesn't poison the
+  rest. Chips for errored employees stay in the input so admins can
+  fix and retry without re-typing.
+- **Workspace-scoped candidate endpoints** — `GET
+  /api/projects/{id}/members/candidates` (workspace admin) and
+  `GET /api/projects/{id}/sources/candidates` (workspace editor+) return
+  not-yet-linked employees / sources with `?search=` substring filter.
+  Replaces the previous frontend dependency on the org-wide
+  `/api/employees` / `/api/sources` lists.
+- **Out-of-scope discovery hint in MCP** — when a non-admin caller's
+  `search_wiki` query matches pages in a department or workspace they
+  can't access, the response appends an "Out-of-scope matches" section
+  listing `(scope_label, count)` groups (e.g. "3 page(s) in department
+  HR — contact the HR admin to request access"). `read_wiki_page` does
+  the same when the slug exists in an inaccessible scope. The hint
+  leaks **only** scope label + count — titles and content are never
+  surfaced across a permission boundary.
+- **Scrollable + filterable scope legend on the wiki graph** — the
+  `Scope` section grows a `Filter scopes…` input and a `max-h-44` scroll
+  cap once it has more than 8 entries. Below that threshold it stays
+  identical to before. Header shows `visible/total` while filtering.
+
+### Fixed
+
+- **Project-scope blindspot in wiki read path** — the MCP wiki layer
+  filtered visible pages with a `global + own_dept` OR-clause that
+  completely omitted project-scoped pages, even for the workspace's
+  own members. `search_wiki` returned 0 hits against pages a user
+  obviously had access to, forcing them to drill into raw sources to
+  discover the wiki page existed. New helper
+  `_scope_filter_for_identity(department_id, project_ids)` ORs the
+  third branch in; `ResolvedIdentity` carries a `project_ids` list
+  populated from active workspace memberships. `search_pages_semantic`,
+  `list_pages`, and `read_wiki_page` all updated. Incidental: admins
+  were also being scope-filtered to own_dept — `all_scopes=True` now
+  bypasses the filter entirely for admin identities.
+- **Workspace admins couldn't open their own workspace** — the project
+  detail page fetched `/api/employees?page_size=500` to populate the
+  picker, which required `org:employees:read` — a permission workspace
+  admins do not have. The 403 sank the `Promise.all` and showed
+  "Failed to load project details" with no fallback. Fixed by swapping
+  to the new candidate endpoints, using `Promise.allSettled` so a 403
+  on the side fetches no longer kills the page, and computing
+  `canAdminWorkspace = isOrgAdmin || workspaceRole === 'admin'` so the
+  picker UI shows for workspace admins who aren't org admins.
+
+### Docs
+
+- `docs/ACCESS-CONTROL.md`, `docs/WIKI.md`, `docs/ARCHITECTURE.md`,
+  `docs/MCP.md` all caught up: project-scope OR branch documented,
+  AI pre-review (L1→L4) + resubmit race guard + stuck-running sweep,
+  review console layout + shortcuts, token hashing at rest + forced
+  rotation after migration 027, draft state machine with the
+  needs_revision loop, new worker tasks and cron jobs, OOS hint
+  format, and updated data-model section.
+
+---
+
+## [0.7.3] — 2026-05-20
+
+Follow-up critical review on top of 0.7.2 — three concurrency / data-loss
+issues uncovered by re-reading the AI pre-review path, bulk-approve loop,
+and approve_draft scope parser after the 0.7.2 fixes settled.
+
+### Fixed
+
+- **AI pre-review stale verdict on resubmit** — the L3/L4 worker
+  could finish a check pass against the OLD `content_md` of a draft
+  that the author had already resubmitted, then overwrite the newer
+  worker's verdict on commit. The submit path now passes
+  `revision_round` to the job, and the runner `refresh()`-es the draft
+  immediately before writing its verdict — if the round has bumped it
+  drops the stale result. A newer worker is already queued for the
+  new content.
+- **Bulk approve ORM identity-map pollution** — `db.begin_nested()`
+  correctly rolled back the SAVEPOINT in Postgres on a per-draft
+  failure, but SQLAlchemy does NOT revert in-memory attribute
+  mutations on persistent objects when a savepoint rolls back. A
+  failed approve would leave `page.version = N+1` / `draft.status =
+  "approved"` on the still-attached instances, polluting the next
+  iteration that touched the same page (wrong version label,
+  miscounted notification). The router now `db.expire(draft, page)`
+  in the savepoint's except branch so a fresh load reads true DB state.
+- **`scope_id` parse crashed on non-string non-UUID values** —
+  `wiki_service.approve_draft` only caught `ValueError` when reading
+  `suggested_metadata.scope_id`. Hand-crafted or migrated rows with
+  e.g. an int there would `TypeError` in `uuid.UUID(...)` and surface
+  as a 500. Now catches `(ValueError, TypeError)` and `isinstance`-
+  validates, matching the defensive parse in
+  `wiki_drafts._can_review_draft`.
+
+### Added
+
+- **`sweep_stuck_ai_review_cron`** — runs every 10 minutes; resets any
+  draft stuck in `ai_check_status="running"` for more than
+  `2 × worker_job_timeout` (min 30 min) back to `"skipped"`. Catches
+  the case where the AI worker process is SIGKILL/OOM-killed AFTER
+  committing `running` but BEFORE finishing the check pass — the
+  in-worker try/except can't run during a hard process death, so
+  without the sweep the UI would show a perpetual spinner. The
+  `ai_pre_review_draft_task` signature is backwards-compatible:
+  jobs enqueued by older code (without `expected_round`) still run
+  to completion but skip the race guard.
+
+---
+
 ## [0.7.2] — 2026-05-20
 
 Critical-review batch: data-integrity, race, and security findings from a

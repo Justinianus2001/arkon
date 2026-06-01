@@ -26,6 +26,7 @@ Connection:
 
 from fastmcp import FastMCP
 
+from app.mcp.middleware import ScopedToolsMiddleware
 from app.mcp.resources import register_resources
 from app.mcp.tools import register_tools
 
@@ -61,5 +62,9 @@ def create_mcp_server() -> FastMCP:
     # Register all tools and resources
     register_tools(mcp)
     register_resources(mcp)
+
+    # Filter `tools/list` per bearer-token identity. Must run after tools are
+    # registered so the middleware can read `__arkon_requires__` off each fn.
+    mcp.add_middleware(ScopedToolsMiddleware())
 
     return mcp

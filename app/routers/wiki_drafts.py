@@ -11,18 +11,16 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, field_validator
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, or_, func, select
 from sqlalchemy.orm import selectinload
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.database.models import (
     Employee,
-    ProjectMember,
     WikiDraftRound,
     WikiPage,
     WikiPageDraft,
-    WorkspaceRole,
 )
 from app.services import contribution_service, wiki_service
 from app.services.audit_service import log_audit
@@ -33,9 +31,7 @@ from app.services.contribution_service import (
 )
 from app.services.permission_engine import (
     _get_user_permissions,
-    get_workspace_role,
     has_any_permission,
-    workspace_role_can,
 )
 
 router = APIRouter()
@@ -51,6 +47,7 @@ class ProposeDraftRequest(BaseModel):
     base_version: Optional[int] = None
     scope_type: Optional[str] = None
     scope_id: Optional[uuid.UUID] = None
+    branch_id: Optional[uuid.UUID] = None
 
     @field_validator("content_md")
     @classmethod
@@ -72,6 +69,7 @@ class ProposeCreateRequest(BaseModel):
     content_md: str
     summary: str = ""
     note: Optional[str] = None
+    branch_id: Optional[uuid.UUID] = None
 
     @field_validator("content_md")
     @classmethod
@@ -102,8 +100,8 @@ class ProposeCreateRequest(BaseModel):
     @field_validator("scope_type")
     @classmethod
     def scope_known(cls, v: str) -> str:
-        if v not in ("global", "department", "project"):
-            raise ValueError("scope_type must be global, department, or project")
+        if v not in ("global", "department"):
+            raise ValueError("scope_type must be global or department")
         return v
 
 
@@ -242,35 +240,27 @@ class DraftResponse(BaseModel):
 async def _can_propose(db: AsyncSession, user: Employee, page: WikiPage) -> bool:
     """Permission to propose an edit on `page`.
 
-    - Project pages: workspace contributor+ (or admin).
     - Department pages: `wiki:write:all` for any dept, or
       `wiki:write:own_dept` ONLY when the page belongs to the user's own
-      department. Previously this branch fell through to `has_any_permission`
-      which let own_dept users propose on every department.
+      department.
     - Global pages: any wiki:write permission.
     """
     if user.role == "admin":
         return True
     perms = _get_user_permissions(user)
-    if page.scope_type == "project" and page.scope_id:
-        role = await get_workspace_role(db, user, page.scope_id)
-        return bool(role) and workspace_role_can(role, "contributor")
     if page.scope_type == "department" and page.scope_id:
         if "wiki:write:all" in perms:
             return True
-        if "wiki:write:own_dept" in perms and user.department_id == page.scope_id:
+        if "wiki:write:own_dept" in perms and page.scope_id in user.department_ids:
             return True
         return False
     return has_any_permission(list(perms), "wiki", "write")
 
 
 async def _can_review(db: AsyncSession, user: Employee, page: WikiPage) -> bool:
-    """Editor+ in workspace, or wiki:write:all, or admin."""
+    """wiki:write:all, or admin."""
     if user.role == "admin":
         return True
-    if page.scope_type == "project" and page.scope_id:
-        role = await get_workspace_role(db, user, page.scope_id)
-        return bool(role) and workspace_role_can(role, "editor")
     perms = _get_user_permissions(user)
     return "wiki:write:all" in perms
 
@@ -281,13 +271,9 @@ async def _can_review_scope(
     scope_type: str,
     scope_id: Optional[uuid.UUID],
 ) -> bool:
-    """Reviewer check for a (scope_type, scope_id) pair — used by create
-    drafts where no page exists yet."""
+    """Reviewer check for a (scope_type, scope_id) pair."""
     if user.role == "admin":
         return True
-    if scope_type == "project" and scope_id:
-        role = await get_workspace_role(db, user, scope_id)
-        return bool(role) and workspace_role_can(role, "editor")
     perms = _get_user_permissions(user)
     return "wiki:write:all" in perms
 
@@ -321,8 +307,7 @@ def _build_reviewable_page_filter(user: Employee):
     """SQL filter selecting WikiPage rows the user can review (editor+).
 
     Returns None if the user can review everything (admin / wiki:write:all),
-    a falsy filter if they can review nothing, otherwise an OR clause covering
-    project-scoped pages the user is editor+ in (no global/department review).
+    otherwise a falsy filter (False) since there are no more project scopes.
     """
     if user.role == "admin":
         return None
@@ -331,15 +316,8 @@ def _build_reviewable_page_filter(user: Employee):
     if can_global:
         return None
 
-    editor_levels = [WorkspaceRole.EDITOR.value, WorkspaceRole.ADMIN.value]
-    workspace_pages = select(ProjectMember.project_id).where(
-        ProjectMember.employee_id == user.id,
-        ProjectMember.role.in_(editor_levels),
-    )
-    return and_(
-        WikiPage.scope_type == "project",
-        WikiPage.scope_id.in_(workspace_pages),
-    )
+    # No more projects, so non-global-reviewers can review nothing
+    return False
 
 
 def _expire_after_failed_approve(
@@ -513,10 +491,6 @@ async def _draft_response(db: AsyncSession, draft: WikiPageDraft) -> DraftRespon
             from app.database.models import Department
             d = await db.get(Department, page_scope_id)
             page_scope_name = d.name if d else None
-        elif page_scope_type == "project":
-            from app.database.models import Project
-            p = await db.get(Project, page_scope_id)
-            page_scope_name = p.name if p else None
     return DraftResponse(
         id=draft.id,
         page_id=draft.page_id,
@@ -602,6 +576,8 @@ async def propose_draft(
     # created row inside this session — set it manually so the adapter can
     # resolve the page scope without an extra round trip.
     draft.page = page
+    if hasattr(body, "branch_id") and body.branch_id:
+        draft.branch_id = body.branch_id
     await log_audit(db, user, "create", "wiki_draft", str(draft.id), reason=f"draft for: {slug}")
     await contribution_service.notify_submitted(db, wiki_draft_adapter, draft, user)
     await db.commit()
@@ -647,6 +623,11 @@ async def list_all_drafts(
     if mine:
         stmt = stmt.where(WikiPageDraft.author_id == user.id)
     else:
+        # Exclude drafts that belong to unsubmitted branches
+        from app.database.models import WikiBranch
+        stmt = stmt.outerjoin(WikiBranch, WikiBranch.id == WikiPageDraft.branch_id)
+        stmt = stmt.where(or_(WikiPageDraft.branch_id == None, WikiBranch.status == "pending_merge"))
+
         page_filter = _build_reviewable_page_filter(user)
         if page_filter is False:  # noqa: E712 — never true, kept for symmetry
             return []
@@ -981,14 +962,10 @@ async def propose_create_page(
     # Contributor-level check, mirroring _can_propose for edit drafts.
     if user.role != "admin":
         perms = _get_user_permissions(user)
-        if body.scope_type == "project" and body.scope_id:
-            role = await get_workspace_role(db, user, body.scope_id)
-            if not role or not workspace_role_can(role, "contributor"):
-                raise HTTPException(403, "Requires contributor role or above in this workspace")
-        elif body.scope_type == "department" and body.scope_id:
+        if body.scope_type == "department" and body.scope_id:
             # own_dept perm only counts when proposing in the user's own dept.
             if "wiki:write:all" not in perms and not (
-                "wiki:write:own_dept" in perms and user.department_id == body.scope_id
+                "wiki:write:own_dept" in perms and body.scope_id in user.department_ids
             ):
                 raise HTTPException(
                     403,
@@ -1030,6 +1007,8 @@ async def propose_create_page(
         draft_kind="create",
         suggested_metadata=suggested_metadata,
     )
+    if hasattr(body, "branch_id") and body.branch_id:
+        draft.branch_id = body.branch_id
     await log_audit(
         db, user, "create", "wiki_draft", str(draft.id),
         reason=f"propose new page: {body.slug}",

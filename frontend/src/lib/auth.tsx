@@ -21,8 +21,8 @@ export type User = {
   name: string;
   email: string;
   role: "admin" | "employee";
-  department_id: string;
-  department_name: string;
+  department_ids: string[];
+  department_names: string[];
   permissions: string[];
   workspace_memberships: WorkspaceMembership[];
 };
@@ -53,8 +53,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         name: string;
         email: string;
         role: "admin" | "employee";
-        department_id: string;
-        department_name: string;
+        department_ids: string[];
+        department_names: string[];
         permissions: string[];
         workspace_memberships: WorkspaceMembership[];
       }>("/api/auth/me");

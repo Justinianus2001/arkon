@@ -26,8 +26,7 @@ from sqlalchemy.orm import selectinload
 from app.config import settings
 from app.database.models import (
     Employee,
-    ProjectMember,
-    ProjectSource,
+    EmployeeDepartment,
     Source,
     SourceDepartment,
 )
@@ -56,17 +55,28 @@ class ResolvedIdentity:
     """The authenticated employee context, passed to MCP tools."""
     employee_id: uuid.UUID
     employee_name: str
-    department_id: uuid.UUID
-    department_name: str
+    # All departments the employee belongs to. May be empty — in which case the
+    # user can only see resources scoped to 'global'. Replaces the legacy single
+    # `department_id`; treat as an unordered set.
+    department_ids: list[uuid.UUID] = field(default_factory=list)
+    department_names: list[str] = field(default_factory=list)
     allowed_knowledge_types: Optional[list[str]] = None  # None = all
     allowed_source_ids: Optional[list[str]] = None       # None = all
-    project_source_ids: list[str] = field(default_factory=list)  # always granted via projects
-    # UUIDs (as strings) of every workspace the user is a member of. Used by
-    # the wiki layer to include project-scoped wiki pages of those workspaces
-    # in search/list/read paths — otherwise they're invisible even to members.
-    project_ids: list[str] = field(default_factory=list)
     is_admin: bool = False
     permissions: list[str] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ #
+    # Predicate helpers — used by MCP tool-visibility middleware so the   #
+    # list_tools hook stays I/O-free.                                     #
+    # ------------------------------------------------------------------ #
+
+    def has_permission(self, perm: str) -> bool:
+        """True if `perm` is in the identity's resolved permission set."""
+        return perm in self.permissions
+
+    def has_any_permission(self, *perms: str) -> bool:
+        """True if any of `perms` is present."""
+        return any(p in self.permissions for p in perms)
 
 
 class MCPAuthService:
@@ -92,8 +102,9 @@ class MCPAuthService:
                 Employee.is_active.is_(True),
             )
             .options(
-                selectinload(Employee.department),
-                selectinload(Employee.custom_role),
+                selectinload(Employee.employee_departments).selectinload(
+                    EmployeeDepartment.department
+                ),
             )
         )
         result = await self.db.execute(stmt)
@@ -131,17 +142,18 @@ class MCPAuthService:
         )
 
         permissions = get_effective_permissions(employee)
-        project_ids, project_source_ids = await self._resolve_projects(employee.id)
 
-        # Admin gets unrestricted access
+        department_ids = [ed.department_id for ed in employee.employee_departments]
+        department_names = [
+            ed.department.name for ed in employee.employee_departments if ed.department
+        ]
+
         if employee.role == "admin":
             return ResolvedIdentity(
                 employee_id=employee.id,
                 employee_name=employee.name,
-                department_id=employee.department_id,
-                department_name=employee.department.name if employee.department else "",
-                project_source_ids=project_source_ids,
-                project_ids=project_ids,
+                department_ids=department_ids,
+                department_names=department_names,
                 is_admin=True,
                 permissions=permissions,
             )
@@ -154,25 +166,20 @@ class MCPAuthService:
             return ResolvedIdentity(
                 employee_id=employee.id,
                 employee_name=employee.name,
-                department_id=employee.department_id,
-                department_name=employee.department.name if employee.department else "",
-                project_source_ids=project_source_ids,
-                project_ids=project_ids,
+                department_ids=department_ids,
+                department_names=department_names,
                 permissions=permissions,
             )
 
         if scope == "own_dept":
-            # Can only read: global docs + docs in own department
-            # Build list of allowed source IDs
-            allowed_ids = await self._get_department_source_ids(employee.department_id)
+            # Can read global docs + docs in any of the user's departments.
+            allowed_ids = await self._get_department_source_ids(department_ids)
             return ResolvedIdentity(
                 employee_id=employee.id,
                 employee_name=employee.name,
-                department_id=employee.department_id,
-                department_name=employee.department.name if employee.department else "",
+                department_ids=department_ids,
+                department_names=department_names,
                 allowed_source_ids=allowed_ids,
-                project_source_ids=project_source_ids,
-                project_ids=project_ids,
                 permissions=permissions,
             )
 
@@ -180,16 +187,18 @@ class MCPAuthService:
         return ResolvedIdentity(
             employee_id=employee.id,
             employee_name=employee.name,
-            department_id=employee.department_id,
-            department_name=employee.department.name if employee.department else "",
+            department_ids=department_ids,
+            department_names=department_names,
             allowed_source_ids=[],  # empty = no access
-            project_source_ids=project_source_ids,
-            project_ids=project_ids,
             permissions=permissions,
         )
 
-    async def _get_department_source_ids(self, department_id: uuid.UUID) -> list[str]:
-        """Get IDs of sources that are global (no departments) or in the given department."""
+    async def _get_department_source_ids(
+        self, department_ids: list[uuid.UUID],
+    ) -> list[str]:
+        """Get IDs of sources that are global (no departments) or in any of the
+        given departments. Empty `department_ids` returns only global sources.
+        """
         # Sources with no department entries (global)
         global_stmt = (
             select(Source.id)
@@ -203,51 +212,19 @@ class MCPAuthService:
         global_result = await self.db.execute(global_stmt)
         global_ids = [str(r[0]) for r in global_result.all()]
 
-        # Sources in this department
+        if not department_ids:
+            return global_ids
+
+        # Sources in any of these departments
         dept_stmt = (
             select(SourceDepartment.source_id)
-            .where(SourceDepartment.department_id == department_id)
+            .where(SourceDepartment.department_id.in_(department_ids))
+            .distinct()
         )
         dept_result = await self.db.execute(dept_stmt)
         dept_ids = [str(r[0]) for r in dept_result.all()]
 
         return global_ids + dept_ids
-
-    async def _resolve_projects(
-        self, employee_id: uuid.UUID,
-    ) -> tuple[list[str], list[str]]:
-        """Resolve workspace memberships into (project_ids, project_source_ids).
-
-        - project_ids: UUIDs (as strings) of every ACTIVE workspace the
-          employee is a member of. Used by the wiki layer to include
-          project-scoped wiki pages in search/list/read.
-        - project_source_ids: source UUIDs linked to those workspaces.
-        """
-        from app.database.models import Project
-
-        # Active workspaces this user is a member of.
-        active_proj_stmt = (
-            select(ProjectMember.project_id)
-            .join(Project, Project.id == ProjectMember.project_id)
-            .where(
-                ProjectMember.employee_id == employee_id,
-                Project.status == "active",
-            )
-        )
-        result = await self.db.execute(active_proj_stmt)
-        proj_uuids = [r[0] for r in result.all()]
-
-        if not proj_uuids:
-            return [], []
-
-        project_ids = [str(p) for p in proj_uuids]
-
-        source_stmt = select(ProjectSource.source_id).where(
-            ProjectSource.project_id.in_(proj_uuids)
-        )
-        source_result = await self.db.execute(source_stmt)
-        project_source_ids = [str(r[0]) for r in source_result.all()]
-        return project_ids, project_source_ids
 
     # --- Token Management ---
 
@@ -300,20 +277,11 @@ def apply_scope_filter(query, identity: ResolvedIdentity):
       1. No scope restrictions defined (open access)
       2. Source ID is in allowed_source_ids (explicit grant)
       3. Source knowledge_type is in allowed_knowledge_types (type-based grant)
-      4. Source is in one of the employee's active projects (project grant)
-
-    NOTE: project membership grants access REGARDLESS of allowed_knowledge_types
-    (OR semantics across all conditions). This is intentional — adding a user
-    to a workspace is treated as an explicit override of their KT scope. Do
-    NOT change this to AND; it would silently revoke workspace access for any
-    user whose default KT list excludes the workspace's source types.
 
     Usage:
         stmt = select(Source).where(Source.status == "ready")
         stmt = apply_scope_filter(stmt, identity)
     """
-    project_uuids = [uuid.UUID(s) for s in identity.project_source_ids]
-
     if identity.allowed_source_ids is None and identity.allowed_knowledge_types is None:
         # Open access
         return query
@@ -331,9 +299,6 @@ def apply_scope_filter(query, identity: ResolvedIdentity):
             KnowledgeType.slug.in_(identity.allowed_knowledge_types)
         )
         conditions.append(Source.knowledge_type_id.in_(kt_subq))
-
-    if project_uuids:
-        conditions.append(Source.id.in_(project_uuids))
 
     if conditions:
         query = query.where(or_(*conditions))

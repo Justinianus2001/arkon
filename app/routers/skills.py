@@ -107,11 +107,12 @@ async def upload_skills(
         if "skill:create:own_dept" not in perms:
             raise HTTPException(403, "Permission required: skill:create")
         
-        # User only has own_dept scope
-        if department_ids and any(d_id != user.department_id for d_id in department_ids):
-            raise HTTPException(403, "You can only assign skills to your own department")
-        if scope_type == "department" and scope_id != user.department_id:
-            raise HTTPException(403, "You can only assign skills to your own department")
+        # User only has own_dept scope — must overlap user's dept set.
+        user_depts = set(user.department_ids)
+        if department_ids and any(d_id not in user_depts for d_id in department_ids):
+            raise HTTPException(403, "You can only assign skills to your own departments")
+        if scope_type == "department" and scope_id not in user_depts:
+            raise HTTPException(403, "You can only assign skills to your own departments")
         if scope_type == "global":
             # Auto-force to own department if trying to create global without :all permission?
             # Or just deny. Let's deny for now to be safe.
@@ -482,11 +483,12 @@ async def update_skill(
     # Scope validation for new department/scope
     perms = _get_user_permissions(user)
     if user.role != "admin" and "skill:edit:all" not in perms:
-        # User only has own_dept scope
-        if req.department_ids and any(d_id != user.department_id for d_id in req.department_ids):
-            raise HTTPException(403, "You can only assign skills to your own department")
-        if req.scope_type == "department" and req.scope_id != user.department_id:
-            raise HTTPException(403, "You can only assign skills to your own department")
+        # User only has own_dept scope — must overlap user's dept set.
+        user_depts = set(user.department_ids)
+        if req.department_ids and any(d_id not in user_depts for d_id in req.department_ids):
+            raise HTTPException(403, "You can only assign skills to your own departments")
+        if req.scope_type == "department" and req.scope_id not in user_depts:
+            raise HTTPException(403, "You can only assign skills to your own departments")
         if req.scope_type == "global":
             raise HTTPException(403, "You do not have permission to make skills global")
 

@@ -33,13 +33,12 @@ type Employee = {
   name: string;
   email: string;
   role: string;
-  department_id: string;
-  department_name: string;
+  global_role: string;
+  department_ids: string[];
+  department_names: string[];
   is_active: boolean;
   has_token: boolean;
   last_connected?: string;
-  custom_role_id?: string;
-  custom_role_name?: string;
 };
 
 type Props = {
@@ -181,8 +180,7 @@ export function EmployeeTable({
             <TableHeader>
               <TableRow className="hover:bg-transparent">
                 <TableHead className="text-[11px] uppercase tracking-wider font-semibold text-muted-foreground">Employee</TableHead>
-                <TableHead className="text-[11px] uppercase tracking-wider font-semibold text-muted-foreground">System Role</TableHead>
-                <TableHead className="text-[11px] uppercase tracking-wider font-semibold text-muted-foreground">Position</TableHead>
+                <TableHead className="text-[11px] uppercase tracking-wider font-semibold text-muted-foreground">Role</TableHead>
                 <TableHead className="text-[11px] uppercase tracking-wider font-semibold text-muted-foreground">Department</TableHead>
                 <TableHead className="text-[11px] uppercase tracking-wider font-semibold text-muted-foreground">Status</TableHead>
                 <TableHead className="text-[11px] uppercase tracking-wider font-semibold text-muted-foreground">MCP Token</TableHead>
@@ -208,21 +206,27 @@ export function EmployeeTable({
                   </TableCell>
                   <TableCell>
                     <Badge
-                      variant={emp.role === "admin" ? "default" : "secondary"}
-                      className="text-[10px] capitalize h-5 px-2"
+                      variant={emp.global_role === "admin" ? "default" : emp.global_role === "knowledge_manager" ? "outline" : "secondary"}
+                      className="text-[10px] capitalize h-5 px-2 font-medium"
                     >
-                      {emp.role}
+                      {emp.global_role === "admin" ? "System Admin" : emp.global_role === "knowledge_manager" ? "Knowledge Manager" : emp.global_role === "contributor" ? "Contributor" : "Viewer"}
                     </Badge>
                   </TableCell>
                   <TableCell>
-                    {emp.custom_role_name ? (
-                      <span className="text-sm text-foreground">{emp.custom_role_name}</span>
-                    ) : (
+                    {emp.department_names.length === 0 ? (
                       <span className="text-xs text-muted-foreground/50">—</span>
+                    ) : (
+                      <div className="flex flex-wrap gap-1">
+                        {emp.department_names.map((n) => (
+                          <span
+                            key={n}
+                            className="inline-block px-1.5 py-0.5 rounded bg-secondary text-secondary-foreground text-xs"
+                          >
+                            {n}
+                          </span>
+                        ))}
+                      </div>
                     )}
-                  </TableCell>
-                  <TableCell>
-                    <span className="text-sm text-foreground">{emp.department_name}</span>
                   </TableCell>
                   <TableCell>
                     <div className="flex items-center gap-1.5">

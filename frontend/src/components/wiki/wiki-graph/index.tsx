@@ -4,6 +4,7 @@ import React from "react";
 import dynamic from "next/dynamic";
 import { useRouter } from "next/navigation";
 import { forceX, forceY } from "d3-force";
+import { cn } from "@/lib/utils";
 import { wikiTypeColor, wikiTypeGroupLabel, wikiTypeIcon } from "../wiki-type-badge";
 import { NodeInput } from "./types";
 import { nodeRadius } from "./utils";
@@ -47,6 +48,29 @@ const EDGE_COLOR = "rgba(120,112,106,0.35)";
 const EDGE_HIGHLIGHT = "#c2652a";
 const LABEL_COLOR = "#3a302a";
 const BG_COLOR = "#faf5ee";
+
+const SCOPE_COLORS: Record<string, string> = {
+  global: "#bfa88f",
+  department: "#c2652a",
+  project: "#d38b80",
+};
+
+const STATUS_COLORS: Record<string, string> = {
+  seed: "#a8977e",
+  developing: "#d4872e",
+  mature: "#2e8b8b",
+  evergreen: "#3a8a3f",
+};
+
+function getNodeColor(n: Node, mode: "scope" | "status"): string {
+  if (mode === "status") {
+    return STATUS_COLORS[n.status || "seed"] || STATUS_COLORS.seed;
+  }
+  if (mode === "scope") {
+    return SCOPE_COLORS[n.scope_type || "global"] || SCOPE_COLORS.global;
+  }
+  return wikiTypeColor(n.page_type);
+}
 
 // Above this many scopes the legend grows a filter input + scrollable list.
 // Below it, the flat list is fine and a search box would just add noise.
@@ -175,6 +199,7 @@ export function WikiGraph({
     scopeType?: string;
     scopeName?: string | null;
   } | null>(null);
+  const [colorMode, setColorMode] = React.useState<"scope" | "status">("scope");
 
   // Measure container.
   React.useEffect(() => {
@@ -211,6 +236,7 @@ export function WikiGraph({
       if (existing) {
         existing.title = n.title;
         existing.page_type = n.page_type;
+        existing.status = n.status;
         existing.scope_type = n.scope_type;
         existing.scope_name = n.scope_name;
         existing.degree = degree;
@@ -378,7 +404,7 @@ export function WikiGraph({
       const n = rawNode as Node;
       if (n.x === undefined || n.y === undefined) return;
       const r = nodeRadius(n.degree ?? 0, mini);
-      const color = wikiTypeColor(n.page_type);
+      const color = getNodeColor(n, colorMode);
       const hovered = hoveredIdRef.current;
       const neighborSet = neighborIdsRef.current;
       const isHovered = hovered === n.id;
@@ -438,9 +464,9 @@ export function WikiGraph({
         ctx.globalAlpha = 1;
       }
     },
-    // hoverVersion bump → callback ref changes → react-force-graph repaints.
+    // hoverVersion or colorMode bump → callback ref changes → react-force-graph repaints.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [mini, centerSlug, hoverVersion]
+    [mini, centerSlug, hoverVersion, colorMode]
   );
 
   // --- Custom link colour/width — also bump on hover to trigger repaint ---
@@ -510,12 +536,7 @@ export function WikiGraph({
     }
   }, []);
 
-  // --- Legend data ---
-  const typeCounts = React.useMemo(() => {
-    const counts: Record<string, number> = {};
-    for (const n of rawNodes) counts[n.page_type] = (counts[n.page_type] ?? 0) + 1;
-    return counts;
-  }, [rawNodes]);
+
 
   const scopeCounts = React.useMemo(() => {
     const counts: Record<string, { count: number; scopeType: string }> = {};
@@ -538,6 +559,24 @@ export function WikiGraph({
     return Object.entries(counts)
       .map(([label, { count, scopeType }]) => ({ label, count, scopeType }))
       .sort((a, b) => b.count - a.count);
+  }, [rawNodes]);
+
+  const statusCounts = React.useMemo(() => {
+    const counts: Record<string, number> = { seed: 0, developing: 0, mature: 0, evergreen: 0 };
+    for (const n of rawNodes) {
+      const s = n.status || "seed";
+      counts[s] = (counts[s] ?? 0) + 1;
+    }
+    return counts;
+  }, [rawNodes]);
+
+  const scopeTypeCounts = React.useMemo(() => {
+    const counts: Record<string, number> = { global: 0, department: 0, project: 0 };
+    for (const n of rawNodes) {
+      const s = n.scope_type || "global";
+      counts[s] = (counts[s] ?? 0) + 1;
+    }
+    return counts;
   }, [rawNodes]);
 
   return (
@@ -585,89 +624,168 @@ export function WikiGraph({
         maxZoom={5}
       />
 
-      {/* Tooltip */}
-      {tooltip && hoveredId && (
-        <div
-          className="pointer-events-none z-50 px-3 py-2 rounded-lg text-xs shadow-lg"
-          style={{
-            position: "absolute",
-            left: Math.min(tooltip.x + 12, dimensions.w - 220),
-            top: Math.max(tooltip.y - 8, 8),
-            background: "var(--color-card, #fff)",
-            color: "var(--color-foreground, #3a302a)",
-            border: "1px solid var(--color-border, rgba(216,208,200,0.6))",
-            maxWidth: 220,
-          }}
-        >
-          <p className="font-medium text-sm mb-0.5 truncate">{tooltip.title}</p>
-          <div className="flex items-center gap-2 text-muted-foreground">
-            <span
-              className="w-2 h-2 rounded-full shrink-0"
-              style={{ background: wikiTypeColor(tooltip.type) }}
-            />
-            <span className="capitalize">{tooltip.type}</span>
-            <span className="ml-auto">{tooltip.degree} links</span>
-          </div>
-          {tooltip.scopeType && (
-            <div className="flex items-center gap-1.5 mt-1 pt-1 border-t border-border/50 text-muted-foreground">
-              <span className="material-symbols-outlined" style={{ fontSize: 11 }}>
-                {tooltip.scopeType === "project"
-                  ? "folder_special"
-                  : tooltip.scopeType === "department"
-                  ? "business"
-                  : "public"}
-              </span>
-              <span className="truncate">
-                {tooltip.scopeType === "project"
-                  ? tooltip.scopeName || "Workspace"
-                  : tooltip.scopeType === "department"
-                  ? tooltip.scopeName || "Department"
-                  : "Global"}
-              </span>
-            </div>
-          )}
+      {/* Color Mode Switcher */}
+      {!mini && (
+        <div className="absolute top-3 right-3 flex gap-1 rounded-xl border border-border bg-card/90 backdrop-blur-sm p-1.5 shadow-sm z-10">
+          <button
+            onClick={() => setColorMode("scope")}
+            className={cn(
+              "px-2 py-1 text-[10px] font-semibold rounded-lg transition-all",
+              colorMode === "scope" ? "bg-primary text-primary-foreground shadow" : "text-muted-foreground hover:bg-accent"
+            )}
+          >
+            Scope
+          </button>
+          <button
+            onClick={() => setColorMode("status")}
+            className={cn(
+              "px-2 py-1 text-[10px] font-semibold rounded-lg transition-all",
+              colorMode === "status" ? "bg-primary text-primary-foreground shadow" : "text-muted-foreground hover:bg-accent"
+            )}
+          >
+            Maturity
+          </button>
         </div>
       )}
 
+      {/* Tooltip */}
+      {tooltip && hoveredId && (() => {
+        const hoveredNode = nodeMapRef.current.get(hoveredId);
+        const nodeColor = hoveredNode ? getNodeColor(hoveredNode, colorMode) : wikiTypeColor(tooltip.type);
+        return (
+          <div
+            className="pointer-events-none z-50 px-3 py-2 rounded-lg text-xs shadow-lg"
+            style={{
+              position: "absolute",
+              left: Math.min(tooltip.x + 12, dimensions.w - 220),
+              top: Math.max(tooltip.y - 8, 8),
+              background: "var(--color-card, #fff)",
+              color: "var(--color-foreground, #3a302a)",
+              border: "1px solid var(--color-border, rgba(216,208,200,0.6))",
+              maxWidth: 220,
+            }}
+          >
+            <p className="font-medium text-sm mb-0.5 truncate">{tooltip.title}</p>
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <span
+                className="w-2 h-2 rounded-full shrink-0"
+                style={{ background: nodeColor }}
+              />
+              <span className="capitalize">{tooltip.type}</span>
+              <span className="ml-auto">{tooltip.degree} links</span>
+            </div>
+            {tooltip.scopeType && (
+              <div className="flex items-center gap-1.5 mt-1 pt-1 border-t border-border/50 text-muted-foreground">
+                <span className="material-symbols-outlined" style={{ fontSize: 11 }}>
+                  {tooltip.scopeType === "project"
+                    ? "folder_special"
+                    : tooltip.scopeType === "department"
+                    ? "business"
+                    : "public"}
+                </span>
+                <span className="truncate">
+                  {tooltip.scopeType === "project"
+                    ? tooltip.scopeName || "Workspace"
+                    : tooltip.scopeType === "department"
+                    ? tooltip.scopeName || "Department"
+                    : "Global"}
+                </span>
+              </div>
+            )}
+          </div>
+        );
+      })()}
+
       {/* Legend */}
       {!mini && (
-        <div className="absolute bottom-3 left-3 rounded-xl border border-border bg-card/90 backdrop-blur-sm px-3 py-2.5 text-xs shadow-sm max-w-[240px]">
-          <div className="mb-1.5 font-semibold text-foreground text-xs">Node Types</div>
-          <div className="flex flex-col gap-1">
-            {Object.entries(typeCounts)
-              .sort((a, b) => b[1] - a[1])
-              .map(([type, count]) => (
-                <div
-                  key={type}
-                  className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-accent/30 transition-colors"
-                >
-                  <span
-                    className="w-2.5 h-2.5 rounded-full shrink-0"
-                    style={{
-                      background: wikiTypeColor(type),
-                      boxShadow: `0 0 4px ${wikiTypeColor(type)}40`,
-                    }}
-                  />
-                  <span
-                    className="material-symbols-outlined"
-                    style={{ fontSize: 11, color: wikiTypeColor(type) }}
-                  >
-                    {wikiTypeIcon(type)}
-                  </span>
-                  <span className="text-muted-foreground">{wikiTypeGroupLabel(type)}</span>
-                  <span className="text-muted-foreground/60 ml-auto tabular-nums">{count}</span>
-                </div>
-              ))}
-          </div>
-          {scopeCounts.length > 0 && (
-            <ScopeLegendSection scopeCounts={scopeCounts} />
+        <div className="absolute bottom-3 left-3 rounded-xl border border-border bg-card/90 backdrop-blur-sm px-3 py-2.5 text-xs shadow-sm max-w-[240px] z-10">
+          {colorMode === "status" && (
+            <>
+              <div className="mb-1.5 font-semibold text-foreground text-xs">Maturity Lifecycle</div>
+              <div className="flex flex-col gap-1">
+                {(["evergreen", "mature", "developing", "seed"] as const).map((status) => {
+                  const labelMap: Record<string, string> = {
+                    evergreen: "Evergreen",
+                    mature: "Mature",
+                    developing: "Developing",
+                    seed: "Seed",
+                  };
+                  return (
+                    <div
+                      key={status}
+                      className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-accent/30 transition-colors"
+                    >
+                      <span
+                        className="w-2.5 h-2.5 rounded-full shrink-0"
+                        style={{
+                          background: STATUS_COLORS[status],
+                          boxShadow: `0 0 4px ${STATUS_COLORS[status]}40`,
+                        }}
+                      />
+                      <span className="text-muted-foreground">{labelMap[status]}</span>
+                      <span className="text-muted-foreground/60 ml-auto tabular-nums">
+                        {statusCounts[status] ?? 0}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </>
           )}
+
+          {colorMode === "scope" && (
+            <>
+              <div className="mb-1.5 font-semibold text-foreground text-xs">Scope Levels</div>
+              <div className="flex flex-col gap-1">
+                {(["global", "department", "project"] as const).map((scope) => {
+                  const labelMap: Record<string, string> = {
+                    global: "Global",
+                    department: "Department",
+                    project: "Workspace",
+                  };
+                  const iconMap: Record<string, string> = {
+                    global: "public",
+                    department: "business",
+                    project: "folder_special",
+                  };
+                  return (
+                    <div
+                      key={scope}
+                      className="flex items-center gap-2 rounded px-1 py-0.5 hover:bg-accent/30 transition-colors"
+                    >
+                      <span
+                        className="w-2.5 h-2.5 rounded-full shrink-0"
+                        style={{
+                          background: SCOPE_COLORS[scope],
+                          boxShadow: `0 0 4px ${SCOPE_COLORS[scope]}40`,
+                        }}
+                      />
+                      <span
+                        className="material-symbols-outlined"
+                        style={{ fontSize: 11, color: SCOPE_COLORS[scope] }}
+                      >
+                        {iconMap[scope]}
+                      </span>
+                      <span className="text-muted-foreground">{labelMap[scope]}</span>
+                      <span className="text-muted-foreground/60 ml-auto tabular-nums">
+                        {scopeTypeCounts[scope] ?? 0}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+              {scopeCounts.length > 0 && (
+                <ScopeLegendSection scopeCounts={scopeCounts} />
+              )}
+            </>
+          )}
+
         </div>
       )}
 
       {/* Zoom controls */}
       {!mini && (
-        <div className="absolute bottom-3 right-3 flex flex-col items-center gap-1 rounded-xl border border-border bg-card/90 backdrop-blur-sm shadow-sm p-1">
+        <div className="absolute bottom-3 right-3 flex flex-col items-center gap-1 rounded-xl border border-border bg-card/90 backdrop-blur-sm shadow-sm p-1 z-10">
           <button
             onClick={() => fgRef.current?.zoom(fgRef.current.zoom() * 1.2, 200)}
             className="w-7 h-7 flex items-center justify-center rounded-lg hover:bg-accent/50 transition-colors text-muted-foreground hover:text-foreground"

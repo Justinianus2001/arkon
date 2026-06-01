@@ -83,8 +83,14 @@ export default function ProfilePage() {
                 </Badge>
               </div>
               <div>
-                <p className="text-xs text-muted-foreground">Department</p>
-                <p className="text-sm font-medium mt-1">{user.department_name}</p>
+                <p className="text-xs text-muted-foreground">
+                  {user.department_names.length > 1 ? "Departments" : "Department"}
+                </p>
+                <p className="text-sm font-medium mt-1">
+                  {user.department_names.length > 0
+                    ? user.department_names.join(", ")
+                    : "—"}
+                </p>
               </div>
             </div>
           </div>

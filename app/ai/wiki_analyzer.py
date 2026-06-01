@@ -64,9 +64,8 @@ Analyze the document above and return a JSON object with exactly these fields:
     {{"slug": "<must be from the existing pages list above>", "reason": "..."}}
   ],
   "new_pages_to_create": [
-    {{"suggested_slug": "...", "page_type": "<entity|concept|topic|source>", "title": "..."}}
+    {{"suggested_slug": "...", "page_type": "<entity|concept|topic>", "title": "..."}}
   ],
-  "source_page_slug": "source/<short-slug>",
   "compilation_notes": "<any important note for the compiler agent>"
 }}
 
@@ -172,9 +171,6 @@ def format_analysis_section(analysis: Optional[dict]) -> str:
         for p in to_create:
             lines.append(f"- `{p.get('suggested_slug', '')}` ({p.get('page_type', '')}) — {p.get('title', '')}")
 
-    source_slug = analysis.get("source_page_slug", "")
-    if source_slug:
-        lines.append(f"\n**Suggested source page slug:** `{source_slug}`")
 
     notes = analysis.get("compilation_notes", "")
     if notes:

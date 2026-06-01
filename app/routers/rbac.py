@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.database import get_db
-from app.database.models import Department, Employee
+from app.database.models import Department, Employee, EmployeeDepartment
 from app.services.audit_service import log_audit
 from app.services.auth_service import (
     get_current_user,
@@ -49,8 +49,10 @@ class EmployeeCreate(BaseModel):
     email: str
     password: Optional[str] = None  # Optional on update
     role: str = "employee"  # "admin" or "employee"
-    department_id: str
-    custom_role_id: Optional[str] = None
+    global_role: str = "viewer"  # "viewer", "contributor", "knowledge_manager", "admin"
+    # All departments the employee belongs to. Empty list is allowed — such a
+    # user can only see resources scoped to 'global'.
+    department_ids: list[str] = []
 
 
 class EmployeeOut(BaseModel):
@@ -58,13 +60,12 @@ class EmployeeOut(BaseModel):
     name: str
     email: str
     role: str
-    department_id: str
-    department_name: str = ""
+    global_role: str
+    department_ids: list[str] = []
+    department_names: list[str] = []
     is_active: bool
     has_token: bool
     last_connected: Optional[str] = None
-    custom_role_id: Optional[str] = None
-    custom_role_name: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -163,13 +164,21 @@ async def list_employees(
     from sqlalchemy import func as sa_func
 
     base = select(Employee).options(
-        selectinload(Employee.department), selectinload(Employee.custom_role)
+        selectinload(Employee.employee_departments).selectinload(
+            EmployeeDepartment.department
+        ),
     )
     count_base = select(sa_func.count(Employee.id))
 
     if department_id:
-        base = base.where(Employee.department_id == uuid.UUID(department_id))
-        count_base = count_base.where(Employee.department_id == uuid.UUID(department_id))
+        dept_uuid = uuid.UUID(department_id)
+        dept_filter = Employee.id.in_(
+            select(EmployeeDepartment.employee_id).where(
+                EmployeeDepartment.department_id == dept_uuid
+            )
+        )
+        base = base.where(dept_filter)
+        count_base = count_base.where(dept_filter)
     if search:
         like = f"%{search}%"
         base = base.where(Employee.name.ilike(like) | Employee.email.ilike(like))
@@ -191,13 +200,14 @@ async def list_employees(
                 name=e.name,
                 email=e.email,
                 role=e.role,
-                department_id=str(e.department_id),
-                department_name=e.department.name if e.department else "",
+                global_role=e.global_role,
+                department_ids=[str(ed.department_id) for ed in e.employee_departments],
+                department_names=[
+                    ed.department.name for ed in e.employee_departments if ed.department
+                ],
                 is_active=e.is_active,
                 has_token=bool(e.mcp_token_hash),
                 last_connected=e.last_connected.isoformat() if e.last_connected else None,
-                custom_role_id=str(e.custom_role_id) if e.custom_role_id else None,
-                custom_role_name=e.custom_role.name if e.custom_role else None,
             )
             for e in employees
         ],
@@ -215,26 +225,36 @@ async def create_employee(
     _user: Employee = require_permission("org:employees:manage"),
 ):
     """Create a new employee."""
-    dept = await db.get(Department, uuid.UUID(body.department_id))
-    if not dept:
-        raise HTTPException(400, "Department not found")
-
     if not body.password:
         raise HTTPException(400, "Password is required")
     if len(body.password) < 8:
         raise HTTPException(400, "Password must be at least 8 characters")
     if body.role not in ("admin", "employee"):
         raise HTTPException(400, "Role must be 'admin' or 'employee'")
+    if body.global_role not in ("viewer", "contributor", "knowledge_manager", "admin"):
+        raise HTTPException(400, "Global role must be one of: viewer, contributor, knowledge_manager, admin")
+
+    dept_uuids = [uuid.UUID(d) for d in body.department_ids]
+    if dept_uuids:
+        existing = (await db.execute(
+            select(Department.id).where(Department.id.in_(dept_uuids))
+        )).scalars().all()
+        if len(existing) != len(set(dept_uuids)):
+            raise HTTPException(400, "One or more departments not found")
 
     emp = Employee(
         name=body.name,
         email=body.email,
         password_hash=hash_password(body.password),
         role=body.role,
-        department_id=uuid.UUID(body.department_id),
-        custom_role_id=uuid.UUID(body.custom_role_id) if body.custom_role_id else None,
+        global_role=body.global_role,
     )
     db.add(emp)
+    await db.flush()  # need emp.id before adding join rows
+
+    for d_id in set(dept_uuids):
+        db.add(EmployeeDepartment(employee_id=emp.id, department_id=d_id))
+
     await log_audit(db, _user, "create", "employee", str(emp.id), reason=emp.email)
     await db.flush()
 
@@ -251,13 +271,35 @@ async def update_employee(
     emp = await db.get(Employee, uuid.UUID(emp_id))
     if not emp:
         raise HTTPException(404, "Employee not found")
+    if body.global_role not in ("viewer", "contributor", "knowledge_manager", "admin"):
+        raise HTTPException(400, "Global role must be one of: viewer, contributor, knowledge_manager, admin")
     emp.name = body.name
     emp.email = body.email
     emp.role = body.role
-    emp.department_id = uuid.UUID(body.department_id)
-    emp.custom_role_id = uuid.UUID(body.custom_role_id) if body.custom_role_id else None
+    emp.global_role = body.global_role
     if body.password:
         emp.password_hash = hash_password(body.password)
+
+    # Reconcile department memberships against the incoming set.
+    new_dept_uuids = {uuid.UUID(d) for d in body.department_ids}
+    if new_dept_uuids:
+        existing = (await db.execute(
+            select(Department.id).where(Department.id.in_(new_dept_uuids))
+        )).scalars().all()
+        if len(existing) != len(new_dept_uuids):
+            raise HTTPException(400, "One or more departments not found")
+
+    current = (await db.execute(
+        select(EmployeeDepartment).where(EmployeeDepartment.employee_id == emp.id)
+    )).scalars().all()
+    current_set = {ed.department_id for ed in current}
+
+    for ed in current:
+        if ed.department_id not in new_dept_uuids:
+            await db.delete(ed)
+    for d_id in new_dept_uuids - current_set:
+        db.add(EmployeeDepartment(employee_id=emp.id, department_id=d_id))
+
     await log_audit(db, _user, "update", "employee", str(emp.id), reason=emp.email)
     await db.flush()
     return {"id": str(emp.id), "name": emp.name}
@@ -279,28 +321,66 @@ async def delete_employee(
     return {"deleted": True}
 
 
-class DepartmentTransfer(BaseModel):
+class DepartmentMembership(BaseModel):
     department_id: str
 
 
-@router.patch("/employees/{emp_id}/department")
-async def transfer_employee_department(
+@router.post("/employees/{emp_id}/departments", status_code=201)
+async def add_employee_department(
     emp_id: str,
-    body: DepartmentTransfer,
+    body: DepartmentMembership,
     db: AsyncSession = Depends(get_db),
     _user: Employee = require_permission("org:employees:manage"),
 ):
-    """Move an employee to a different department."""
+    """Add an employee to an additional department."""
     emp = await db.get(Employee, uuid.UUID(emp_id))
     if not emp:
         raise HTTPException(404, "Employee not found")
     dept = await db.get(Department, uuid.UUID(body.department_id))
     if not dept:
         raise HTTPException(404, "Department not found")
-    emp.department_id = dept.id
-    await log_audit(db, _user, "update", "employee", str(emp.id), reason=f"moved to dept={dept.name}")
+
+    existing = (await db.execute(
+        select(EmployeeDepartment).where(
+            EmployeeDepartment.employee_id == emp.id,
+            EmployeeDepartment.department_id == dept.id,
+        )
+    )).scalar_one_or_none()
+    if existing:
+        raise HTTPException(409, "Employee already belongs to this department")
+
+    db.add(EmployeeDepartment(employee_id=emp.id, department_id=dept.id))
+    await log_audit(
+        db, _user, "update", "employee", str(emp.id),
+        reason=f"added to dept={dept.name}",
+    )
     await db.flush()
-    return {"id": str(emp.id), "department_id": str(emp.department_id)}
+    return {"id": str(emp.id), "department_id": str(dept.id)}
+
+
+@router.delete("/employees/{emp_id}/departments/{dept_id}")
+async def remove_employee_department(
+    emp_id: str,
+    dept_id: str,
+    db: AsyncSession = Depends(get_db),
+    _user: Employee = require_permission("org:employees:manage"),
+):
+    """Remove an employee from a department."""
+    ed = (await db.execute(
+        select(EmployeeDepartment).where(
+            EmployeeDepartment.employee_id == uuid.UUID(emp_id),
+            EmployeeDepartment.department_id == uuid.UUID(dept_id),
+        )
+    )).scalar_one_or_none()
+    if not ed:
+        raise HTTPException(404, "Membership not found")
+    await db.delete(ed)
+    await log_audit(
+        db, _user, "update", "employee", str(emp_id),
+        reason=f"removed from dept={dept_id}",
+    )
+    await db.flush()
+    return {"removed": True}
 
 
 @router.patch("/employees/{emp_id}/toggle")

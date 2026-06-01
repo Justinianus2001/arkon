@@ -53,6 +53,18 @@ from app.utils.progress import ProgressTracker  # noqa: E402
 # Ingestion tasks
 # ---------------------------------------------------------------------------
 
+async def enqueue_post_extraction_pipeline(source_id: str, has_images: bool) -> Optional[str]:
+    """Enqueue caption_images_task (if images) or ingest_map_reduce_task directly.
+
+    Shared by ingest_file_task auto-proceed and the approve-extraction API.
+    Returns the enqueued job_id, or None if enqueue failed.
+    """
+    pool = await get_arq_pool()
+    task_name = "caption_images_task" if has_images else "ingest_map_reduce_task"
+    job = await pool.enqueue_job(task_name, source_id)
+    return job.job_id if job else None
+
+
 async def ingest_file_task(ctx: dict, source_id: str):
     """
     arq task: full file ingestion → wiki compilation.
@@ -69,6 +81,7 @@ async def ingest_file_task(ctx: dict, source_id: str):
     )
     from app.services.source_outline import assemble_full_text, build_outline
     from app.services.storage_service import storage_service
+    from app.utils.tokens import count_tokens
 
     sid = uuid.UUID(source_id)
     tracker = ProgressTracker(sid)
@@ -138,29 +151,42 @@ async def ingest_file_task(ctx: dict, source_id: str):
             full_text, page_offsets = assemble_full_text(pages_data)
             source.full_text = full_text
             source.page_offsets = page_offsets
-            await session.commit()
-            await tracker.update(50, f"Outline: {len(source.outline_json or [])} top-level sections")
 
-            # --- Step 6: Enqueue captioning (if images) OR MRP directly ---
-            # Captioning MUST complete before MAP so wiki pages get real image captions
-            # baked into full_text. caption_images_task chains into ingest_map_reduce_task
-            # itself when it finishes.
+            # --- Step 5: Token count (drives auto-approve vs gate) ---
+            token_count = count_tokens(full_text)
+            source.extracted_token_count = token_count
+            await session.commit()
+            await tracker.update(50, f"Outline: {len(source.outline_json or [])} top-level sections, ~{token_count} tokens")
+
+            # --- Step 6: Gate or auto-proceed ---
+            threshold = settings.auto_approve_extraction_threshold_tokens
+            if token_count > threshold:
+                source.status = "awaiting_approval"
+                source.progress = 55
+                source.progress_message = (
+                    f"Awaiting human approval: {token_count:,} tokens > {threshold:,} threshold"
+                )
+                await session.commit()
+                logger.info(
+                    f"Source {source_id} gated at awaiting_approval: {token_count} tokens "
+                    f"({len(images)} images extracted, captioning deferred)"
+                )
+                return {"status": "awaiting_approval", "token_count": token_count, "images": len(images)}
+
             await tracker.update(55, "Queuing compilation pipeline...")
-            pool = await get_arq_pool()
-            if images:
-                job = await pool.enqueue_job("caption_images_task", source_id)
-                source.progress_message = f"Captioning {len(images)} images before extraction..."
-            else:
-                job = await pool.enqueue_job("ingest_map_reduce_task", source_id)
-                source.progress_message = "Extraction queued..."
+            job_id = await enqueue_post_extraction_pipeline(source_id, has_images=bool(images))
             source.status = "processing"
             source.progress = 55
-            if job:
-                source.job_id = job.job_id
+            source.progress_message = (
+                f"Captioning {len(images)} images before extraction..." if images
+                else "Extraction queued..."
+            )
+            if job_id:
+                source.job_id = job_id
             await session.commit()
 
             logger.info(f"Source {source_id} pre-processing done; next: {'caption→MRP' if images else 'MRP'}")
-            return {"status": "processing", "images": len(images)}
+            return {"status": "processing", "token_count": token_count, "images": len(images)}
 
         except BaseException as e:
             logger.error(f"Pre-processing failed for {source_id}: {e}")
@@ -192,6 +218,7 @@ async def ingest_url_task(ctx: dict, source_id: str):
     from app.database.models import Source
     from app.services.kb_service import _extract_text_from_url
     from app.services.source_outline import assemble_full_text, build_outline
+    from app.utils.tokens import count_tokens
 
     sid = uuid.UUID(source_id)
     tracker = ProgressTracker(sid)
@@ -226,20 +253,32 @@ async def ingest_url_task(ctx: dict, source_id: str):
             full_text, page_offsets = assemble_full_text(pages_data)
             source.full_text = full_text
             source.page_offsets = page_offsets
+            token_count = count_tokens(full_text)
+            source.extracted_token_count = token_count
             await session.commit()
 
+            threshold = settings.auto_approve_extraction_threshold_tokens
+            if token_count > threshold:
+                source.status = "awaiting_approval"
+                source.progress = 55
+                source.progress_message = (
+                    f"Awaiting human approval: {token_count:,} tokens > {threshold:,} threshold"
+                )
+                await session.commit()
+                logger.info(f"URL source {source_id} gated at awaiting_approval: {token_count} tokens")
+                return {"status": "awaiting_approval", "token_count": token_count}
+
             await tracker.update(55, "Queuing compilation pipeline...")
-            pool = await get_arq_pool()
-            job = await pool.enqueue_job("ingest_map_reduce_task", source_id)
+            job_id = await enqueue_post_extraction_pipeline(source_id, has_images=False)
             source.status = "processing"
             source.progress = 55
             source.progress_message = "Extraction queued..."
-            if job:
-                source.job_id = job.job_id
+            if job_id:
+                source.job_id = job_id
             await session.commit()
 
-            logger.info(f"URL source {source_id} pre-processing done, MRP task enqueued: {job.job_id if job else 'n/a'}")
-            return {"status": "processing"}
+            logger.info(f"URL source {source_id} pre-processing done, MRP task enqueued: {job_id or 'n/a'}")
+            return {"status": "processing", "token_count": token_count}
 
         except BaseException as e:
             logger.error(f"URL ingestion failed for {source_id}: {e}")
@@ -674,6 +713,7 @@ async def ingest_map_reduce_task(ctx: dict, source_id: str):
                     src.status = "plan_ready"
                     src.progress = 80
                     src.progress_message = "Compilation plan ready — awaiting review"
+                    src.auto_recover_count = 0
                     await session.commit()
                 logger.info(f"Source {source_id} plan ready: {result.get('plan_id')}")
             elif result.get("status") == "plan_auto_approved":
@@ -923,6 +963,120 @@ async def sweep_stuck_ai_review_cron(ctx: dict):
             )
 
 
+async def sweep_stuck_processing_cron(ctx: dict):
+    """Periodic safety net: flip any Source stuck in status='processing' for
+    longer than 2x the worker job_timeout back to 'error'.
+
+    A source gets stuck when the worker process dies AFTER writing
+    status='processing' but BEFORE finishing the pipeline — OOM, SIGKILL,
+    container restart, hung LLM call. The in-worker try/except can't catch
+    process death so the source row stays at 'processing' indefinitely with
+    no recovery path (the retry endpoint only accepts 'error' / 'plan_ready').
+
+    This sweep does NOT auto-enqueue a retry — it only marks the row 'error'
+    so the user sees the Retry button. Auto-retrying here would loop forever
+    if the failure is deterministic (bad provider key, malformed file).
+    Source.auto_recover_count tracks consecutive sweeps; the retry API blocks
+    once it crosses settings.max_auto_recover_attempts so even manual retries
+    are gated against token-burning loops.
+
+    Uses updated_at (bumped by ProgressTracker on every progress update) so
+    legitimately slow MAP-phase LLM calls don't get swept while still
+    producing progress.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import or_, select
+
+    from app.database import async_session_factory
+    from app.database.models import Source
+
+    timeout_sec = max(int(settings.worker_job_timeout) * 2, 1800)
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=timeout_sec)
+
+    async with async_session_factory() as session:
+        rows = (await session.execute(
+            select(Source).where(
+                Source.status == "processing",
+                or_(Source.updated_at < cutoff, Source.updated_at.is_(None)),
+            )
+        )).scalars().all()
+
+        if not rows:
+            return
+
+        for src in rows:
+            src.auto_recover_count = (src.auto_recover_count or 0) + 1
+            src.status = "error"
+            attempts = src.auto_recover_count
+            cap = settings.max_auto_recover_attempts
+            if attempts >= cap:
+                src.error_message = (
+                    f"Worker died with no progress for >{timeout_sec // 60} min "
+                    f"on {attempts} consecutive attempts (cap={cap}). Retry is "
+                    f"blocked — check LLM provider config and source file, then "
+                    f"ask an admin to reset auto_recover_count."
+                )
+            else:
+                src.error_message = (
+                    f"Worker died with no progress for >{timeout_sec // 60} min. "
+                    f"Press Retry to try again ({attempts}/{cap} auto-recoveries used)."
+                )
+            src.progress_message = src.error_message
+
+        await session.commit()
+        logger.warning(
+            f"sweep_stuck_processing_cron: flipped {len(rows)} source(s) "
+            f"from 'processing' → 'error' (stuck >{timeout_sec}s)"
+        )
+
+
+async def cleanup_orphan_awaiting_approval_cron(ctx: dict):
+    """Delete sources stuck in status='awaiting_approval' longer than the TTL.
+
+    A source enters this state after extraction when token count exceeds the
+    auto-approve threshold. If a human never approves or cancels, the MinIO
+    object + DB row become orphans. This sweep deletes them along with
+    associated MinIO data.
+    """
+    from datetime import datetime, timedelta, timezone
+
+    from sqlalchemy import select
+
+    from app.database import async_session_factory
+    from app.database.models import Source
+    from app.services.storage_service import storage_service
+
+    ttl_hours = max(1, int(settings.extraction_approval_ttl_hours))
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+
+    async with async_session_factory() as session:
+        rows = (await session.execute(
+            select(Source).where(
+                Source.status == "awaiting_approval",
+                Source.updated_at < cutoff,
+            )
+        )).scalars().all()
+
+        for src in rows:
+            try:
+                if src.minio_key:
+                    try:
+                        storage_service.delete_object(src.minio_key)
+                    except Exception as exc:
+                        logger.warning(f"cleanup_orphan: minio delete failed for {src.id}: {exc}")
+                await session.delete(src)
+            except Exception as exc:
+                logger.warning(f"cleanup_orphan: delete failed for {src.id}: {exc}")
+
+        if rows:
+            await session.commit()
+            logger.info(
+                f"cleanup_orphan_awaiting_approval_cron: deleted {len(rows)} "
+                f"source(s) older than {ttl_hours}h"
+            )
+
+
 async def daily_stats_rollup_cron(ctx: dict):
     """
     Cronjob: recompute admin Statistics rollups for yesterday (UTC).
@@ -1099,6 +1253,11 @@ class WorkerSettings:
         # Every 10 minutes — quick recovery from stuck 'running' AI reviews
         # caused by hard worker death (OOM, SIGKILL, container restart).
         cron(sweep_stuck_ai_review_cron, minute={0, 10, 20, 30, 40, 50}),
+        # Every 10 minutes — recover sources stuck at 'processing' from the
+        # same class of failures. Flips to 'error' only; no auto-retry.
+        cron(sweep_stuck_processing_cron, minute={5, 15, 25, 35, 45, 55}),
+        # Hourly: delete orphan sources stuck in awaiting_approval.
+        cron(cleanup_orphan_awaiting_approval_cron, minute=15),
     ]
 
     @staticmethod

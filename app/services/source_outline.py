@@ -185,3 +185,30 @@ def flatten_outline(nodes: list[dict]) -> list[dict]:
 
     _walk(nodes)
     return out
+
+
+def flatten_outline_with_depth(nodes: list[dict], depth: int = 0) -> list[dict]:
+    """Like flatten_outline but injects _depth and preserves children pointer."""
+    result: list[dict] = []
+    for node in nodes:
+        result.append({**node, "_depth": depth})
+        if node.get("children"):
+            result.extend(flatten_outline_with_depth(node["children"], depth + 1))
+    return result
+
+
+def find_smallest_node_containing(flat: list[dict], offset: int) -> Optional[dict]:
+    """Return the smallest-leaf outline node whose [char_start, char_end) covers offset."""
+    best: Optional[dict] = None
+    best_size = float("inf")
+    for node in flat:
+        start = node.get("char_start")
+        end = node.get("char_end")
+        if start is None or end is None:
+            continue
+        if start <= offset < end:
+            size = end - start
+            if size < best_size:
+                best = node
+                best_size = size
+    return best

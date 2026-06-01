@@ -26,9 +26,10 @@ from app.database.models import WikiLink, WikiPage, WikiPageDraft, WikiPageRevis
 # Reserved page slugs — these are regular WikiPage rows but treated specially.
 INDEX_SLUG = "_index"
 LOG_SLUG = "_log"
+HOT_SLUG = "_hot"
 
 # Recognized page types — used for filtering and prompt hints to the compiler.
-PAGE_TYPES = {"entity", "concept", "source", "topic", "index", "log"}
+PAGE_TYPES = {"entity", "concept", "source", "topic", "index", "log", "hot"}
 
 # `[[slug]]` or `[[slug|display text]]` — captures the slug only.
 _WIKILINK_RE = re.compile(r"\[\[([^\]\|]+)(?:\|[^\]]*)?]]")
@@ -45,30 +46,30 @@ def _scope_filter(scope_type: str = "global", scope_id: Optional[uuid.UUID] = No
     return and_(WikiPage.scope_type == scope_type, WikiPage.scope_id.is_(None))
 
 
-def _scope_filter_with_dept(department_id: Optional[uuid.UUID] = None):
-    """OR-filter: global pages + department pages visible to the given dept member.
+def _scope_filter_with_dept(department_ids: Optional[list[uuid.UUID]] = None):
+    """OR-filter: global pages + department pages visible to the given dept members.
 
     DEPRECATED for MCP read paths — does NOT include project-scoped pages,
     which made wiki pages of workspaces invisible to their own members. Use
     `_scope_filter_for_identity` instead.
     """
-    if department_id:
+    if department_ids:
         return or_(
             and_(WikiPage.scope_type == "global", WikiPage.scope_id.is_(None)),
-            and_(WikiPage.scope_type == "department", WikiPage.scope_id == department_id),
+            and_(WikiPage.scope_type == "department", WikiPage.scope_id.in_(department_ids)),
         )
     return _scope_filter("global")
 
 
 def _scope_filter_for_identity(
-    department_id: Optional[uuid.UUID] = None,
+    department_ids: Optional[list[uuid.UUID]] = None,
     project_ids: Optional[list[uuid.UUID]] = None,
 ):
     """OR-filter for the MCP read path: every wiki page the user can see.
 
     Includes:
       - All global pages.
-      - Department pages of the user's own department.
+      - Department pages of every department the user belongs to.
       - Project pages of every workspace the user is a member of.
 
     Without the project branch, members of a workspace cannot find their own
@@ -76,9 +77,9 @@ def _scope_filter_for_identity(
     drill-down and assume the page doesn't exist.
     """
     clauses = [and_(WikiPage.scope_type == "global", WikiPage.scope_id.is_(None))]
-    if department_id is not None:
+    if department_ids:
         clauses.append(
-            and_(WikiPage.scope_type == "department", WikiPage.scope_id == department_id)
+            and_(WikiPage.scope_type == "department", WikiPage.scope_id.in_(department_ids))
         )
     if project_ids:
         clauses.append(
@@ -88,13 +89,13 @@ def _scope_filter_for_identity(
 
 
 def _inverse_scope_filter_for_identity(
-    department_id: Optional[uuid.UUID] = None,
+    department_ids: Optional[list[uuid.UUID]] = None,
     project_ids: Optional[list[uuid.UUID]] = None,
 ):
     """Pages OUTSIDE the user's accessible scope — used by out-of-scope hints.
 
     Excludes global pages (everyone sees those) so the inverse is just:
-      - Department pages of OTHER departments.
+      - Department pages of departments the user does NOT belong to.
       - Project pages of workspaces the user is NOT a member of.
     """
     project_clause = (
@@ -103,8 +104,8 @@ def _inverse_scope_filter_for_identity(
         else WikiPage.scope_type == "project"
     )
     dept_clause = (
-        and_(WikiPage.scope_type == "department", WikiPage.scope_id != department_id)
-        if department_id is not None
+        and_(WikiPage.scope_type == "department", WikiPage.scope_id.notin_(department_ids))
+        if department_ids
         else WikiPage.scope_type == "department"
     )
     return or_(dept_clause, project_clause)
@@ -280,7 +281,7 @@ async def get_page_by_slug(
     page = result.scalars().first()
     if page is None:
         return None
-    if allowed_kt_slugs is None or slug in (INDEX_SLUG, LOG_SLUG):
+    if allowed_kt_slugs is None or slug in (INDEX_SLUG, LOG_SLUG, HOT_SLUG):
         return page
     if not page.knowledge_type_slugs:
         return page
@@ -308,11 +309,12 @@ async def list_pages(
     page_type: Optional[str] = None,
     knowledge_type_slug: Optional[str] = None,
     allowed_kt_slugs: Optional[list[str]] = None,
+    query: Optional[str] = None,
     limit: int = 50,
     offset: int = 0,
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
-    department_id: Optional[uuid.UUID] = None,
+    department_ids: Optional[list[uuid.UUID]] = None,
     project_ids: Optional[list[uuid.UUID]] = None,
     all_scopes: bool = False,
 ) -> list[WikiPage]:
@@ -320,19 +322,20 @@ async def list_pages(
 
     Scope behaviour:
       - `all_scopes=True`: no scope filter at all (admin bypass).
-      - `department_id` (and optionally `project_ids`) given: union of global
-        + user's department + every workspace the user is a member of.
+      - `department_ids` (and optionally `project_ids`) given: union of global
+        + every department the user belongs to + every workspace the user is
+        a member of.
       - Otherwise: exact `scope_type`/`scope_id` (pipeline write path).
     """
     if all_scopes:
         scope_clause = None
-    elif department_id is not None or project_ids:
-        scope_clause = _scope_filter_for_identity(department_id, project_ids)
+    elif department_ids or project_ids:
+        scope_clause = _scope_filter_for_identity(department_ids, project_ids)
     else:
         scope_clause = _scope_filter(scope_type, scope_id)
     stmt = (
         select(WikiPage)
-        .where(WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]))
+        .where(WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG, HOT_SLUG]))
         .order_by(WikiPage.updated_at.desc())
         .limit(limit)
         .offset(offset)
@@ -350,6 +353,14 @@ async def list_pages(
                 func.cardinality(WikiPage.knowledge_type_slugs) == 0,
             )
         )
+    if query:
+        stmt = stmt.where(
+            or_(
+                WikiPage.title.ilike(f"%{query}%"),
+                WikiPage.slug.ilike(f"%{query}%"),
+                WikiPage.content_md.ilike(f"%{query}%"),
+            )
+        )
     result = await session.execute(stmt)
     return list(result.scalars().all())
 
@@ -362,7 +373,7 @@ async def search_pages_semantic(
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
     spec_id: Optional[str] = None,
-    department_id: Optional[uuid.UUID] = None,
+    department_ids: Optional[list[uuid.UUID]] = None,
     project_ids: Optional[list[uuid.UUID]] = None,
     inverse_scope: bool = False,
     all_scopes: bool = False,
@@ -376,8 +387,8 @@ async def search_pages_semantic(
     only used by tests and internal tooling.
 
     Scope behaviour:
-      - If `department_id` or `project_ids` is given: returns pages from
-        global + user's department + user's workspaces (MCP read path).
+      - If `department_ids` or `project_ids` is given: returns pages from
+        global + user's departments + user's workspaces (MCP read path).
       - If `inverse_scope=True`: returns pages OUTSIDE that scope (other
         departments, workspaces the user isn't a member of). Used to surface
         "you don't have access" hints.
@@ -402,15 +413,15 @@ async def search_pages_semantic(
     if all_scopes and not inverse_scope:
         scope_clause = None
     elif inverse_scope:
-        scope_clause = _inverse_scope_filter_for_identity(department_id, project_ids)
-    elif department_id is not None or project_ids:
-        scope_clause = _scope_filter_for_identity(department_id, project_ids)
+        scope_clause = _inverse_scope_filter_for_identity(department_ids, project_ids)
+    elif department_ids or project_ids:
+        scope_clause = _scope_filter_for_identity(department_ids, project_ids)
     else:
         scope_clause = _scope_filter(scope_type, scope_id)
 
     where_clauses = [
         Emb.model_spec_id == spec.id,
-        WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
+        WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG, HOT_SLUG]),
     ]
     if scope_clause is not None:
         where_clauses.append(scope_clause)
@@ -452,12 +463,13 @@ async def apply_create(
     embedding: Optional[list[float]] = None,
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
+    status: str = "seed",
 ) -> WikiPage:
     """Insert a new page in the given scope. Conflicts raise — caller should use update."""
     page = WikiPage(
         slug=slug,
         title=title,
-        page_type=page_type if page_type in PAGE_TYPES else "concept",
+        status=status,
         content_md=content_md,
         summary=summary,
         knowledge_type_slugs=list(knowledge_type_slugs or []),
@@ -489,6 +501,7 @@ async def apply_update(
     embedding: Optional[list[float]] = None,
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
+    status: Optional[str] = None,
 ) -> Optional[WikiPage]:
     """
     Update an existing page atomically within the given scope:
@@ -496,6 +509,7 @@ async def apply_update(
       - Optionally update title/summary.
       - Union add_knowledge_type_slug into knowledge_type_slugs.
       - Append add_source_id to source_ids if not present.
+      - Optionally update lifecycle status.
       - Bump version, refresh updated_at, refresh embedding if supplied.
     Returns None if the page does not exist.
     """
@@ -508,10 +522,12 @@ async def apply_update(
         page.title = title
     if summary is not None:
         page.summary = summary
+    if status is not None:
+        page.status = status
     if add_knowledge_type_slug and add_knowledge_type_slug not in (page.knowledge_type_slugs or []):
         page.knowledge_type_slugs = [*(page.knowledge_type_slugs or []), add_knowledge_type_slug]
     if add_source_id and add_source_id not in (page.source_ids or []):
-        page.source_ids = [*(page.source_ids or []), add_source_id]
+        page.source_ids = [*(source_id for source_id in (page.source_ids or [])), add_source_id]
     # Embeddings are no longer stored on WikiPage; the compiler calls
     # _reembed_pages after this returns, which writes into the active
     # wiki_page_embeddings_<dim> table. The `embedding` parameter is accepted
@@ -539,6 +555,7 @@ async def upsert_page(
     embedding: Optional[list[float]] = None,
     scope_type: str = "global",
     scope_id: Optional[uuid.UUID] = None,
+    status: Optional[str] = None,
 ) -> WikiPage:
     """Create-or-update by slug within a scope."""
     # Acquire a transaction-level advisory lock based on the hash of the slug
@@ -552,6 +569,7 @@ async def upsert_page(
             session, slug, title, page_type, content_md, summary,
             knowledge_type_slugs, source_ids, embedding,
             scope_type=scope_type, scope_id=scope_id,
+            status=status or "seed",
         )
     return await apply_update(
         session,
@@ -563,6 +581,7 @@ async def upsert_page(
         add_source_id=source_ids[0] if source_ids else None,
         embedding=embedding,
         scope_type=scope_type, scope_id=scope_id,
+        status=status,
     ) or existing
 
 
@@ -582,7 +601,7 @@ async def regenerate_index(
     stmt = (
         select(WikiPage.slug, WikiPage.title, WikiPage.page_type, WikiPage.summary)
         .where(
-            WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG]),
+            WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG, HOT_SLUG]),
             _scope_filter(scope_type, scope_id),
         )
         .order_by(WikiPage.page_type, WikiPage.title)
@@ -909,7 +928,7 @@ async def approve_draft(
             # shouldn't propagate downstream. Treat as missing scope.
             scope_id = None
 
-        if not slug or slug in (INDEX_SLUG, LOG_SLUG):
+        if not slug or slug in (INDEX_SLUG, LOG_SLUG, HOT_SLUG):
             raise ValueError(f"Invalid slug for new page: '{slug}'")
         if not title:
             raise ValueError("Title is required to materialise a new page")
@@ -1051,3 +1070,190 @@ async def rollback_to_revision(
     ))
     await session.flush()
     return page
+
+
+async def regenerate_hot_cache(
+    session: AsyncSession,
+    scope_type: str = "global",
+    scope_id: Optional[uuid.UUID] = None,
+) -> WikiPage:
+    """
+    Generate or rebuild the dynamic hot cache page (`_hot`) for the given scope.
+    It summarizes:
+      - The 10 most recently updated pages.
+      - A list of active 'seed' pages that need more knowledge.
+      - Any detected and unresolved contradictions (pages containing `[!contradiction]`).
+    It calls the active LLM to compile this into a dense, high-value briefing.
+    """
+    from app.ai.registry import ProviderRegistry
+
+    # 1. Fetch recent pages
+    recent_stmt = (
+        select(WikiPage.slug, WikiPage.title, WikiPage.status, WikiPage.updated_at)
+        .where(
+            WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG, HOT_SLUG]),
+            _scope_filter(scope_type, scope_id),
+        )
+        .order_by(WikiPage.updated_at.desc())
+        .limit(10)
+    )
+    recent_rows = (await session.execute(recent_stmt)).all()
+    
+    # 2. Fetch seed pages
+    seed_stmt = (
+        select(WikiPage.slug, WikiPage.title)
+        .where(
+            WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG, HOT_SLUG]),
+            WikiPage.status == "seed",
+            _scope_filter(scope_type, scope_id),
+        )
+        .order_by(WikiPage.title)
+        .limit(20)
+    )
+    seed_rows = (await session.execute(seed_stmt)).all()
+
+    # 3. Fetch contradiction pages
+    contradiction_stmt = (
+        select(WikiPage.slug, WikiPage.title, WikiPage.content_md)
+        .where(
+            WikiPage.slug.notin_([INDEX_SLUG, LOG_SLUG, HOT_SLUG]),
+            WikiPage.content_md.contains("[!contradiction]"),
+            _scope_filter(scope_type, scope_id),
+        )
+        .order_by(WikiPage.title)
+    )
+    contradiction_rows = (await session.execute(contradiction_stmt)).all()
+
+    # 4. Format context natively (Zero LLM cost fallback)
+    recent_prose = "\n".join(f"- [[{r.slug}|{r.title}]] (Trạng thái: {r.status}, Cập nhật: {r.updated_at.strftime('%Y-%m-%d %H:%M') if r.updated_at else 'N/A'})" for r in recent_rows) if recent_rows else "- Không có cập nhật gần đây."
+    seed_prose = "\n".join(f"- [[{r.slug}|{r.title}]]" for r in seed_rows) if seed_rows else "- Không có trang sơ khởi nào."
+    
+    contradiction_items = []
+    for r in contradiction_rows:
+        match = re.search(r">\s*\[!contradiction]\s*(.*?)(?=\n[^>]|\n\n|$)", r.content_md, re.DOTALL | re.IGNORECASE)
+        callout_desc = match.group(1).replace(">", "").strip() if match else "Có mâu thuẫn tri thức được phát hiện."
+        contradiction_items.append(f"- [[{r.slug}|{r.title}]]: {callout_desc}")
+    contradiction_prose = "\n".join(contradiction_items) if contradiction_items else "- Không phát hiện mâu thuẫn tri thức nào."
+
+    new_md = f"""# ⚡ Arkon Briefing Tri Thức Nóng
+
+*(Bản tin trạng thái tri thức tự động của hệ thống)*
+
+## ⚠️ Mâu thuẫn tri thức đang tồn tại
+{contradiction_prose}
+
+## 🔄 Tri thức cập nhật gần đây
+{recent_prose}
+
+## 🌱 Tri thức sơ khởi (Seed Pages)
+{seed_prose}
+"""
+
+    page = await get_page_by_slug(session, HOT_SLUG, scope_type=scope_type, scope_id=scope_id)
+    if page is None:
+        page = WikiPage(
+            slug=HOT_SLUG,
+            title="Briefing Tri Thức Nóng",
+            status="evergreen",
+            content_md=new_md,
+            summary="Bản tin tóm tắt tự động về tri thức và các mâu thuẫn cần giải quyết",
+            knowledge_type_slugs=[],
+            source_ids=[],
+            scope_type=scope_type,
+            scope_id=scope_id,
+        )
+        session.add(page)
+    else:
+        page.content_md = new_md
+        page.status = "evergreen"
+        page.version = (page.version or 1) + 1
+    await session.flush()
+    return page
+
+
+async def lint_wiki(
+    session: AsyncSession,
+    scope_type: str = "global",
+    scope_id: Optional[uuid.UUID] = None,
+) -> dict:
+    """
+    Diagnose structural health issues in the wiki:
+      - Dead links: wikilinks pointing to non-existent pages in this scope.
+      - Orphan pages: pages with zero incoming backlinks.
+      - Contradiction nodes: pages containing '[!contradiction]' callouts.
+    """
+    # 1. Fetch all pages in the current scope
+    pages_stmt = select(WikiPage.slug, WikiPage.title, WikiPage.id, WikiPage.status).where(
+        _scope_filter(scope_type, scope_id)
+    )
+    pages_rows = (await session.execute(pages_stmt)).all()
+    all_slugs = {r.slug for r in pages_rows}
+    slug_to_title = {r.slug: r.title for r in pages_rows}
+
+    # 2. Fetch all links in this scope
+    page_ids = [r.id for r in pages_rows]
+    links_stmt = select(WikiLink.from_page_id, WikiLink.to_slug)
+    if page_ids:
+        links_stmt = links_stmt.where(WikiLink.from_page_id.in_(page_ids))
+    links_rows = (await session.execute(links_stmt)).all()
+
+    # 3. Find dead links
+    dead_links = []
+    id_to_slug = {r.id: r.slug for r in pages_rows}
+    backlink_counts: dict[str, int] = {slug: 0 for slug in all_slugs}
+
+    for from_page_id, to_slug in links_rows:
+        from_slug = id_to_slug.get(from_page_id)
+        if not from_slug:
+            continue
+        
+        is_exist = (to_slug in all_slugs)
+        
+        if not is_exist:
+            # Check global scope as fallback
+            if scope_type != "global":
+                global_exists = (await session.execute(
+                    select(WikiPage.id).where(WikiPage.slug == to_slug, WikiPage.scope_type == "global", WikiPage.scope_id.is_(None))
+                )).scalar_one_or_none()
+                if global_exists:
+                    is_exist = True
+
+        if is_exist:
+            if to_slug in backlink_counts:
+                backlink_counts[to_slug] += 1
+        else:
+            if to_slug not in (INDEX_SLUG, LOG_SLUG, HOT_SLUG):
+                dead_links.append({
+                    "from_slug": from_slug,
+                    "from_title": slug_to_title.get(from_slug, from_slug),
+                    "to_slug": to_slug
+                })
+
+    # 4. Find orphan pages (0 incoming backlinks, excluding reserved pages)
+    orphans = []
+    for r in pages_rows:
+        if r.slug in (INDEX_SLUG, LOG_SLUG, HOT_SLUG):
+            continue
+        if backlink_counts.get(r.slug, 0) == 0:
+            orphans.append({
+                "slug": r.slug,
+                "title": r.title,
+                "status": r.status
+            })
+
+    # 5. Find pages carrying contradictions
+    contradictions_stmt = select(WikiPage.slug, WikiPage.title).where(
+        WikiPage.content_md.contains("[!contradiction]"),
+        _scope_filter(scope_type, scope_id)
+    )
+    contradictions_rows = (await session.execute(contradictions_stmt)).all()
+    contradiction_nodes = [
+        {"slug": r.slug, "title": r.title}
+        for r in contradictions_rows
+    ]
+
+    return {
+        "dead_links": dead_links,
+        "orphans": orphans,
+        "contradictions": contradiction_nodes
+    }

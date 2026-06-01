@@ -15,7 +15,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.database.models import Employee, ProjectMember
+from app.database.models import Employee
 from app.services.auth_service import (
     authenticate_employee,
     create_access_token,
@@ -37,10 +37,7 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class WorkspaceMembershipOut(BaseModel):
-    workspace_id: str
-    workspace_name: str
-    role: str
+# Deprecated WorkspaceMembershipOut DTO
 
 
 class LoginResponse(BaseModel):
@@ -59,34 +56,21 @@ class ProfileResponse(BaseModel):
     name: str
     email: str
     role: str
-    department_id: str
-    department_name: str
+    department_ids: list[str] = []
+    department_names: list[str] = []
     is_active: bool
     has_mcp_token: bool
     permissions: list[str] = []
-    workspace_memberships: list[WorkspaceMembershipOut] = []
+    workspace_memberships: list[dict] = []
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
-async def _get_workspace_memberships(db, employee_id) -> list[WorkspaceMembershipOut]:
-    """Get all workspace memberships for an employee."""
-    from app.database.models import Project
-    result = await db.execute(
-        select(ProjectMember, Project.name)
-        .join(Project, ProjectMember.project_id == Project.id)
-        .where(ProjectMember.employee_id == employee_id)
-    )
-    return [
-        WorkspaceMembershipOut(
-            workspace_id=str(pm.project_id),
-            workspace_name=name,
-            role=pm.role,
-        )
-        for pm, name in result.all()
-    ]
+async def _get_workspace_memberships(db, employee_id) -> list:
+    """Workspace memberships have been deprecated and removed."""
+    return []
 
 
 def _build_user_dict(employee: Employee, permissions: list[str], workspace_memberships: Optional[list] = None) -> dict:
@@ -96,8 +80,10 @@ def _build_user_dict(employee: Employee, permissions: list[str], workspace_membe
         "name": employee.name,
         "email": employee.email,
         "role": employee.role,
-        "department_id": str(employee.department_id),
-        "department_name": employee.department.name if employee.department else "",
+        "department_ids": [str(ed.department_id) for ed in employee.employee_departments],
+        "department_names": [
+            ed.department.name for ed in employee.employee_departments if ed.department
+        ],
         "permissions": permissions,
         "workspace_memberships": workspace_memberships or [],
     }
@@ -128,7 +114,7 @@ async def login(req: LoginRequest, db: AsyncSession = Depends(get_db)):
 
     return LoginResponse(
         access_token=token,
-        user=_build_user_dict(employee, permissions, [m.model_dump() for m in workspace_memberships]),
+        user=_build_user_dict(employee, permissions, []),
     )
 
 
@@ -146,8 +132,10 @@ async def get_profile(
         name=current_user.name,
         email=current_user.email,
         role=current_user.role,
-        department_id=str(current_user.department_id),
-        department_name=current_user.department.name if current_user.department else "",
+        department_ids=[str(ed.department_id) for ed in current_user.employee_departments],
+        department_names=[
+            ed.department.name for ed in current_user.employee_departments if ed.department
+        ],
         is_active=current_user.is_active,
         has_mcp_token=bool(current_user.mcp_token_hash),
         permissions=permissions,

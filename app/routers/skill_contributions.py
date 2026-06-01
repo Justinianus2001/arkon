@@ -521,10 +521,11 @@ async def approve_skill_contribution(
     # 2. If scope is 'global', any reviewer can approve.
     # 3. If scope is 'department', reviewer must belong to one of the target departments.
     if admin.role != "admin" and contribution.scope_type == "department":
-        target_dept_ids = [str(id) for id in (contribution.scope_ids or [])]
-        if str(admin.department_id) not in target_dept_ids:
+        target_dept_ids = {str(id) for id in (contribution.scope_ids or [])}
+        admin_dept_ids = {str(d) for d in admin.department_ids}
+        if not (target_dept_ids & admin_dept_ids):
             raise HTTPException(
-                403, 
+                403,
                 "You do not have permission to approve contributions for these departments. "
                 "Reviewer must belong to one of the target departments."
             )

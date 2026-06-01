@@ -32,10 +32,24 @@ async def _resolve_wiki_scopes(session: AsyncSession, source) -> list[tuple[str,
 
     Project scope takes priority. If source has department assignments, one scope
     per department. Falls back to global.
+
+    Reads scope_type / scope_id fresh from DB rather than from the in-memory
+    `source` object: PATCH /sources/{id} may have changed scope while the
+    worker held a stale copy (session uses expire_on_commit=False). Mixing
+    in-memory scope with DB-read departments would commit wiki pages to the
+    wrong scope and could leak visibility.
     """
+    from app.database.models import Source as SourceModel
     from app.database.models import SourceDepartment
-    if source.scope_type == "project":
-        return [("project", source.scope_id)]
+
+    row = (await session.execute(
+        select(SourceModel.scope_type, SourceModel.scope_id).where(SourceModel.id == source.id)
+    )).one_or_none()
+    if row is None:
+        return [("global", None)]
+    scope_type, scope_id = row
+    if scope_type == "project":
+        return [("project", scope_id)]
     rows = (await session.execute(
         select(SourceDepartment.department_id).where(SourceDepartment.source_id == source.id)
     )).all()
@@ -124,6 +138,7 @@ async def run_commit_phase(
                             source_ids=[source.id],
                             scope_type=scope_type,
                             scope_id=scope_id,
+                            status=getattr(pr, "status", "seed"),
                         )
                         pages_created += 1
 
@@ -143,7 +158,7 @@ async def run_commit_phase(
                                 existing_page.content_md,
                                 pr.content_md,
                                 pr.slug,
-                            )
+                             )
 
                     page = await wiki_service.apply_update(
                         session,
@@ -155,6 +170,7 @@ async def run_commit_phase(
                         add_source_id=source.id,
                         scope_type=scope_type,
                         scope_id=scope_id,
+                        status=getattr(pr, "status", None),
                     )
                     if page is None:
                         page = await wiki_service.apply_create(
@@ -168,6 +184,7 @@ async def run_commit_phase(
                             source_ids=[source.id],
                             scope_type=scope_type,
                             scope_id=scope_id,
+                            status=getattr(pr, "status", "seed"),
                         )
                         pages_created += 1
                     else:
@@ -188,6 +205,7 @@ async def run_commit_phase(
                 logger.error(f"MRP COMMIT failed for '{pr.slug}' scope={scope_type}: {exc}")
 
         await wiki_service.regenerate_index(session, scope_type=scope_type, scope_id=scope_id)
+        # regenerate_hot_cache is disabled to save resources and LLM costs
 
         log_entry = (
             f"MRP: ingested '{source.title or source.file_name or str(source.id)}': "
@@ -212,6 +230,7 @@ async def run_commit_phase(
         src.progress = 100
         src.progress_message = "Done"
         src.error_message = None
+        src.auto_recover_count = 0
 
     await session.commit()
 

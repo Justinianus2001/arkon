@@ -22,7 +22,7 @@ type Employee = {
   id: string;
   name: string;
   email: string;
-  department_id: string;
+  department_ids: string[];
 };
 
 type Props = {
@@ -67,8 +67,8 @@ export function DeptMembersDialog({ open, onOpenChange, deptId, deptName }: Prop
     setSaving(true);
     setError("");
     try {
-      await api(`/api/employees/${selectedEmpId}/department`, {
-        method: "PATCH",
+      await api(`/api/employees/${selectedEmpId}/departments`, {
+        method: "POST",
         body: { department_id: deptId },
       });
       setSelectedEmpId("");
@@ -77,6 +77,18 @@ export function DeptMembersDialog({ open, onOpenChange, deptId, deptName }: Prop
       setError(err instanceof Error ? err.message : "Failed to add member");
     } finally {
       setSaving(false);
+    }
+  };
+
+  const handleRemove = async (empId: string) => {
+    setError("");
+    try {
+      await api(`/api/employees/${empId}/departments/${deptId}`, {
+        method: "DELETE",
+      });
+      await loadMembers();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Failed to remove member");
     }
   };
 
@@ -154,6 +166,15 @@ export function DeptMembersDialog({ open, onOpenChange, deptId, deptName }: Prop
                       <span className="text-sm font-medium">{m.name}</span>
                       <span className="text-xs text-muted-foreground">{m.email}</span>
                     </div>
+                    <Button
+                      size="sm"
+                      variant="ghost"
+                      onClick={() => handleRemove(m.id)}
+                      className="text-muted-foreground hover:text-destructive"
+                      aria-label={`Remove ${m.name} from ${deptName}`}
+                    >
+                      <span className="material-symbols-outlined text-sm">close</span>
+                    </Button>
                   </div>
                 ))}
               </div>
@@ -161,7 +182,8 @@ export function DeptMembersDialog({ open, onOpenChange, deptId, deptName }: Prop
           </div>
 
           <p className="text-xs text-muted-foreground">
-            To move an employee out of this department, edit their profile and assign a new department.
+            Employees can belong to multiple departments. Removing them here only revokes
+            this department&apos;s access — their other memberships are untouched.
           </p>
         </div>
       </DialogContent>

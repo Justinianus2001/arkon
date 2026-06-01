@@ -20,14 +20,14 @@ import {
 } from "@/components/ui/dialog";
 
 type Department = { id: string; name: string };
-type Role = { id: string; name: string; is_system?: boolean };
+type Role = { id: string; name: string };
 type Employee = {
   id: string;
   name: string;
   email: string;
   role: string;
-  department_id: string;
-  custom_role_id?: string;
+  global_role: string;
+  department_ids: string[];
 };
 
 type Props = {
@@ -51,12 +51,10 @@ export function EmployeeDialog({
   const [name, setName] = useState("");
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
-  const [role, setRole] = useState("employee");
-  const [deptId, setDeptId] = useState("");
-  const [customRoleId, setCustomRoleId] = useState("");
+  const [globalRole, setGlobalRole] = useState("viewer");
+  const [deptIds, setDeptIds] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState("");
-  const [localRoles, setLocalRoles] = useState<Role[]>([]);
   const [localDepartments, setLocalDepartments] = useState<Department[]>([]);
   const [inlinePrompt, setInlinePrompt] = useState({
     open: false,
@@ -67,10 +65,6 @@ export function EmployeeDialog({
     error: "",
     onSubmit: async (val: string) => {},
   });
-
-  useEffect(() => {
-    setLocalRoles(roles.filter(r => !r.is_system));
-  }, [roles]);
 
   useEffect(() => {
     setLocalDepartments(departments);
@@ -90,27 +84,7 @@ export function EmployeeDialog({
           body: { name: val, description: "" }
         });
         setLocalDepartments(prev => [...prev, newDept]);
-        setDeptId(newDept.id);
-        setInlinePrompt(p => ({ ...p, open: false }));
-      }
-    });
-  };
-
-  const handleCreateRole = () => {
-    setInlinePrompt({
-      open: true,
-      title: "Create Position",
-      label: "Position Name",
-      value: "",
-      saving: false,
-      error: "",
-      onSubmit: async (val) => {
-        const newRole = await api<Role>("/api/roles", {
-          method: "POST",
-          body: { name: val, permissions: [] }
-        });
-        setLocalRoles(prev => [...prev, newRole]);
-        setCustomRoleId(newRole.id);
+        setDeptIds(prev => prev.includes(newDept.id) ? prev : [...prev, newDept.id]);
         setInlinePrompt(p => ({ ...p, open: false }));
       }
     });
@@ -130,17 +104,15 @@ export function EmployeeDialog({
     if (employee) {
       setName(employee.name);
       setEmail(employee.email);
-      setRole(employee.role);
-      setDeptId(employee.department_id);
-      setCustomRoleId(employee.custom_role_id || "");
+      setGlobalRole(employee.global_role || "viewer");
+      setDeptIds(employee.department_ids ?? []);
       setPassword("");
     } else {
       setName("");
       setEmail("");
       setPassword("");
-      setRole("employee");
-      setDeptId(departments[0]?.id || "");
-      setCustomRoleId("");
+      setGlobalRole("viewer");
+      setDeptIds(departments[0]?.id ? [departments[0].id] : []);
     }
     setError("");
   }, [employee, open, departments]);
@@ -151,12 +123,12 @@ export function EmployeeDialog({
     setError("");
 
     try {
-      const body: Record<string, string | null> = {
+      const body: Record<string, unknown> = {
         name,
         email,
-        role,
-        department_id: deptId,
-        custom_role_id: customRoleId || null,
+        role: globalRole === "admin" ? "admin" : "employee",
+        global_role: globalRole,
+        department_ids: deptIds,
       };
       if (password) body.password = password;
 
@@ -230,39 +202,45 @@ export function EmployeeDialog({
 
           <div className="grid grid-cols-2 gap-4">
             <div className="flex flex-col gap-2">
-              <Label>System Role</Label>
-              <Select value={role} onValueChange={(v) => v && setRole(v)}>
+              <Label>Role</Label>
+              <Select value={globalRole} onValueChange={(v) => v && setGlobalRole(v)}>
                 <SelectTrigger className="bg-background">
-                  {role === "admin" ? "Admin" : role === "employee" ? "Employee" : <SelectValue />}
+                  <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="employee">Employee</SelectItem>
-                  <SelectItem value="admin">Admin</SelectItem>
+                  {roles.map((r) => (
+                    <SelectItem key={r.id} value={r.id}>
+                      {r.name}
+                    </SelectItem>
+                  ))}
                 </SelectContent>
               </Select>
             </div>
 
             <div className="flex flex-col gap-2">
-              <Label>Department</Label>
-              <Select 
-                value={deptId} 
+              <Label>Departments</Label>
+              <Select
+                value=""
                 onValueChange={(v) => {
+                  if (!v) return;
                   if (v === "__new__") {
                     handleCreateDepartment();
                     return;
                   }
-                  if (v) setDeptId(v);
+                  setDeptIds(prev => prev.includes(v) ? prev : [...prev, v]);
                 }}
               >
                 <SelectTrigger className="bg-background">
-                  {deptId ? (localDepartments.find(d => d.id === deptId)?.name || deptId) : <SelectValue placeholder="Select" />}
+                  <span className="text-muted-foreground">Add department…</span>
                 </SelectTrigger>
                 <SelectContent className="!w-max min-w-(--anchor-width)">
-                  {localDepartments.map((d) => (
-                    <SelectItem key={d.id} value={d.id}>
-                      {d.name}
-                    </SelectItem>
-                  ))}
+                  {localDepartments
+                    .filter(d => !deptIds.includes(d.id))
+                    .map((d) => (
+                      <SelectItem key={d.id} value={d.id}>
+                        {d.name}
+                      </SelectItem>
+                    ))}
                   <div className="h-px bg-border my-1 -mx-1" />
                   <SelectItem value="__new__" className="text-primary font-medium focus:text-primary">
                     <span className="flex items-center gap-2">
@@ -272,43 +250,35 @@ export function EmployeeDialog({
                   </SelectItem>
                 </SelectContent>
               </Select>
+              <div className="flex flex-wrap gap-1.5 min-h-7">
+                {deptIds.length === 0 ? (
+                  <span className="text-xs text-muted-foreground italic">
+                    No departments — user will only see global resources
+                  </span>
+                ) : (
+                  deptIds.map((id) => {
+                    const d = localDepartments.find(x => x.id === id);
+                    return (
+                      <span
+                        key={id}
+                        className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-secondary text-secondary-foreground text-xs"
+                      >
+                        {d?.name || id}
+                        <button
+                          type="button"
+                          onClick={() => setDeptIds(prev => prev.filter(x => x !== id))}
+                          className="hover:text-destructive transition-colors"
+                          aria-label={`Remove ${d?.name || id}`}
+                        >
+                          <span className="material-symbols-outlined text-sm leading-none">close</span>
+                        </button>
+                      </span>
+                    );
+                  })
+                )}
+              </div>
             </div>
           </div>
-
-          {role === "employee" && (
-            <div className="flex flex-col gap-2">
-              <Label>Position</Label>
-              <Select
-                value={customRoleId || "__none__"}
-                onValueChange={(v) => {
-                  if (v === "__new__") {
-                    handleCreateRole();
-                    return;
-                  }
-                  setCustomRoleId(v === "__none__" ? "" : (v ?? ""));
-                }}
-              >
-                <SelectTrigger className="bg-background">
-                  {customRoleId ? (localRoles.find(r => r.id === customRoleId)?.name || customRoleId) : "None"}
-                </SelectTrigger>
-                <SelectContent className="!w-max min-w-(--anchor-width)">
-                  <SelectItem value="__none__">None</SelectItem>
-                  {localRoles.map((r) => (
-                    <SelectItem key={r.id} value={r.id}>
-                      {r.name}
-                    </SelectItem>
-                  ))}
-                  <div className="h-px bg-border my-1 -mx-1" />
-                  <SelectItem value="__new__" className="text-primary font-medium focus:text-primary">
-                    <span className="flex items-center gap-2">
-                      <span className="material-symbols-outlined text-sm">add</span>
-                      Create new position...
-                    </span>
-                  </SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          )}
 
           {error && (
             <p className="text-destructive text-sm bg-destructive/10 px-3 py-2 rounded-lg">

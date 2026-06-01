@@ -1,9 +1,10 @@
-export type WikiPageType = "entity" | "concept" | "topic" | "source" | "index" | "log";
+export type WikiPageType = "entity" | "concept" | "topic" | "source" | "index" | "log" | "hot";
 
 export type WikiPageSummary = {
   slug: string;
   title: string;
   page_type: WikiPageType;
+  status: "seed" | "developing" | "mature" | "evergreen";
   summary: string;
   knowledge_type_slugs: string[];
   source_ids: string[];
@@ -31,6 +32,7 @@ export type WikiGraphNode = {
   slug: string;
   title: string;
   page_type: string;
+  status?: string;
   scope_type?: string;
   scope_id?: string | null;
   scope_name?: string | null;

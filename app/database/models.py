@@ -23,11 +23,13 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    case,
     func,
     text,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.dialects.postgresql import ENUM as PgEnum
+from sqlalchemy.ext.hybrid import hybrid_property
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 # ---------------------------------------------------------------------------
@@ -35,26 +37,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 # ---------------------------------------------------------------------------
 
 class ScopeType(str, PyEnum):
-    """Scope for sources/wiki: global, project (workspace), or department."""
+    """Scope for sources/wiki: global or department."""
     GLOBAL = "global"
-    PROJECT = "project"
     DEPARTMENT = "department"
-
-
-class WorkspaceRole(str, PyEnum):
-    """Role within a workspace (ordered by privilege level)."""
-    VIEWER = "viewer"
-    CONTRIBUTOR = "contributor"
-    EDITOR = "editor"
-    ADMIN = "admin"
-
-
-WORKSPACE_ROLE_HIERARCHY: dict[WorkspaceRole, int] = {
-    WorkspaceRole.VIEWER: 0,
-    WorkspaceRole.CONTRIBUTOR: 1,
-    WorkspaceRole.EDITOR: 2,
-    WorkspaceRole.ADMIN: 3,
-}
 
 
 class SkillContributionStatus(str, PyEnum):
@@ -124,6 +109,16 @@ class Source(Base):
     progress: Mapped[int] = mapped_column(Integer, default=0)
     progress_message: Mapped[Optional[str]] = mapped_column(String(500))
     job_id: Mapped[Optional[str]] = mapped_column(String(200))
+    extracted_token_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="tiktoken cl100k_base count of full_text. Used by upload gate.",
+    )
+    auto_recover_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0",
+        comment="Times sweep_stuck_processing_cron has flipped this source from "
+                "'processing' back to 'error'. Reset on successful plan_ready/ready. "
+                "Gated by settings.max_auto_recover_attempts.",
+    )
     pipeline_strategy: Mapped[Optional[str]] = mapped_column(
         String(20), nullable=True,
         comment="single_pass | standard | hierarchical — set by Phase 0 triage",
@@ -288,7 +283,10 @@ class WikiPage(Base):
     )
     slug: Mapped[str] = mapped_column(String(300), nullable=False)
     title: Mapped[str] = mapped_column(String(500), nullable=False)
-    page_type: Mapped[str] = mapped_column(String(30), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="seed",
+        comment="Lifecycle status: seed | developing | mature | evergreen"
+    )
     content_md: Mapped[str] = mapped_column(Text, nullable=False, default="")
     summary: Mapped[str] = mapped_column(Text, nullable=False, default="")
     # --- Scope: global or project (workspace) ---
@@ -318,8 +316,27 @@ class WikiPage(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
+    @hybrid_property
+    def page_type(self) -> str:
+        if self.slug in ("_index", "_log", "_hot"):
+            return self.slug.lstrip("_")
+        if self.slug.startswith("source/"):
+            return "source"
+        return "concept"
+
+    @page_type.expression
+    @classmethod
+    def page_type(cls):
+        return case(
+            (cls.slug == "_index", "index"),
+            (cls.slug == "_log", "log"),
+            (cls.slug == "_hot", "hot"),
+            (cls.slug.like("source/%"), "source"),
+            else_="concept"
+        )
+
     __table_args__ = (
-        Index("ix_wiki_pages_page_type", "page_type"),
+        Index("ix_wiki_pages_status", "status"),
     )
 
 
@@ -344,6 +361,44 @@ class WikiLink(Base):
         PrimaryKeyConstraint("from_page_id", "to_slug"),
         Index("ix_wiki_links_from_page_id", "from_page_id"),
         Index("ix_wiki_links_to_slug", "to_slug"),
+    )
+
+
+class WikiBranch(Base):
+    """
+    Named contribution branch grouping multiple page drafts.
+    """
+    __tablename__ = "wiki_branches"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    scope_type: Mapped[str] = mapped_column(String(20), nullable=False, default="global")
+    scope_id: Mapped[Optional[uuid.UUID]] = mapped_column(UUID(as_uuid=True), nullable=True)
+    author_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="draft")
+    has_conflict: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    reviewer_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
+    )
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+    reviewer_note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    author: Mapped["Employee"] = relationship("Employee", foreign_keys=[author_id])
+    reviewer: Mapped[Optional["Employee"]] = relationship("Employee", foreign_keys=[reviewer_id])
+    drafts: Mapped[list["WikiPageDraft"]] = relationship(
+        "WikiPageDraft", back_populates="branch", cascade="all, delete-orphan"
+    )
+
+    __table_args__ = (
+        Index("ix_wiki_branches_author_id", "author_id"),
+        Index("ix_wiki_branches_status", "status"),
     )
 
 
@@ -390,6 +445,9 @@ class WikiPageDraft(Base):
     # web_ui | mcp_claude_desktop | mcp_claude_code | mcp_other | api_direct
     source: Mapped[str] = mapped_column(String(40), nullable=False, default="web_ui")
     source_metadata: Mapped[Optional[dict]] = mapped_column(JSONB, nullable=True)
+    branch_id: Mapped[Optional[uuid.UUID]] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("wiki_branches.id", ondelete="CASCADE"), nullable=True
+    )
     reviewed_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         UUID(as_uuid=True), ForeignKey("employees.id", ondelete="SET NULL"), nullable=True
     )
@@ -403,11 +461,13 @@ class WikiPageDraft(Base):
     page: Mapped["WikiPage"] = relationship("WikiPage", foreign_keys=[page_id])
     author: Mapped[Optional["Employee"]] = relationship("Employee", foreign_keys=[author_id])
     reviewer: Mapped[Optional["Employee"]] = relationship("Employee", foreign_keys=[reviewed_by_id])
+    branch: Mapped[Optional["WikiBranch"]] = relationship("WikiBranch", back_populates="drafts")
 
     __table_args__ = (
         Index("ix_wiki_drafts_page_id", "page_id"),
         Index("ix_wiki_drafts_status", "status"),
         Index("ix_wiki_drafts_author_id", "author_id"),
+        Index("ix_wiki_drafts_branch_id", "branch_id"),
     )
 
 
@@ -553,29 +613,6 @@ class KnowledgeType(Base):
 # RBAC: Roles, Departments, Employees
 # ---------------------------------------------------------------------------
 
-class Role(Base):
-    """Custom permission role assignable to employees.
-    Permissions use scoped format: resource:action:scope
-    e.g. 'doc:read:own_dept', 'doc:read:all', 'org:settings:manage'
-    """
-    __tablename__ = "roles"
-
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    name: Mapped[str] = mapped_column(String(100), nullable=False, unique=True)
-    description: Mapped[Optional[str]] = mapped_column(Text)
-    permissions: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    is_system: Mapped[bool] = mapped_column(Boolean, default=False)
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    # Relationships
-    employees: Mapped[list["Employee"]] = relationship(back_populates="custom_role")
 
 
 class Department(Base):
@@ -595,8 +632,15 @@ class Department(Base):
     )
 
     # Relationships
+    employee_departments: Mapped[list["EmployeeDepartment"]] = relationship(
+        back_populates="department",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
     employees: Mapped[list["Employee"]] = relationship(
-        back_populates="department", cascade="all, delete-orphan"
+        secondary="employee_departments",
+        back_populates="departments",
+        viewonly=True,
     )
     source_departments: Mapped[list["SourceDepartment"]] = relationship(
         back_populates="department", cascade="all, delete-orphan"
@@ -627,12 +671,9 @@ class Employee(Base):
         String(20), default="employee",
         comment="admin or employee — system-level role",
     )
-    department_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE")
-    )
-    custom_role_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("roles.id", ondelete="SET NULL"),
-        nullable=True,
+    global_role: Mapped[str] = mapped_column(
+        String(30), default="viewer",
+        comment="viewer, contributor, knowledge_manager, or admin",
     )
     # Legacy plaintext column — kept nullable for one release so a rollback is
     # possible. The hashed column below is authoritative; new code never reads
@@ -662,8 +703,17 @@ class Employee(Base):
     )
 
     # Relationships
-    department: Mapped["Department"] = relationship(back_populates="employees")
-    custom_role: Mapped[Optional["Role"]] = relationship(back_populates="employees")
+    employee_departments: Mapped[list["EmployeeDepartment"]] = relationship(
+        back_populates="employee",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
+    departments: Mapped[list["Department"]] = relationship(
+        secondary="employee_departments",
+        back_populates="employees",
+        viewonly=True,
+    )
+
 
     __table_args__ = (
         Index("ix_employees_mcp_token", "mcp_token"),
@@ -673,112 +723,46 @@ class Employee(Base):
             unique=True,
             postgresql_where=text("mcp_token_hash IS NOT NULL"),
         ),
-        Index("ix_employees_department_id", "department_id"),
         Index("ix_employees_email", "email"),
     )
 
+    @property
+    def department_ids(self) -> list[uuid.UUID]:
+        """All departments this employee belongs to. Empty list = no dept."""
+        return [ed.department_id for ed in self.employee_departments]
 
-# ---------------------------------------------------------------------------
-# Workspaces (Projects) — membership-gated realm
-# ---------------------------------------------------------------------------
 
-class Project(Base):
+class EmployeeDepartment(Base):
+    """Many-to-many: Employee ↔ Department.
+
+    All departments are equal — there is no concept of a "primary" department.
+    `*:*:own_dept` permissions resolve to the union of all departments listed
+    here for the employee. An employee with zero rows can only see resources
+    scoped to 'global'.
     """
-    A named workspace grouping employees and sources across departments.
-    Can represent a project, customer engagement, or any cross-functional context.
-    Access is purely membership-based — global role does NOT grant access.
-    Admin (role='admin') can view all workspaces via workspace:view:all permission.
-    """
-    __tablename__ = "projects"
+    __tablename__ = "employee_departments"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
-    name: Mapped[str] = mapped_column(String(200), nullable=False)
-    description: Mapped[Optional[str]] = mapped_column(Text)
-    workspace_type: Mapped[str] = mapped_column(
-        String(20), default="project",
-        comment="project or customer",
-    )
-    status: Mapped[str] = mapped_column(
-        String(20), default="active",
-        comment="active or archived",
-    )
-    created_by_id: Mapped[Optional[uuid.UUID]] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("employees.id", ondelete="SET NULL"),
-        nullable=True,
-    )
-    created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-    updated_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
-    )
-
-    # Relationships
-    members: Mapped[list["ProjectMember"]] = relationship(
-        back_populates="project", cascade="all, delete-orphan"
-    )
-    project_sources: Mapped[list["ProjectSource"]] = relationship(
-        back_populates="project", cascade="all, delete-orphan"
-    )
-    created_by: Mapped[Optional["Employee"]] = relationship(foreign_keys=[created_by_id])
-
-
-class ProjectMember(Base):
-    """Associates an employee with a project/workspace.
-    Role determines what the member can do within this workspace.
-    """
-    __tablename__ = "project_members"
-
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
     employee_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("employees.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    role: Mapped[str] = mapped_column(
-        String(20), default=WorkspaceRole.VIEWER.value,
-        comment="viewer, contributor, editor, or admin",
-    )
-    added_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
-    )
-
-    # Relationships
-    project: Mapped["Project"] = relationship(back_populates="members")
-    employee: Mapped["Employee"] = relationship()
-
-    __table_args__ = (
-        Index("ix_project_members_employee_id", "employee_id"),
-    )
-
-
-class ProjectSource(Base):
-    """Associates a source document with a project."""
-    __tablename__ = "project_sources"
-
-    project_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("projects.id", ondelete="CASCADE"),
+    department_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("departments.id", ondelete="CASCADE"),
         primary_key=True,
     )
-    source_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("sources.id", ondelete="CASCADE"),
-        primary_key=True,
-    )
-    added_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), server_default=func.now()
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False,
     )
 
-    # Relationships
-    project: Mapped["Project"] = relationship(back_populates="project_sources")
-    source: Mapped["Source"] = relationship()
+    employee: Mapped["Employee"] = relationship(back_populates="employee_departments")
+    department: Mapped["Department"] = relationship(back_populates="employee_departments")
 
     __table_args__ = (
-        Index("ix_project_sources_source_id", "source_id"),
+        Index("ix_employee_departments_department_id", "department_id"),
     )
+
+
+
 
 
 # ---------------------------------------------------------------------------

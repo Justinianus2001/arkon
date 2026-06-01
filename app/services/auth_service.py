@@ -23,7 +23,7 @@ from sqlalchemy.orm import selectinload
 
 from app.config import settings
 from app.database import get_db
-from app.database.models import Employee
+from app.database.models import Employee, EmployeeDepartment
 
 # JWT config
 JWT_ALGORITHM = "HS256"
@@ -85,7 +85,11 @@ async def authenticate_employee(
     stmt = (
         select(Employee)
         .where(Employee.email == email, Employee.is_active.is_(True))
-        .options(selectinload(Employee.department), selectinload(Employee.custom_role))
+        .options(
+            selectinload(Employee.employee_departments).selectinload(
+                EmployeeDepartment.department
+            ),
+        )
     )
     result = await db.execute(stmt)
     employee = result.scalar_one_or_none()
@@ -124,7 +128,11 @@ async def get_current_user(
 
     result = await db.execute(
         select(Employee)
-        .options(selectinload(Employee.department), selectinload(Employee.custom_role))
+        .options(
+            selectinload(Employee.employee_departments).selectinload(
+                EmployeeDepartment.department
+            ),
+        )
         .where(Employee.id == uuid.UUID(payload["sub"]))
     )
     employee = result.scalar_one_or_none()
@@ -134,14 +142,9 @@ async def get_current_user(
             detail="Account not found or deactivated",
         )
 
-    # Auto-attach the "Employee" system role if no custom role assigned
-    if employee.role == "employee" and not employee.custom_role:
-        from app.database.models import Role
-        sys_role = (await db.execute(
-            select(Role).where(Role.name == "Employee", Role.is_system.is_(True))
-        )).scalar_one_or_none()
-        if sys_role:
-            employee.custom_role = sys_role
+    # Ensure default global_role is populated
+    if not getattr(employee, "global_role", None):
+        employee.global_role = "viewer"
 
     return employee
 

@@ -1,6 +1,8 @@
 "use client";
 
 import React from "react";
+import { useRouter } from "next/navigation";
+import Link from "next/link";
 import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
@@ -27,6 +29,7 @@ import { fileIcons, getFileExt } from "./utils";
 import { StatusDot } from "./status-dot";
 import { EditSourceDialog } from "./edit-source-dialog";
 import { PlanReviewDialog } from "./plan-review-dialog";
+import { ExtractionReviewDialog } from "./extraction-review-dialog";
 
 type Props = {
   sources: Source[];
@@ -58,8 +61,10 @@ export function KnowledgeTable({
   const [actionError, setActionError] = React.useState<string | null>(null);
   const [editSource, setEditSource] = React.useState<Source | null>(null);
   const [reviewPlanSource, setReviewPlanSource] = React.useState<Source | null>(null);
+  const [reviewExtractionSource, setReviewExtractionSource] = React.useState<Source | null>(null);
   const [retryingIds, setRetryingIds] = React.useState<Set<string>>(new Set());
   const [searchInput, setSearchInput] = React.useState(search);
+  const router = useRouter();
 
   const handleDelete = async (id: string) => {
     if (!confirm("Delete this document? This cannot be undone.")) return;
@@ -169,7 +174,7 @@ export function KnowledgeTable({
                         {fileIcons[getFileExt(source)] || (source.source_type === "url" ? "link" : "description")}
                       </span>
                       <div className="min-w-0">
-                        <p className="text-sm font-medium text-foreground truncate max-w-[280px]">{source.title}</p>
+                        <Link href={`/wiki/source/${source.id}`} className="text-sm font-medium text-foreground truncate max-w-[280px] hover:text-primary hover:underline transition-colors">{source.title}</Link>
                         {source.file_name && source.file_name !== source.title && (
                           <p className="text-[10px] text-muted-foreground truncate max-w-[280px]">{source.file_name}</p>
                         )}
@@ -263,6 +268,24 @@ export function KnowledgeTable({
                         <span className="material-symbols-outlined text-base">more_vert</span>
                       </DropdownMenuTrigger>
                       <DropdownMenuContent align="end">
+                        <DropdownMenuItem onClick={() => router.push(`/wiki/source/${source.id}`)}>
+                          <span className="material-symbols-outlined mr-2" style={{ fontSize: 16 }}>visibility</span>
+                          View
+                        </DropdownMenuItem>
+                        {source.status === "ready" && (
+                          <DropdownMenuItem
+                            onClick={async () => {
+                              try {
+                                const detail = await api<{ download_url?: string }>(`/api/sources/${source.id}`);
+                                if (detail.download_url) window.open(detail.download_url, "_blank");
+                              } catch {}
+                            }}
+                          >
+                            <span className="material-symbols-outlined mr-2" style={{ fontSize: 16 }}>cloud_download</span>
+                            Download
+                          </DropdownMenuItem>
+                        )}
+                        <DropdownMenuSeparator />
                         <DropdownMenuItem onClick={() => setEditSource(source)}>
                           <span className="material-symbols-outlined mr-2" style={{ fontSize: 16 }}>edit</span>
                           Edit
@@ -273,6 +296,14 @@ export function KnowledgeTable({
                               fact_check
                             </span>
                             Review Plan
+                          </DropdownMenuItem>
+                        )}
+                        {source.status === "awaiting_approval" && (
+                          <DropdownMenuItem onClick={() => setReviewExtractionSource(source)}>
+                            <span className="material-symbols-outlined mr-2 text-orange-500" style={{ fontSize: 16 }}>
+                              scale
+                            </span>
+                            Review Size
                           </DropdownMenuItem>
                         )}
                         {source.status === "error" && (
@@ -371,6 +402,14 @@ export function KnowledgeTable({
           source={reviewPlanSource}
           onClose={() => setReviewPlanSource(null)}
           onDone={() => { setReviewPlanSource(null); onRefresh(); }}
+        />
+      )}
+
+      {reviewExtractionSource && (
+        <ExtractionReviewDialog
+          source={reviewExtractionSource}
+          onClose={() => setReviewExtractionSource(null)}
+          onDone={() => { setReviewExtractionSource(null); onRefresh(); }}
         />
       )}
     </div>

@@ -137,6 +137,7 @@ async def ingest_source(
 
         source.status = "ready"
         source.error_message = None
+        source.auto_recover_count = 0
         await session.flush()
         logger.success(
             f"Source {source_id} ingested into wiki: "

@@ -125,6 +125,30 @@ in your answer so the user can verify.
 
 Tools are organized in four tiers by permission level.
 
+### Tool visibility by identity
+
+`tools/list` is filtered per bearer token: a tool only appears in the catalog
+if the caller's `ResolvedIdentity` could actually use it. This is enforced by
+`ScopedToolsMiddleware` ([app/mcp/middleware.py](../app/mcp/middleware.py)).
+
+| Caller | Visible tiers |
+|---|---|
+| Admin (`role = admin`) | All tiers |
+| Org perm `wiki:write:all` | Read + Contribute + Review + Direct-write |
+| Workspace editor (in any workspace) | Read + Contribute + Review + Direct-write |
+| Org perm `wiki:write:own_dept` | Read + Contribute |
+| Workspace contributor (in any workspace) | Read + Contribute |
+| Workspace viewer only / read-only employee | Read |
+| Unauthenticated / invalid token | Read, with an "Authenticate to use" hint prepended to every description |
+
+**Visibility is a UX gate, not a security boundary.** A client may still invoke
+any tool by name regardless of whether it appeared in the catalog. Per-tool
+permission checks inside tool bodies (e.g. `_can_review_page` for a specific
+draft's parent page) remain authoritative and MUST NOT be removed.
+
+Role / token changes are not pushed mid-session. To pick up a new role, the
+client should reconnect to the MCP server.
+
 ---
 
 ### Tier 1 — Read (all authenticated employees)

@@ -42,12 +42,13 @@ def check_coverage(
     # Count mentions per entity
     mention_counts: dict[str, int] = {}
     for row in chunk_extracts:
-        for e in (row.extract_json or {}).get("entities", []):
-            name = e.get("name", "").lower()
+        # Compatibility helper: count concepts (topics) as terms
+        for e in (row.extract_json or {}).get("concepts", []):
+            name = e.get("term", "").lower()
             if name:
                 mention_counts[name] = mention_counts.get(name, 0) + 1
 
-    # Collect all entity names covered by page results
+    # Collect all topic names covered by page results
     covered: set[str] = set()
     for pr in page_results:
         covered.update(n.lower() for n in pr.entity_names)
@@ -60,7 +61,7 @@ def check_coverage(
 
     if uncovered:
         logger.warning(
-            f"MRP VERIFY coverage: {len(uncovered)} significant entities not covered: "
+            f"MRP VERIFY coverage: {len(uncovered)} significant topics not covered: "
             + ", ".join(uncovered[:10])
         )
 
@@ -68,7 +69,7 @@ def check_coverage(
 
 
 # ---------------------------------------------------------------------------
-# 4.2 Conflict check
+# 4.2 Conflict check & Contradiction Callout
 # ---------------------------------------------------------------------------
 
 async def check_conflicts(
@@ -80,7 +81,8 @@ async def check_conflicts(
 ) -> list[dict]:
     """
     For each new/updated page, find KB neighbors with high similarity and
-    check for factual contradictions via LLM. Returns list of conflict dicts.
+    check for factual contradictions via LLM.
+    If a contradiction is detected, prepends a standardized Obsidian Callout to pr.content_md.
     Non-blocking: conflicts are logged and returned but don't fail the pipeline.
     """
     from app.services import wiki_service
@@ -90,6 +92,10 @@ async def check_conflicts(
     conflicts = []
 
     for pr in page_results:
+        # Ignore source index and logs
+        if pr.slug in ("_index", "_log", "_hot") or pr.page_type == "source":
+            continue
+
         try:
             vec = await embedding_provider.embed(
                 f"{pr.title}\n\n{pr.summary}\n\n{pr.content_md[:3000]}"
@@ -132,10 +138,44 @@ async def check_conflicts(
                     logger.warning(
                         f"MRP VERIFY conflict: '{pr.slug}' ↔ '{kb_page.slug}' (sim={sim:.2f}): {desc[:150]}"
                     )
+                    
+                    # Prepend standardized contradiction callout directly to the page content markdown
+                    pr.content_md = (
+                        f"> [!contradiction] **Mâu thuẫn tri thức phát hiện bởi AI:**\n"
+                        f"> {desc}\n\n"
+                        f"{pr.content_md}"
+                    )
             except Exception:
                 pass
 
     return conflicts
+
+
+# ---------------------------------------------------------------------------
+# 4.3 Lifecycle status assessment
+# ---------------------------------------------------------------------------
+
+def assess_page_status(content_md: str) -> str:
+    """Programmatically assess a page lifecycle status based on content length & wikilinks.
+
+    Status states: seed -> developing -> mature -> evergreen
+    """
+    import re
+    
+    body = content_md or ""
+    length = len(body)
+    
+    # Count wikilinks: [[slug]] or [[slug|text]]
+    wikilinks = len(re.findall(r"\[\[([^\]]+)\]\]", body))
+    
+    if length < 600 or wikilinks < 1:
+        return "seed"
+    elif length < 2000 or wikilinks < 3:
+        return "developing"
+    elif length < 4000 or wikilinks < 5:
+        return "mature"
+    else:
+        return "evergreen"
 
 
 # ---------------------------------------------------------------------------
@@ -153,23 +193,30 @@ async def run_verify_phase(
     tracker: ProgressTracker,
 ) -> list[PageWriteResult]:
     """
-    Run Phase 4 (VERIFY). Returns page results unchanged.
+    Run Phase 4 (VERIFY). Returns page results with assessed status and contradiction callouts.
 
-    Coverage and conflict checks run as non-blocking diagnostics.
+    Coverage, conflict checks, and status assessments run inline.
     """
     await tracker.update(88, "Checking coverage...")
 
-    # 4.1 Coverage check (code only, non-blocking)
+    # 4.1 Coverage check (non-blocking)
     check_coverage(chunk_extracts, page_results)
 
     await tracker.update(91, "Checking for conflicts...")
 
-    # 4.2 Conflict check (non-blocking)
+    # 4.2 Conflict check & contradiction injection
     if embedding_provider is not None:
         try:
             await check_conflicts(session, page_results, embedding_provider, llm, source)
         except Exception as exc:
             logger.warning(f"MRP VERIFY conflict check failed: {exc}")
+
+    # 4.3 Lifecycle status assessment
+    for pr in page_results:
+        if pr.page_type == "source":
+            pr.status = "evergreen" # source indexes are always evergreen
+        else:
+            pr.status = assess_page_status(pr.content_md)
 
     logger.info(f"MRP VERIFY complete: {len(page_results)} pages verified for source={source.id}")
     return page_results

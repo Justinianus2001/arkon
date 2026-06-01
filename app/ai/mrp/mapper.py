@@ -232,17 +232,10 @@ Character range in full document: {start_char}–{end_char}
 Extract all knowledge from this section and return a JSON object with this exact schema:
 
 {{
-  "entities": [
-    {{
-      "name": "string — entity canonical name as it appears in text",
-      "type": "string — one of: person|org|product|regulation|location|system|equipment|other",
-      "aliases": ["string"],
-      "local_offset": 0
-    }}
-  ],
+  "entities": [],
   "concepts": [
     {{
-      "term": "string — concept name OR a thematic section topic (e.g. 'Product Positioning', 'Target Customer Profile', 'Pricing Model'). Prefer the document's own heading wording when the section is coherent and self-contained.",
+      "term": "string — name of the topic, subject, entity, product, organization, or concept mentioned in text",
       "definition_excerpt": "string — verbatim or near-verbatim defining phrase from text; for thematic sections use the opening sentence that frames the section.",
       "local_offset": 0
     }}
@@ -250,7 +243,7 @@ Extract all knowledge from this section and return a JSON object with this exact
   "claims": [
     {{
       "statement": "string — complete factual claim stated in source",
-      "subject": "string — entity/concept this claim is about",
+      "subject": "string — topic/concept this claim is about",
       "local_offset": 0,
       "evidence_length": 200,
       "confidence": "explicit"
@@ -258,8 +251,8 @@ Extract all knowledge from this section and return a JSON object with this exact
   ],
   "relations": [
     {{
-      "from": "string — source entity/concept name",
-      "to": "string — target entity/concept name",
+      "from": "string — source topic name",
+      "to": "string — target topic name",
       "type": "string — e.g. owns|part_of|caused_by|regulates|uses|located_in|other"
     }}
   ],
@@ -267,19 +260,13 @@ Extract all knowledge from this section and return a JSON object with this exact
 }}
 
 Rules:
-- local_offset is the character position of the entity/concept/claim WITHIN the chunk
+- local_offset is the character position of the concept/claim WITHIN the chunk
   text body (AFTER the context separator line if present). Start counting from 0 at the
   first character of the actual document section content.
 - Absolute offset in full document = {start_char} + local_offset.
 - confidence must be "explicit" (directly stated) or "inferred" (implied by the text).
-- Be exhaustive — include all named entities, defined terms, and factual claims.
-- For `concepts`, extract BOTH (a) named terms with definitions (e.g. "RAG",
-  "MCP") AND (b) thematic section topics — coherent sub-topics that a reader
-  could open as their own wiki page (e.g. "Product Positioning", "Target
-  Customer Profile (ICP)", "Content Pillars", "Risk Assessment"). When a
-  document is structured around such themes about a primary entity, prefer
-  splitting them as separate concepts over collapsing everything into the
-  entity's page.
+- Be exhaustive — include all significant named terms, organizations, subjects, and factual claims.
+- Place all extracted subjects (whether a person, company, technology, product, or idea) under `concepts`. Keep `entities` as an empty list `[]` for system compatibility.
 - Return empty arrays [] for categories with no findings.
 - Return ONLY the JSON object, no other text.
 """

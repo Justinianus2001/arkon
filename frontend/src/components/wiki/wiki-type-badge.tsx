@@ -4,12 +4,13 @@ const TYPE_CONFIG: Record<
   WikiPageType,
   { icon: string; label: string; color: string; bg: string }
 > = {
-  entity: { icon: "person", label: "Entity", color: "#c2652a", bg: "rgba(194,101,42,0.1)" },
-  concept: { icon: "lightbulb", label: "Concept", color: "#8c7b6b", bg: "rgba(140,123,107,0.1)" },
-  topic: { icon: "topic", label: "Topic", color: "#6b8c7b", bg: "rgba(107,140,123,0.1)" },
+  entity: { icon: "article", label: "Page", color: "#c2652a", bg: "rgba(194,101,42,0.1)" },
+  concept: { icon: "article", label: "Page", color: "#8c7b6b", bg: "rgba(140,123,107,0.1)" },
+  topic: { icon: "article", label: "Page", color: "#6b8c7b", bg: "rgba(107,140,123,0.1)" },
   source: { icon: "description", label: "Source", color: "#7b6b8c", bg: "rgba(123,107,140,0.1)" },
   index: { icon: "list_alt", label: "Index", color: "#78706a", bg: "rgba(120,112,106,0.1)" },
   log: { icon: "history", label: "Log", color: "#78706a", bg: "rgba(120,112,106,0.1)" },
+  hot: { icon: "local_fire_department", label: "Hot Cache", color: "#c2652a", bg: "rgba(194,101,42,0.1)" },
 };
 
 export function WikiTypeBadge({ type }: { type: string }) {
@@ -37,12 +38,13 @@ export function wikiTypeColor(type: string): string {
 
 export function wikiTypeGroupLabel(type: string): string {
   const labels: Record<string, string> = {
-    entity: "Entities",
-    concept: "Concepts",
-    topic: "Topics",
+    entity: "Pages",
+    concept: "Pages",
+    topic: "Pages",
     source: "Sources",
     index: "Index",
     log: "Log",
+    hot: "Hot Cache",
   };
   return labels[type] ?? type;
 }

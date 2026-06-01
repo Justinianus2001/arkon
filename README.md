@@ -58,10 +58,6 @@ Role-based access control at department + workspace level.
 - Granular permissions (`doc:read:own_dept`, `wiki:edit:all`, `org:settings:manage`, ...).
 - **Audit log** for every privileged action - settings changes, plan approvals, role updates.
 
-<p align="center">
-  <img src="docs/assets/permission-and-scope.png" alt="Arkon RBAC permission model — department and project scope isolation with role-based access control" width="720">
-</p>
-
 ### 🔌 MCP Server for Claude & Other AI Clients
 Employees connect Claude Desktop or Claude.ai to Arkon via **OAuth 2.1 + PKCE** — just add the server URL and sign in through the browser. No manual token copying required. The MCP server exposes:
 - **Wiki tools** - `search_wiki`, `read_wiki_page`, `list_wiki_pages`, `read_wiki_index`.

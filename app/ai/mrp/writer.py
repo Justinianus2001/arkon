@@ -21,6 +21,7 @@ from loguru import logger
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.providers.base import EmbeddingProvider, LLMProvider
+from app.config import settings
 from app.utils.progress import ProgressTracker
 
 if TYPE_CHECKING:
@@ -35,6 +36,14 @@ WRITER_COMPLEX_THRESHOLD_EVIDENCE = 8
 WRITER_COMPLEX_THRESHOLD_EXISTING_CHARS = 3_000
 WRITER_AGENT_MAX_STEPS = 10
 WRITER_AGENT_TIMEOUT = 300  # seconds per LLM call in complex writer
+
+# Multi-pass writer
+_EXTEND_SHRINK_THRESHOLD = 0.9
+_POLISH_MIN_BATCHES = 3
+_BUDGET_RESERVE_RATIO = 0.7
+_PASS_BUDGET_RATIO = 0.5
+_MAX_EXTEND_RETRIES = 2
+_TIER_B_PROXIMITY_CHARS = 5_000
 
 # ---------------------------------------------------------------------------
 # Dataclass
@@ -81,6 +90,24 @@ class PageWriteResult:
         )
 
 
+@dataclass
+class SectionRef:
+    title: str
+    level: int
+    char_start: int
+    char_end: int
+    text: str
+    evidence_indices: list[int] = field(default_factory=list)
+    tier: str = "A"  # "A" | "B"
+
+
+@dataclass
+class WriterPassBatch:
+    sections: list[SectionRef]
+    evidence: list[dict]
+    total_chars: int
+
+
 # ---------------------------------------------------------------------------
 # Evidence assembly
 # ---------------------------------------------------------------------------
@@ -123,7 +150,7 @@ def assemble_evidence(
             continue
 
         offset = claim.get("absolute_offset", 0)
-        length = min(claim.get("evidence_length", 200), 500)
+        length = min(claim.get("evidence_length", 200), 2000)
         excerpt = full_text[offset: offset + length] if full_text else ""
         evidence.append({
             "statement": claim.get("statement", ""),
@@ -199,8 +226,7 @@ Each page must be a proper encyclopedic article, NOT a flat bullet list:
   Do NOT invent or hallucinate slugs.
 
 # Minimum depth
-- concept/topic pages: at least 200 words of actual prose+structure.
-- entity pages: at least 100 words.
+- concept pages: at least 150 words of actual structured prose.
 - source pages: at least 150 words.
 
 # Image markers
@@ -209,13 +235,11 @@ Each page must be a proper encyclopedic article, NOT a flat bullet list:
 - Do NOT invent image UUIDs.
 """
 
-SOURCE_CONTEXT_FALLBACK_CHARS = 60_000  # fallback when no spec is available
+SOURCE_CONTEXT_FALLBACK_CHARS = 120_000  # fallback when no spec is available
 
-# Source text gets 60% of the context budget; the rest is for system prompt,
-# evidence blocks, existing content, and output tokens.
-_SOURCE_BUDGET_RATIO = 0.60
-_CHARS_PER_TOKEN = 4  # conservative estimate
-_MAX_BUDGET_CHARS = 800_000  # cap to avoid diminishing returns on huge contexts
+_SOURCE_BUDGET_RATIO = 0.85
+_CHARS_PER_TOKEN = 4
+_MAX_BUDGET_CHARS = 2_500_000
 
 
 def _get_source_context_budget(llm: Optional[LLMProvider]) -> int:
@@ -405,6 +429,217 @@ def _score_sections(
     # Sort by score descending
     scored.sort(key=lambda x: -x[2])
     return scored
+
+
+# ---------------------------------------------------------------------------
+# Section selection (3-tier) — replaces _score_sections greedy logic
+# ---------------------------------------------------------------------------
+
+def _sections_from_outline(
+    full_text: str,
+    outline_json: list,
+) -> list[SectionRef]:
+    """Build SectionRefs from outline leaf nodes (smallest level per range)."""
+    from app.services.source_outline import flatten_outline_with_depth
+
+    flat = flatten_outline_with_depth(outline_json)
+    # Build leaf set: a node is a "leaf" if it has no children
+    refs: list[SectionRef] = []
+    for node in flat:
+        if node.get("children"):
+            continue
+        cs = node.get("char_start")
+        ce = node.get("char_end")
+        if cs is None or ce is None or ce <= cs:
+            continue
+        ce = min(ce, len(full_text))
+        refs.append(SectionRef(
+            title=node.get("title", ""),
+            level=int(node.get("level", 1)),
+            char_start=cs,
+            char_end=ce,
+            text=full_text[cs:ce],
+        ))
+    refs.sort(key=lambda s: s.char_start)
+    return refs
+
+
+def _sections_from_fallback(full_text: str) -> list[SectionRef]:
+    """Fallback when no outline: reuse _split_into_sections."""
+    raw = _split_into_sections(full_text)
+    return [
+        SectionRef(
+            title=f"section_{i}",
+            level=1,
+            char_start=start,
+            char_end=start + len(text),
+            text=text,
+        )
+        for i, (start, text) in enumerate(raw)
+    ]
+
+
+def select_relevant_sections(
+    full_text: str,
+    outline_json: Optional[list],
+    evidence: list[dict],
+    budget: int,
+) -> tuple[list[SectionRef], list[SectionRef], list[SectionRef]]:
+    """Classify sections into TIER A (mandatory), TIER B (adjacent), TIER C (skipped).
+
+    TIER A: section contains >=1 evidence offset.
+    TIER B: sibling/adjacent of TIER A, or evidence within _TIER_B_PROXIMITY_CHARS
+            of section boundary. Included if budget allows after TIER A.
+    TIER C: everything else (returned for skip-marker emission).
+    """
+    if outline_json:
+        sections = _sections_from_outline(full_text, outline_json)
+    else:
+        sections = _sections_from_fallback(full_text)
+
+    if not sections:
+        return [], [], []
+
+    ev_offsets = [int(ev.get("absolute_offset", 0)) for ev in evidence]
+
+    tier_a: list[SectionRef] = []
+    tier_b: list[SectionRef] = []
+    tier_c: list[SectionRef] = []
+
+    a_indices: set[int] = set()
+    for idx, sec in enumerate(sections):
+        hits = [
+            ev_idx for ev_idx, off in enumerate(ev_offsets)
+            if sec.char_start <= off < sec.char_end
+        ]
+        if hits:
+            sec.evidence_indices = hits
+            sec.tier = "A"
+            tier_a.append(sec)
+            a_indices.add(idx)
+
+    a_total = sum(len(s.text) for s in tier_a)
+    remaining = max(0, budget - a_total)
+
+    for idx, sec in enumerate(sections):
+        if idx in a_indices:
+            continue
+        # Adjacent to a TIER A?
+        is_adjacent = (idx - 1) in a_indices or (idx + 1) in a_indices
+        # Close-by evidence?
+        close = any(
+            min(abs(off - sec.char_start), abs(off - sec.char_end)) < _TIER_B_PROXIMITY_CHARS
+            for off in ev_offsets
+        )
+        if is_adjacent or close:
+            if len(sec.text) <= remaining:
+                sec.tier = "B"
+                tier_b.append(sec)
+                remaining -= len(sec.text)
+            else:
+                tier_c.append(sec)
+        else:
+            tier_c.append(sec)
+
+    return tier_a, tier_b, tier_c
+
+
+def _format_skipped_marker(sec: SectionRef) -> str:
+    return f"\n\n[…skipped: \"{sec.title}\" ({sec.char_end - sec.char_start} chars)…]\n\n"
+
+
+def build_writer_batches(
+    tier_a: list[SectionRef],
+    tier_b: list[SectionRef],
+    evidence: list[dict],
+    budget_per_pass: int,
+) -> list[WriterPassBatch]:
+    """Pack sections into batches respecting doc order; never split a section.
+
+    Each batch carries the evidence rows referenced by its sections.
+    Sections that individually exceed budget_per_pass become a solo batch
+    (acceptable degradation; logged by caller).
+    """
+    all_sections = sorted(tier_a + tier_b, key=lambda s: s.char_start)
+    if not all_sections:
+        return []
+
+    batches: list[WriterPassBatch] = []
+    current: list[SectionRef] = []
+    current_chars = 0
+
+    for sec in all_sections:
+        size = len(sec.text)
+        if current and current_chars + size > budget_per_pass:
+            batches.append(_make_batch(current, evidence))
+            current = []
+            current_chars = 0
+        current.append(sec)
+        current_chars += size
+
+    if current:
+        batches.append(_make_batch(current, evidence))
+
+    return batches
+
+
+def _make_batch(sections: list[SectionRef], evidence: list[dict]) -> WriterPassBatch:
+    seen: set[int] = set()
+    for s in sections:
+        seen.update(s.evidence_indices)
+    batch_evidence = [evidence[i] for i in sorted(seen) if 0 <= i < len(evidence)]
+    total = sum(len(s.text) for s in sections)
+    return WriterPassBatch(sections=sections, evidence=batch_evidence, total_chars=total)
+
+
+def _decide_writer_strategy(
+    relevant_chars: int,
+    budget: int,
+    evidence_overhead: int,
+    existing_content_len: int,
+) -> tuple[str, int]:
+    """Decide single-pass vs multi-pass. Returns (mode, budget_per_pass)."""
+    threshold = int(budget * _BUDGET_RESERVE_RATIO)
+    if relevant_chars + evidence_overhead + existing_content_len < threshold:
+        return "single", budget
+    return "multipass", int(budget * _PASS_BUDGET_RATIO)
+
+
+def _render_single_pass_source(
+    tier_a: list[SectionRef],
+    tier_b: list[SectionRef],
+    tier_c: list[SectionRef],
+    budget: int,
+) -> str:
+    """Render a single-pass source context from all tier A+B sections + skip markers.
+
+    Truncates greedily if total > budget (rare in single-pass mode since the
+    strategy decision already gated on budget; safety net only).
+    """
+    all_sections = sorted(tier_a + tier_b, key=lambda s: s.char_start)
+    if not all_sections:
+        return ""
+    total = sum(len(s.text) for s in all_sections)
+    batch = WriterPassBatch(sections=all_sections, evidence=[], total_chars=total)
+    rendered = _render_batch_source(batch, tier_c)
+    if len(rendered) > budget:
+        rendered = rendered[:budget] + "\n\n[…truncated to budget…]"
+    return rendered
+
+
+def _render_batch_source(batch: WriterPassBatch, all_tier_c: list[SectionRef]) -> str:
+    """Render a batch's sections into source-context text with skip markers."""
+    parts: list[str] = []
+    for sec in batch.sections:
+        if sec.title and sec.level:
+            parts.append(f"\n\n{'#' * sec.level} {sec.title}\n\n")
+        parts.append(sec.text)
+    body = "".join(parts).lstrip("\n")
+    if all_tier_c:
+        body += "\n\n" + "".join(_format_skipped_marker(s) for s in all_tier_c[:3])
+        if len(all_tier_c) > 3:
+            body += f"\n\n[…and {len(all_tier_c) - 3} more skipped section(s)…]\n\n"
+    return body
 
 
 # ---------------------------------------------------------------------------
@@ -755,6 +990,268 @@ async def _write_page_complex(
 
 
 # ---------------------------------------------------------------------------
+# Multi-pass writer (Tier 2)
+# ---------------------------------------------------------------------------
+
+WRITER_SYSTEM_EXTEND = WRITER_SYSTEM + """
+
+# Multi-pass extension mode
+You are EXTENDING an existing draft of a wiki page with NEW source sections that
+were not visible in earlier passes. CRITICAL RULES:
+
+1. PRESERVE every H2 section, paragraph, list, image marker, and wikilink from
+   the EXISTING DRAFT verbatim. Do NOT shorten, rephrase, or condense.
+2. ADD new sections or extend existing sections with facts from NEW SECTIONS.
+   New H2 sections should appear AFTER the existing ones in logical order.
+3. If a NEW SECTION fact contradicts or supersedes an EXISTING DRAFT fact, KEEP
+   BOTH and mark the discrepancy with a brief inline note.
+4. Output MUST be at least as long as EXISTING DRAFT plus 60% of NEW SECTIONS.
+   A shorter output is rejected.
+5. Do NOT add image markers in this pass — they will be added in the final pass.
+"""
+
+WRITER_SYSTEM_POLISH = WRITER_SYSTEM + """
+
+# Multi-pass polish mode
+You are receiving a multi-pass draft that may have:
+- Duplicate or near-duplicate H2 sections
+- Inconsistent ordering
+- Missing image markers in the appropriate sections
+- An incomplete See also section
+
+POLISH RULES:
+1. Merge duplicate H2 sections. KEEP all facts. Do NOT remove information.
+2. Order H2 sections logically (overview → details → procedures → examples).
+3. Place the provided image markers VERBATIM at the most contextually relevant
+   spot in the document. Do NOT invent new image UUIDs.
+4. Ensure a proper opening paragraph (2-4 sentences, no heading).
+5. Ensure a final See also section with wikilinks (if any).
+6. Output MUST be at least 95% the length of the input draft.
+"""
+
+
+_EXTEND_PROMPT = """\
+## Existing draft (preserve verbatim, extend only)
+
+{existing_draft}
+
+---
+
+## New source sections to incorporate
+
+{batch_source}
+
+## Evidence from new sections ({evidence_count} items)
+
+{evidence_blocks}
+
+## Available pages (ONLY use these slugs for [[wikilinks]])
+{all_plan_slugs}
+
+## Instructions
+Output the EXTENDED draft. Preserve everything from EXISTING DRAFT.
+Add new sections / extend existing sections using facts from NEW SOURCE SECTIONS.
+Return ONLY the markdown content.
+"""
+
+
+_POLISH_PROMPT = """\
+## Multi-pass draft to polish
+
+{draft}
+
+## Image markers to place
+{image_section}
+
+## Available pages (ONLY use these slugs for [[wikilinks]])
+{all_plan_slugs}
+
+## Instructions
+Polish the draft per the rules above. Preserve ALL facts. Return ONLY markdown.
+"""
+
+
+async def _writer_pass_create(
+    llm: LLMProvider,
+    plan_item: dict,
+    batch: WriterPassBatch,
+    tier_c: list[SectionRef],
+    existing_content: Optional[str],
+    all_plan_slugs: list[str],
+) -> str:
+    own_slug = plan_item.get("slug", "")
+    available = [s for s in all_plan_slugs if s != own_slug]
+    all_plan_slugs_str = "\n".join(f"- [[{s}]]" for s in available) if available else "(none — this is the only page)"
+
+    existing_section = (
+        f"## Existing page content (UPDATE — integrate new evidence into this)\n\n{existing_content}\n"
+        if existing_content else ""
+    )
+    evidence_blocks, _ = _format_evidence_blocks(batch.evidence)
+    source_context = _render_batch_source(batch, tier_c)
+
+    prompt = _SIMPLE_WRITER_PROMPT.format(
+        action=plan_item.get("action", "CREATE"),
+        slug=own_slug,
+        title=plan_item.get("title", ""),
+        page_type=plan_item.get("page_type", "concept"),
+        all_plan_slugs=all_plan_slugs_str,
+        existing_section=existing_section,
+        source_context=source_context or "(no source text available)",
+        evidence_count=len(batch.evidence),
+        evidence_blocks=evidence_blocks or "(no pre-extracted evidence)",
+        image_section="",
+    )
+
+    raw = await asyncio.wait_for(
+        llm.generate(prompt, system=WRITER_SYSTEM, temperature=0.15),
+        timeout=WRITER_AGENT_TIMEOUT,
+    )
+    return raw.strip()
+
+
+async def _writer_pass_extend(
+    llm: LLMProvider,
+    draft_prev: str,
+    batch: WriterPassBatch,
+    all_plan_slugs: list[str],
+    own_slug: str,
+) -> str:
+    available = [s for s in all_plan_slugs if s != own_slug]
+    all_plan_slugs_str = "\n".join(f"- [[{s}]]" for s in available) if available else "(none)"
+    evidence_blocks, _ = _format_evidence_blocks(batch.evidence)
+    batch_source = _render_batch_source(batch, [])
+
+    prompt = _EXTEND_PROMPT.format(
+        existing_draft=draft_prev,
+        batch_source=batch_source,
+        evidence_count=len(batch.evidence),
+        evidence_blocks=evidence_blocks or "(no pre-extracted evidence)",
+        all_plan_slugs=all_plan_slugs_str,
+    )
+    raw = await asyncio.wait_for(
+        llm.generate(prompt, system=WRITER_SYSTEM_EXTEND, temperature=0.15),
+        timeout=WRITER_AGENT_TIMEOUT,
+    )
+    return raw.strip()
+
+
+async def _writer_pass_polish(
+    llm: LLMProvider,
+    draft: str,
+    image_markers: list[str],
+    all_plan_slugs: list[str],
+    own_slug: str,
+) -> str:
+    available = [s for s in all_plan_slugs if s != own_slug]
+    all_plan_slugs_str = "\n".join(f"- [[{s}]]" for s in available) if available else "(none)"
+
+    image_section = "\n".join(f"- {m}" for m in image_markers) if image_markers else "(no image markers)"
+
+    prompt = _POLISH_PROMPT.format(
+        draft=draft,
+        image_section=image_section,
+        all_plan_slugs=all_plan_slugs_str,
+    )
+    raw = await asyncio.wait_for(
+        llm.generate(prompt, system=WRITER_SYSTEM_POLISH, temperature=0.1),
+        timeout=WRITER_AGENT_TIMEOUT,
+    )
+    return raw.strip()
+
+
+async def _write_page_multipass(
+    llm: LLMProvider,
+    plan_item: dict,
+    evidence: list[dict],
+    existing_content: Optional[str],
+    tier_a: list[SectionRef],
+    tier_b: list[SectionRef],
+    tier_c: list[SectionRef],
+    budget_per_pass: int,
+    all_plan_slugs: list[str],
+    image_markers: list[str],
+) -> tuple[str, str, list[dict]]:
+    """Orchestrate multi-pass writing: CREATE → EXTEND* → optional POLISH.
+
+    Anti-shrink guarded with hard-append fallback. Falls back to single-pass
+    if no batches can be built.
+    """
+    own_slug = plan_item.get("slug", "")
+    batches = build_writer_batches(tier_a, tier_b, evidence, budget_per_pass)
+    if not batches:
+        content, summary, citations = await _write_page_simple(
+            llm, plan_item, evidence, existing_content,
+            all_plan_slugs=all_plan_slugs,
+            source_context="",
+            image_markers=image_markers,
+        )
+        return content, summary, citations
+
+    logger.info(
+        f"MRP MULTIPASS '{own_slug}': {len(batches)} batch(es), "
+        f"total {sum(b.total_chars for b in batches)} chars, "
+        f"budget_per_pass={budget_per_pass}"
+    )
+
+    draft = await _writer_pass_create(
+        llm, plan_item, batches[0], tier_c, existing_content, all_plan_slugs,
+    )
+
+    for i, batch in enumerate(batches[1:], start=1):
+        attempt_draft = draft
+        success = False
+        for attempt in range(_MAX_EXTEND_RETRIES + 1):
+            try:
+                new_draft = await _writer_pass_extend(
+                    llm, attempt_draft, batch, all_plan_slugs, own_slug,
+                )
+            except Exception as exc:
+                logger.warning(f"MRP MULTIPASS extend pass {i} failed for '{own_slug}': {exc}")
+                break
+            if len(new_draft) >= len(attempt_draft) * _EXTEND_SHRINK_THRESHOLD:
+                draft = new_draft
+                success = True
+                break
+            logger.warning(
+                f"MRP MULTIPASS extend pass {i} attempt {attempt+1} shrunk "
+                f"{len(attempt_draft)}→{len(new_draft)} for '{own_slug}'"
+            )
+        if not success:
+            for sec in batch.sections:
+                draft += f"\n\n## {sec.title}\n\n{sec.text}"
+            logger.warning(
+                f"MRP MULTIPASS extend pass {i} fell back to hard-append for '{own_slug}'"
+            )
+
+    enable_polish = len(batches) >= _POLISH_MIN_BATCHES or bool(image_markers)
+    if enable_polish:
+        try:
+            polished = await _writer_pass_polish(
+                llm, draft, image_markers, all_plan_slugs, own_slug,
+            )
+            if len(polished) >= len(draft) * 0.95:
+                draft = polished
+            else:
+                logger.warning(
+                    f"MRP MULTIPASS polish shrunk {len(draft)}→{len(polished)} "
+                    f"for '{own_slug}', keeping pre-polish draft"
+                )
+        except Exception as exc:
+            logger.warning(f"MRP MULTIPASS polish failed for '{own_slug}': {exc}")
+
+    summary = ""
+    for line in draft.splitlines():
+        s = line.strip()
+        if s and not s.startswith("#"):
+            summary = s[:300]
+            break
+    summary = summary or plan_item.get("title", "")
+
+    return draft.strip(), summary, []
+
+
+# ---------------------------------------------------------------------------
 # Phase 3 orchestrator
 # ---------------------------------------------------------------------------
 
@@ -811,7 +1308,6 @@ async def run_refine_phase(
             # the asyncio.gather fan-out previously caused race conditions when
             # multiple writers hit the DB at the same time.
             async with async_session_factory() as worker_session:
-                # Fetch existing content for UPDATE
                 existing_content: Optional[str] = None
                 if action == "UPDATE":
                     existing_page = await wiki_service.get_page_by_slug(
@@ -820,33 +1316,56 @@ async def run_refine_phase(
                     if existing_page:
                         existing_content = existing_page.content_md
 
-                # Choose writer mode
-                is_complex = (
-                    len(evidence) > WRITER_COMPLEX_THRESHOLD_EVIDENCE
-                    or len(existing_content or "") > WRITER_COMPLEX_THRESHOLD_EXISTING_CHARS
+                budget = _get_source_context_budget(llm)
+                tier_a, tier_b, tier_c = select_relevant_sections(
+                    full_text, source.outline_json, evidence, budget,
+                )
+                relevant_chars = sum(len(s.text) for s in tier_a + tier_b)
+                evidence_overhead = len(_format_evidence_blocks(evidence)[0])
+                mode, budget_per_pass = _decide_writer_strategy(
+                    relevant_chars, budget, evidence_overhead, len(existing_content or ""),
                 )
 
-                # Build source context for the writer
-                source_context = _build_source_context(full_text, evidence, llm=llm)
                 image_markers = _collect_relevant_image_markers(evidence, full_text)
+                multipass_enabled = getattr(settings, "mrp_multipass_writer_enabled", True)
+
+                logger.info(
+                    f"MRP REFINE '{slug}': mode={mode} multipass_enabled={multipass_enabled} "
+                    f"tier_a={len(tier_a)} tier_b={len(tier_b)} tier_c={len(tier_c)} "
+                    f"relevant_chars={relevant_chars} budget={budget}"
+                )
 
                 try:
-                    if is_complex:
-                        content_md, summary, citations = await _write_page_complex(
-                            llm, plan_item, evidence, existing_content, full_text, worker_session, source,
-                            all_plan_slugs=all_plan_slugs,
-                        )
-                    else:
-                        content_md, summary, citations = await _write_page_simple(
+                    if mode == "multipass" and multipass_enabled:
+                        content_md, summary, citations = await _write_page_multipass(
                             llm, plan_item, evidence, existing_content,
+                            tier_a, tier_b, tier_c, budget_per_pass,
                             all_plan_slugs=all_plan_slugs,
-                            source_context=source_context,
                             image_markers=image_markers,
                         )
+                    else:
+                        source_context = _render_single_pass_source(
+                            tier_a, tier_b, tier_c, budget,
+                        )
+                        is_complex = (
+                            len(evidence) > WRITER_COMPLEX_THRESHOLD_EVIDENCE
+                            or len(existing_content or "") > WRITER_COMPLEX_THRESHOLD_EXISTING_CHARS
+                        )
+                        if is_complex:
+                            content_md, summary, citations = await _write_page_complex(
+                                llm, plan_item, evidence, existing_content, full_text, worker_session, source,
+                                all_plan_slugs=all_plan_slugs,
+                            )
+                        else:
+                            content_md, summary, citations = await _write_page_simple(
+                                llm, plan_item, evidence, existing_content,
+                                all_plan_slugs=all_plan_slugs,
+                                source_context=source_context,
+                                image_markers=image_markers,
+                            )
                 except Exception as e:
                     err_msg = f"{type(e).__name__}: {str(e)}"
                     logger.error(f"MRP REFINE writer failed for '{slug}': {err_msg}")
-                    # Return minimal stub so COMMIT can still proceed
                     content_md = f"# {title}\n\n(Page generation failed: {err_msg[:200]})"
                     summary = title
                     citations = []

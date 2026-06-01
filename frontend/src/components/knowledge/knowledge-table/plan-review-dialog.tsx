@@ -235,8 +235,8 @@ export function PlanReviewDialog({
                         <span className="text-[10px] text-muted-foreground font-mono">
                           {page.slug}
                         </span>
-                        <Badge variant="secondary" className="text-[10px] h-4 px-1.5">
-                          {page.page_type}
+                        <Badge variant="secondary" className="text-[10px] h-4 px-1.5 capitalize">
+                          {page.page_type === "concept" ? "page" : page.page_type}
                         </Badge>
                       </div>
                       {page.entity_names && page.entity_names.length > 0 && (

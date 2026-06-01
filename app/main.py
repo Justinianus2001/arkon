@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from loguru import logger
 
 from app.config import settings
@@ -22,7 +23,7 @@ async def seed_default_admin():
     from sqlalchemy import select
 
     from app.database import async_session_factory
-    from app.database.models import Department, Employee
+    from app.database.models import Department, Employee, EmployeeDepartment
     from app.services.auth_service import hash_password
 
     try:
@@ -44,9 +45,10 @@ async def seed_default_admin():
                 email=settings.default_admin_email,
                 password_hash=hash_password(settings.default_admin_password),
                 role="admin",
-                department_id=dept.id,
             )
             session.add(admin)
+            await session.flush()
+            session.add(EmployeeDepartment(employee_id=admin.id, department_id=dept.id))
             await session.flush()
 
             await session.commit()
@@ -111,6 +113,49 @@ app.add_middleware(
 )
 
 
+# --- MCP OAuth discovery gate ---
+# RFC 9728: when a request hits the protected resource (/mcp) without a
+# Bearer token, return 401 with a WWW-Authenticate header pointing at the
+# OAuth Protected Resource Metadata. This is the signal Claude Desktop (and
+# other MCP clients) look for to auto-discover the OAuth flow and surface a
+# "Connect" button instead of requiring the user to paste a Bearer token by
+# hand.
+#
+# Behavior:
+#   - No Authorization header at all  -> 401 + WWW-Authenticate (triggers OAuth)
+#   - Authorization: Bearer <token>   -> pass through (FastMCP + tool-level
+#                                        checks handle validity / scope)
+#
+# We intentionally do NOT validate the token here. Invalid tokens still flow
+# into the tool layer so existing helpful error messages are preserved.
+
+@app.middleware("http")
+async def _mcp_oauth_gate_mw(request, call_next):
+    path = request.url.path
+    if path == "/mcp" or path.startswith("/mcp/"):
+        auth = request.headers.get("authorization", "")
+        if not auth.lower().startswith("bearer "):
+            base = str(request.base_url).rstrip("/")
+            resource_metadata_url = f"{base}/.well-known/oauth-protected-resource"
+            return JSONResponse(
+                status_code=401,
+                content={
+                    "error": "unauthorized",
+                    "error_description": (
+                        "This MCP endpoint requires OAuth 2.0 or a Bearer token. "
+                        "See the WWW-Authenticate header for OAuth discovery."
+                    ),
+                },
+                headers={
+                    "WWW-Authenticate": (
+                        f'Bearer realm="Arkon MCP", '
+                        f'resource_metadata="{resource_metadata_url}"'
+                    ),
+                },
+            )
+    return await call_next(request)
+
+
 # --- Notification dispatch middleware ---
 # Initialise the per-request notification staging bucket at the start of every
 # HTTP request; flush to external channels (email, webhook) after the response
@@ -143,13 +188,13 @@ from app.routers import (  # noqa: E402
     notes,
     notifications,
     oauth,
-    projects,
     rbac,
-    roles,
+
     skill_contributions,
     skills,
     sources,
     wiki,
+    wiki_branches,
     wiki_drafts,
     wiki_images,
 )
@@ -159,6 +204,7 @@ app.include_router(oauth.router, prefix="/oauth", tags=["oauth"])
 app.include_router(auth.router, prefix="/api", tags=["auth"])
 app.include_router(sources.router, prefix="/api", tags=["sources"])
 app.include_router(notes.router, prefix="/api", tags=["notes"])
+app.include_router(wiki_branches.router, prefix="/api", tags=["wiki-branches"])
 app.include_router(wiki_drafts.router, prefix="/api", tags=["wiki-drafts"])
 app.include_router(wiki.router, prefix="/api", tags=["wiki"])
 app.include_router(wiki_images.router, prefix="/api", tags=["wiki"])
@@ -168,8 +214,7 @@ app.include_router(admin_models.router, prefix="/api", tags=["settings"])
 app.include_router(admin_stats.router, prefix="/api", tags=["statistics"])
 app.include_router(rbac.router, prefix="/api", tags=["rbac"])
 app.include_router(knowledge_types.router, prefix="/api", tags=["knowledge-types"])
-app.include_router(projects.router, prefix="/api", tags=["projects"])
-app.include_router(roles.router, prefix="/api", tags=["roles"])
+
 app.include_router(audit.router, prefix="/api", tags=["audit"])
 app.include_router(skills.router, prefix="/api", tags=["skills"])
 app.include_router(skill_contributions.router, prefix="/api", tags=["skill-contributions"])

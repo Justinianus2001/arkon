@@ -47,7 +47,7 @@ export default function WikiIndexPage() {
   const [scopes, setScopes] = React.useState<WikiScope[]>([]);
 
   // `?new=1&title=<gap topic>` deep-link from the knowledge-gaps tab in
-  // /admin/statistics — auto-open the create dialog pre-filled with the
+  // dashboard — auto-open the create dialog pre-filled with the
   // gap's normalized topic.
   React.useEffect(() => {
     if (searchParams.get("new") === "1") {
@@ -130,7 +130,10 @@ export default function WikiIndexPage() {
       }
       if (st === "department" && sid) {
         if (isAdmin || hasPermission("wiki:write:all")) return "direct";
-        if (hasPermission("wiki:write:own_dept") && user.department_id === sid) {
+        if (
+          hasPermission("wiki:write:own_dept") &&
+          user.department_ids.includes(sid)
+        ) {
           return "propose";
         }
         return null;
@@ -206,7 +209,7 @@ export default function WikiIndexPage() {
             )}
             {user && (
               <Link
-                href="/wiki/queue"
+                href="/wiki/review"
                 className="inline-flex h-8 items-center gap-1.5 px-2.5 rounded-lg text-sm font-medium border border-border bg-background hover:bg-muted transition-colors"
                 title="Drafts you authored and drafts waiting for your review"
               >

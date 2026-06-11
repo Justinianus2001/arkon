@@ -60,6 +60,15 @@ class Settings(BaseSettings):
     # --- CORS ---
     cors_origins: str = Field(default="*")
 
+    # --- Portal ---
+    portal_base_url: str = Field(
+        default="",
+        description="Public base URL of the admin/portal frontend (e.g. "
+                    "'https://kb.acme.local'). Used to build clickable links to "
+                    "source documents in MCP search results. Empty → relative "
+                    "'/wiki/source/<id>' paths.",
+    )
+
     # --- Redis (arq worker queue) ---
     redis_host: str = Field(default="localhost")
     redis_port: int = Field(default=6379)

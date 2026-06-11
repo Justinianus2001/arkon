@@ -38,12 +38,13 @@ type Props = {
   onUploaded: () => void;
 };
 
-const ACCEPTED_EXTENSIONS = ["pdf", "docx", "doc", "xlsx", "csv", "txt", "md", "pptx"];
+const ACCEPTED_EXTENSIONS = ["pdf", "docx", "doc", "xlsx", "xls", "csv", "txt", "md", "pptx"];
 const ACCEPTED_MIMES = [
   "application/pdf",
   "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
   "application/msword",
   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+  "application/vnd.ms-excel",
   "text/plain",
   "text/csv",
   "text/markdown",
@@ -78,6 +79,7 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
   const [selectedDepts, setSelectedDepts] = useState<string[]>([]);
   const [scopeType, setScopeType] = useState("global");
   const [scopeId, setScopeId] = useState("");
+  const [keepVerbatim, setKeepVerbatim] = useState(false);
   const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
   const [uploading, setUploading] = useState(false);
   const [error, setError] = useState("");
@@ -148,6 +150,7 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
       if (scopeType !== "global" && scopeId) {
         formData.append("scope_id", scopeId);
       }
+      if (keepVerbatim) formData.append("preserve_verbatim", "true");
 
       await apiUpload("/api/sources/upload", formData);
       onUploaded();
@@ -157,6 +160,7 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
       setSelectedDepts([]);
       setScopeType("global");
       setScopeId("");
+      setKeepVerbatim(false);
     } catch (err) {
       setError(err instanceof Error ? err.message : "Upload failed");
     } finally {
@@ -279,6 +283,25 @@ export function UploadDialog({ open, onOpenChange, types, departments, onUploade
                 ))}
               </SelectContent>
             </Select>
+          </div>
+
+          {/* Verbatim mode — skip wiki, keep original exact */}
+          <div className="flex flex-col gap-1.5">
+            <label className="flex items-start gap-2 cursor-pointer">
+              <input
+                type="checkbox"
+                checked={keepVerbatim}
+                onChange={(e) => setKeepVerbatim(e.target.checked)}
+                className="rounded border-border mt-0.5"
+              />
+              <span className="text-sm font-medium text-foreground">
+                Keep verbatim — skip wiki generation
+              </span>
+            </label>
+            <p className="text-xs text-muted-foreground ml-6">
+              Use for official or high-fidelity documents (contracts, decrees, regulations).
+              The document is stored and searched exactly as-is, skipping AI summarization or rewriting.
+            </p>
           </div>
 
           {/* Department access control */}

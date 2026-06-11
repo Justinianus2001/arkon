@@ -1,7 +1,7 @@
 """add_wiki_branches
 
-Revision ID: e06a34a42582
-Revises: 121
+Revision ID: 033_add_wiki_branches
+Revises: 032_cleanup_legacy_source_pages
 Create Date: 2026-06-01 11:28:43.406021
 """
 
@@ -12,8 +12,8 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers
-revision: str = 'e06a34a42582'
-down_revision: Union[str, None] = '121'
+revision: str = '033_add_wiki_branches'
+down_revision: Union[str, None] = '032_cleanup_legacy_source_pages'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

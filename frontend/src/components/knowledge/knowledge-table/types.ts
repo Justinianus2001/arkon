@@ -30,6 +30,7 @@ export type Source = {
   contributed_by_name?: string;
   scope_type?: string;
   scope_id?: string;
+  preserve_verbatim?: boolean;
   pipeline_strategy?: string;
   pipeline_phase?: string;
   created_at: string;

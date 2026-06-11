@@ -73,6 +73,7 @@ class SourceResponse(BaseModel):
     contributed_by_name: Optional[str] = None
     scope_type: str = "global"
     scope_id: Optional[uuid.UUID] = None
+    preserve_verbatim: bool = False
     created_at: str
     updated_at: str
 
@@ -90,6 +91,7 @@ class SourceCreateURL(BaseModel):
     title: Optional[str] = None
     knowledge_type_id: Optional[uuid.UUID] = None
     department_ids: list[uuid.UUID] = []
+    preserve_verbatim: bool = False
 
 
 class SourceUpdate(BaseModel):
@@ -149,6 +151,7 @@ def _to_response(source: Source, wiki_page_count: int = 0, image_count: int = 0)
         contributed_by_name=source.contributor.name if source.contributor else None,
         scope_type=source.scope_type or "global",
         scope_id=source.scope_id,
+        preserve_verbatim=bool(source.preserve_verbatim),
         created_at=source.created_at.isoformat(),
         updated_at=source.updated_at.isoformat(),
     )
@@ -320,6 +323,7 @@ async def upload_source(
     department_ids: Optional[str] = Form(None),  # comma-separated UUIDs
     scope_type: Optional[str] = Form(None),
     scope_id: Optional[str] = Form(None),
+    preserve_verbatim: bool = Form(False),
     db: AsyncSession = Depends(get_db),
     user: Employee = require_permission("doc:create"),
 ):
@@ -359,6 +363,7 @@ async def upload_source(
         contributed_by_employee_id=user.id,
         scope_type=scope_type or ScopeType.GLOBAL.value,
         scope_id=uuid.UUID(scope_id) if scope_id else None,
+        preserve_verbatim=preserve_verbatim,
     )
     source = await repo.create(source)
     await db.flush()
@@ -420,6 +425,7 @@ async def add_url_source(
         knowledge_type_id=req.knowledge_type_id,
         contributed_by_employee_id=user.id,
         scope_type=ScopeType.GLOBAL.value,
+        preserve_verbatim=req.preserve_verbatim,
     )
     source = await repo.create(source)
     await db.flush()
@@ -505,7 +511,9 @@ async def update_source(
         old_dept_ids = set(old_dept_rows)
         new_dept_ids = set(body.department_ids)
 
-        if old_dept_ids != new_dept_ids and source.status == "ready":
+        # Verbatim sources have no wiki pages whose scope needs rebuilding —
+        # their visibility is enforced at query time via RBAC. Skip re-ingest.
+        if old_dept_ids != new_dept_ids and source.status == "ready" and not source.preserve_verbatim:
             dept_changed = True
 
             # Snapshot old scopes before detaching so we can regenerate their indexes

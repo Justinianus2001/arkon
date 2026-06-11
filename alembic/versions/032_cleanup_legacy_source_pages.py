@@ -1,7 +1,7 @@
 """cleanup_legacy_source_pages
 
-Revision ID: 121
-Revises: 120ffbbffa7c
+Revision ID: 032_cleanup_legacy_source_pages
+Revises: 031_pivot_general_wiki_pages
 Create Date: 2026-05-31 21:22:00.000000
 """
 
@@ -9,8 +9,8 @@ from typing import Sequence, Union
 from alembic import op
 
 # revision identifiers
-revision: str = '121'
-down_revision: Union[str, None] = '120ffbbffa7c'
+revision: str = '032_cleanup_legacy_source_pages'
+down_revision: Union[str, None] = '031_pivot_general_wiki_pages'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

@@ -165,7 +165,7 @@ async def _format_oos_hint(session: AsyncSession, oos_hits: list) -> str:
 
     from collections import Counter
 
-    from app.database.models import Department, Project
+    from app.database.models import Department
 
     # Group by (scope_type, scope_id) → count.
     buckets: Counter[tuple[str, str | None]] = Counter()
@@ -193,9 +193,6 @@ async def _format_oos_hint(session: AsyncSession, oos_hits: list) -> str:
                 if scope_type == "department":
                     d = await session.get(Department, sid)
                     label = d.name if d else None
-                elif scope_type == "project":
-                    p = await session.get(Project, sid)
-                    label = p.name if p else None
         labels[(scope_type, scope_id)] = label or "(unknown)"
 
     lines = ["**Out-of-scope matches** — matching page(s) exist outside your access:"]
@@ -205,11 +202,6 @@ async def _format_oos_hint(session: AsyncSession, oos_hits: list) -> str:
             lines.append(
                 f"- {count} page(s) in department **{label}** — "
                 f"contact the {label} department admin to request access."
-            )
-        elif scope_type == "project":
-            lines.append(
-                f"- {count} page(s) in workspace **{label}** — "
-                f"contact the workspace admin to be added as a member."
             )
     return "\n".join(lines)
 
@@ -229,25 +221,28 @@ def register_tools(mcp: FastMCP):
     @logged_tool("search_wiki", query_arg="query")
     async def search_wiki(query: str, top_k: int = 10) -> str:
         """
-        Semantic search over the synthesized wiki pages.
+        Semantic search across the knowledge base — synthesized wiki pages AND
+        verbatim source documents — in one ranked list.
 
-        Use this FIRST when answering a question about the organization. Wiki
-        pages are persistent, interlinked summaries compiled from many sources,
-        so they often answer cross-document questions in one read.
+        Use this FIRST when answering a question about the organization. Results
+        are of two kinds:
+          - 📘 Wiki pages: persistent, interlinked summaries compiled from many
+            sources. Read the full page with `read_wiki_page(slug)`.
+          - 📄 Source matches: passages from high-fidelity documents kept verbatim
+            (decrees, gazettes, contracts) that are NOT rewritten. Read the exact
+            original text with `get_source_pages(source_id, "<page>")` and cite the
+            portal link shown so the user can open or download the original.
 
-        If the response includes an "Out-of-scope matches" section, pages
-        matching the query exist but live in a department or workspace the
-        caller is not a member of. Mention this back to the user so they can
-        request access from the listed scope's admin instead of assuming the
-        knowledge is missing.
+        If the response includes an "Out-of-scope matches" section, pages matching
+        the query exist but live in a department or workspace the caller is not a
+        member of — tell the user to request access instead of assuming it's missing.
 
         Args:
             query: Natural language search query.
-            top_k: Maximum number of pages to return (default: 10, max: 50).
+            top_k: Maximum number of results to return (default: 10, max: 50).
 
         Returns:
-            A ranked list of page slugs with titles, summaries, and similarity.
-            Read the full page with `read_wiki_page(slug)`.
+            A ranked list of wiki pages and source matches with similarity scores.
         """
         import uuid as uuid_mod
 
@@ -258,6 +253,7 @@ def register_tools(mcp: FastMCP):
 
         top_k = min(max(1, top_k), 50)
 
+        from app.config import settings
         from app.ai.registry import ProviderRegistry
         from app.database import async_session_factory
         from app.services import wiki_service
@@ -279,6 +275,16 @@ def register_tools(mcp: FastMCP):
                 all_scopes=identity.is_admin,
             )
 
+            # Verbatim source chunks — same semantic pool, RBAC-scoped to the
+            # caller's allowed source set (mirrors the source drill-down tools).
+            allowed_source_ids = await _get_allowed_source_ids(identity, session)
+            chunk_hits = await wiki_service.search_source_chunks_semantic(
+                session,
+                query_embedding=query_embedding,
+                top_k=top_k,
+                allowed_source_ids=allowed_source_ids,
+            )
+
             # Out-of-scope peek — admins already see everything, so the hint
             # only fires for non-admins. Limit to a small fixed sample so an
             # adversary can't enumerate the entire org's page list via search.
@@ -294,29 +300,65 @@ def register_tools(mcp: FastMCP):
                 )
                 oos_hint = await _format_oos_hint(session, oos_hits)
 
-        if not hits:
-            base = f"No wiki pages found for: \"{query}\""
+        # Collapse multiple chunk hits from the same source into one entry
+        # (best similarity + the matching page numbers).
+        grouped: dict = {}
+        for source, chunk, sim in chunk_hits:
+            g = grouped.get(source.id)
+            if g is None or sim > g["sim"]:
+                preview = (chunk.text or "").strip().replace("\n", " ")
+                if len(preview) > 200:
+                    preview = preview[:200] + "…"
+                grouped[source.id] = {
+                    "source": source, "sim": sim, "preview": preview, "pages": set(),
+                }
+            grouped[source.id]["pages"].add(chunk.page_number)
+
+        # Unify into one ranked list by similarity.
+        ranked: list = [("wiki", sim, page) for page, sim in hits]
+        ranked += [("source", g["sim"], g) for g in grouped.values()]
+        ranked.sort(key=lambda r: r[1], reverse=True)
+        ranked = ranked[:top_k]
+
+        if not ranked:
+            base = f"No knowledge base matches found for: \"{query}\""
             if oos_hint:
                 return f"{base}\n\n{oos_hint}"
             return base
 
-        lines = [f"**Wiki search — {len(hits)} result(s) for: \"{query}\"**\n"]
-        for page, sim in hits:
+        def _portal_link(source_id) -> str:
+            base = (settings.portal_base_url or "").rstrip("/")
+            return f"{base}/wiki/source/{source_id}" if base else f"/wiki/source/{source_id}"
+
+        lines = [f"**KB search — {len(ranked)} result(s) for: \"{query}\"**\n"]
+        for kind, sim, obj in ranked:
             similarity_pct = f"{sim:.0%}"
-            summary = page.summary or ""
-            kt_label = (
-                f" [{', '.join(page.knowledge_type_slugs)}]"
-                if page.knowledge_type_slugs else ""
-            )
-            entry = (
-                f"- `{page.slug}` ({page.page_type}){kt_label} — {similarity_pct}\n"
-                f"  **{page.title}**"
-            )
-            if summary:
-                entry += f" — {summary}"
+            if kind == "wiki":
+                page = obj
+                kt_label = (
+                    f" [{', '.join(page.knowledge_type_slugs)}]"
+                    if page.knowledge_type_slugs else ""
+                )
+                entry = (
+                    f"- 📘 `{page.slug}` ({page.page_type}){kt_label} — {similarity_pct}\n"
+                    f"  **{page.title}**"
+                )
+                if page.summary:
+                    entry += f" — {page.summary}"
+                entry += "\n  _Read: `read_wiki_page(\"%s\")`_" % page.slug
+            else:
+                source = obj["source"]
+                title = source.title or source.file_name or source.url or "Untitled"
+                pages_sorted = sorted(obj["pages"])
+                pages_label = ",".join(str(p) for p in pages_sorted[:5])
+                entry = (
+                    f"- 📄 **{title}** (nguyên văn) — {similarity_pct} — trang {pages_label}\n"
+                    f"  “{obj['preview']}”\n"
+                    f"  _Đọc bản gốc: `get_source_pages(\"{source.id}\", \"{pages_sorted[0]}\")` · "
+                    f"Link: {_portal_link(source.id)}_"
+                )
             lines.append(entry)
 
-        lines.append("\n_Use `read_wiki_page(slug)` to read the full markdown._")
         if oos_hint:
             lines.append("")
             lines.append(oos_hint)
@@ -358,9 +400,11 @@ def register_tools(mcp: FastMCP):
                   Use `search_wiki` or `list_wiki_pages` to find slugs.
 
         Returns:
-            Markdown content of the page, plus a "Backlinks" section listing
-            other pages that link to this one. Wikilinks `[[slug]]` in the
-            content can be followed with another `read_wiki_page` call.
+            Markdown content of the page, plus an "Outlinks" section listing
+            pages this one links out to, and a "Backlinks" section listing pages
+            that link back to it. Both lists (and any inline `[[slug]]` wikilinks)
+            can be followed with another `read_wiki_page` call to traverse the
+            knowledge graph.
         """
         identity, err = await _get_identity()
         if err:
@@ -373,12 +417,10 @@ def register_tools(mcp: FastMCP):
         import uuid as uuid_mod
         from sqlalchemy import select as sa_select
 
-        from app.database.models import Department, Project, WikiPage
-
-        proj_uuids = [uuid_mod.UUID(p) for p in identity.project_ids]
+        from app.database.models import Department, WikiPage
 
         async with async_session_factory() as session:
-            # Try global → department → user's workspaces (in that order).
+            # Try global → department.
             page = await wiki_service.get_page_by_slug(
                 session, slug, allowed_kt_slugs=identity.allowed_knowledge_types,
             )
@@ -393,34 +435,16 @@ def register_tools(mcp: FastMCP):
                     )
                     if page:
                         break
-            if not page and proj_uuids:
-                # Walk the user's workspaces until we hit a matching slug.
-                for pid in proj_uuids:
-                    page = await wiki_service.get_page_by_slug(
-                        session, slug,
-                        allowed_kt_slugs=identity.allowed_knowledge_types,
-                        scope_type="project",
-                        scope_id=pid,
-                    )
-                    if page:
-                        break
 
             if not page:
                 # Out-of-scope hint: does the slug exist in a scope the caller
                 # CAN'T access? If so, leak only the scope label (no content).
                 if not identity.is_admin:
-                    excluded_proj_ids = proj_uuids
                     stmt = sa_select(WikiPage).where(WikiPage.slug == slug)
                     others = (await session.execute(stmt)).scalars().all()
                     inaccessible = [
                         p for p in others
-                        if (
-                            (p.scope_type == "department" and p.scope_id not in identity.department_ids)
-                            or (
-                                p.scope_type == "project"
-                                and p.scope_id not in excluded_proj_ids
-                            )
-                        )
+                        if p.scope_type == "department" and p.scope_id not in identity.department_ids
                     ]
                     if inaccessible:
                         labels: list[str] = []
@@ -429,11 +453,6 @@ def register_tools(mcp: FastMCP):
                                 d = await session.get(Department, p.scope_id)
                                 labels.append(
                                     f"department **{d.name if d else '(unknown)'}**"
-                                )
-                            elif p.scope_type == "project" and p.scope_id:
-                                pr = await session.get(Project, p.scope_id)
-                                labels.append(
-                                    f"workspace **{pr.name if pr else '(unknown)'}**"
                                 )
                         # Dedup while preserving order.
                         seen: set[str] = set()
@@ -450,8 +469,16 @@ def register_tools(mcp: FastMCP):
             backlinks = await wiki_service.get_backlinks(
                 session, slug, page.scope_type, page.scope_id,
             )
+            outlinks = await wiki_service.get_outlinks(
+                session, slug, page.scope_type, page.scope_id,
+            )
 
         body = page.content_md or ""
+        outlinks = sorted({s for s in outlinks if s != slug})
+        if outlinks:
+            body = body.rstrip() + "\n\n## Outlinks\n" + "\n".join(
+                f"- `{s}`" for s in outlinks
+            )
         if backlinks:
             body = body.rstrip() + "\n\n## Backlinks\n" + "\n".join(
                 f"- `{s}`" for s in sorted(backlinks)

@@ -4,6 +4,7 @@ export const fileIcons: Record<string, string> = {
   pdf: "picture_as_pdf",
   docx: "description",
   xlsx: "table_chart",
+  xls: "table_chart",
   csv: "table_chart",
   txt: "article",
   md: "article",

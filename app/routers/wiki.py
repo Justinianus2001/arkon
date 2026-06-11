@@ -635,7 +635,7 @@ async def get_wiki_graph(
     # Full graph — paginated, with scope filtering
     from sqlalchemy import case, func as sqlfunc
 
-    from app.database.models import Department, Project, WikiLink
+    from app.database.models import Department, WikiLink
 
     base_filter = WikiPage.slug.notin_([wiki_service.INDEX_SLUG, wiki_service.LOG_SLUG, wiki_service.HOT_SLUG])
 

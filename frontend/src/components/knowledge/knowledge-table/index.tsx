@@ -184,20 +184,31 @@ export function KnowledgeTable({
 
                   {/* Category (Knowledge Type) */}
                   <TableCell>
-                    {source.knowledge_type_name ? (
-                      <Badge
-                        variant="outline"
-                        className="text-[10px] font-medium h-5 px-2"
-                        style={{
-                          borderColor: source.knowledge_type_color,
-                          color: source.knowledge_type_color,
-                        }}
-                      >
-                        {source.knowledge_type_name}
-                      </Badge>
-                    ) : (
-                      <span className="text-xs text-muted-foreground/50">—</span>
-                    )}
+                    <div className="flex flex-wrap items-center gap-1">
+                      {source.knowledge_type_name ? (
+                        <Badge
+                          variant="outline"
+                          className="text-[10px] font-medium h-5 px-2"
+                          style={{
+                            borderColor: source.knowledge_type_color,
+                            color: source.knowledge_type_color,
+                          }}
+                        >
+                          {source.knowledge_type_name}
+                        </Badge>
+                      ) : (
+                        <span className="text-xs text-muted-foreground/50">—</span>
+                      )}
+                      {source.preserve_verbatim && (
+                        <Badge
+                          variant="secondary"
+                          className="text-[10px] font-medium h-5 px-2"
+                          title="Keep verbatim — skip wiki generation"
+                        >
+                          Verbatim
+                        </Badge>
+                      )}
+                    </div>
                   </TableCell>
 
                   {/* Visibility */}

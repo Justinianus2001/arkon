@@ -226,7 +226,7 @@ export default function DashboardPage() {
     <>
       <PageHeader
         title="Statistics & Diagnostics"
-        description="Đo lường sức khỏe dữ liệu tri thức, tốc độ đóng góp, phân tích lỗ hổng tri thức và giám sát các cuộc gọi MCP."
+        description="Measure knowledge health, contribution velocity, knowledge gaps, and monitor active MCP queries."
         action={
           <div className="flex gap-2">
             <Button variant="outline" onClick={() => loadAll()} disabled={loading}>
@@ -299,7 +299,7 @@ export default function DashboardPage() {
   );
 }
 
-function LoadingTransition({ message = "Đang tải dữ liệu và xác định không gian làm việc..." }: { message?: string }) {
+function LoadingTransition({ message = "Loading data and resolving workspace scope..." }: { message?: string }) {
   return (
     <div className="flex min-h-[60vh] flex-col items-center justify-center p-6 text-center">
       <div className="relative flex flex-col items-center gap-6 rounded-2xl border border-white/[0.08] bg-black/20 p-12 backdrop-blur-xl shadow-2xl transition-all duration-300">
@@ -310,7 +310,7 @@ function LoadingTransition({ message = "Đang tải dữ liệu và xác định
         </div>
         <div className="space-y-2 z-10">
           <h2 className="text-lg font-semibold tracking-wide text-foreground animate-pulse">
-            Chuyển hướng không gian làm việc
+            Resolving Workspace Scope
           </h2>
           <p className="text-xs text-muted-foreground max-w-[280px]">
             {message}
@@ -570,36 +570,36 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
         <div className={`rounded-xl border p-4 ${dead_links.length > 0 ? "border-amber-500/20 bg-amber-50/40" : "border-border bg-card"}`}>
           <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted-foreground">
             <span className="material-symbols-outlined text-[16px] text-amber-600">link_off</span>
-            <span>Dead Links (Liên kết hỏng)</span>
+            <span>Dead Links</span>
           </div>
           <div className="mt-1 text-2xl font-semibold tabular-nums">{dead_links.length}</div>
-          <div className="mt-0.5 text-xs text-muted-foreground">Các liên kết trong tài liệu trỏ tới trang chưa tồn tại</div>
+          <div className="mt-0.5 text-xs text-muted-foreground">Broken internal links pointing to non-existent wiki pages.</div>
         </div>
 
         <div className={`rounded-xl border p-4 ${orphans.length > 0 ? "border-[#c2652a]/20 bg-[#c2652a]/5" : "border-border bg-card"}`}>
           <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted-foreground">
             <span className="material-symbols-outlined text-[16px] text-amber-600">article</span>
-            <span>Orphan Pages (Trang mồ côi)</span>
+            <span>Orphan Pages</span>
           </div>
           <div className="mt-1 text-2xl font-semibold tabular-nums">{orphans.length}</div>
-          <div className="mt-0.5 text-xs text-muted-foreground">Các trang phẳng không có bất kỳ trang nào khác trỏ tới</div>
+          <div className="mt-0.5 text-xs text-muted-foreground">Wiki pages that have no incoming links from other pages.</div>
         </div>
 
         <div className={`rounded-xl border p-4 ${contradictions.length > 0 ? "border-red-500/20 bg-red-50/40" : "border-border bg-card"}`}>
           <div className="flex items-center gap-1.5 text-[11px] uppercase tracking-wide text-muted-foreground">
             <span className="material-symbols-outlined text-[16px] text-red-500">warning</span>
-            <span>Contradictions (Mâu thuẫn tri thức)</span>
+            <span>Contradictions</span>
           </div>
           <div className="mt-1 text-2xl font-semibold tabular-nums">{contradictions.length}</div>
-          <div className="mt-0.5 text-xs text-muted-foreground">Các trang bị AI Verifier phát hiện có xung đột nội dung</div>
+          <div className="mt-0.5 text-xs text-muted-foreground">Wiki pages containing logical conflicts identified by AI Verifier.</div>
         </div>
       </div>
 
       {totalErrors === 0 ? (
         <div className="rounded-xl border border-emerald-500/20 bg-emerald-50/30 p-8 text-center text-sm text-emerald-800 flex flex-col items-center justify-center gap-2">
           <span className="material-symbols-outlined text-4xl text-emerald-600">check_circle</span>
-          <div className="font-semibold text-base">Hệ thống Wiki hoàn toàn lành mạnh!</div>
-          <p className="text-xs text-emerald-700/80 max-w-md">Không tìm thấy bất kỳ liên kết hỏng, trang mồ côi hoặc mâu thuẫn tri thức nào trong không gian Wiki phẳng.</p>
+          <div className="font-semibold text-base">Knowledge Base is perfectly healthy!</div>
+          <p className="text-xs text-emerald-700/80 max-w-md">No dead links, orphan pages, or logical contradictions were detected in your flat wiki workspace.</p>
         </div>
       ) : (
         <div className="space-y-6">
@@ -608,15 +608,15 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
             <div className="rounded-xl border bg-card overflow-hidden">
               <div className="flex items-center gap-2 px-4 py-3 border-b bg-amber-500/5">
                 <span className="material-symbols-outlined text-[18px] text-amber-600">link_off</span>
-                <div className="text-sm font-medium text-amber-900">Liên kết hỏng (Dead Links)</div>
-                <span className="ml-auto text-xs font-mono px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-800 font-semibold">{dead_links.length} lỗi</span>
+                <div className="text-sm font-medium text-amber-900">Dead Links</div>
+                <span className="ml-auto text-xs font-mono px-2 py-0.5 rounded-full bg-amber-500/10 text-amber-800 font-semibold">{dead_links.length} errors</span>
               </div>
               <table className="w-full text-sm">
                 <thead className="text-[11px] uppercase tracking-wide text-muted-foreground bg-black/[0.02]">
                   <tr className="border-b">
-                    <th className="text-left px-4 py-2 font-medium">Trang chứa link</th>
-                    <th className="text-left px-4 py-2 font-medium">Link bị hỏng (Trỏ tới)</th>
-                    <th className="text-right px-4 py-2 font-medium">Thao tác sửa lỗi</th>
+                    <th className="text-left px-4 py-2 font-medium">Source Page</th>
+                    <th className="text-left px-4 py-2 font-medium">Broken Target Link</th>
+                    <th className="text-right px-4 py-2 font-medium">Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -624,7 +624,7 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
                     <tr key={idx} className="border-b hover:bg-black/[0.01]">
                       <td className="px-4 py-3">
                         <a
-                          href={`/wiki/${link.from_slug}`}
+                           href={`/wiki/${link.from_slug}`}
                           className="font-medium text-foreground hover:underline"
                         >
                           {link.from_title}
@@ -640,7 +640,7 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
                           className="inline-flex items-center gap-1 text-xs text-foreground/80 hover:text-foreground font-medium underline-offset-4 hover:underline"
                         >
                           <span className="material-symbols-outlined text-[14px]">edit</span>
-                          Sửa nguồn →
+                          Edit Source →
                         </a>
                       </td>
                     </tr>
@@ -655,15 +655,15 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
             <div className="rounded-xl border bg-card overflow-hidden">
               <div className="flex items-center gap-2 px-4 py-3 border-b bg-[#c2652a]/5">
                 <span className="material-symbols-outlined text-[18px] text-[#c2652a]">article</span>
-                <div className="text-sm font-medium text-[#c2652a]">Trang mồ côi (Orphan Pages)</div>
-                <span className="ml-auto text-xs font-mono px-2 py-0.5 rounded-full bg-[#c2652a]/10 text-[#c2652a] font-semibold">{orphans.length} trang</span>
+                <div className="text-sm font-medium text-[#c2652a]">Orphan Pages</div>
+                <span className="ml-auto text-xs font-mono px-2 py-0.5 rounded-full bg-[#c2652a]/10 text-[#c2652a] font-semibold">{orphans.length} pages</span>
               </div>
               <table className="w-full text-sm">
                 <thead className="text-[11px] uppercase tracking-wide text-muted-foreground bg-black/[0.02]">
                   <tr className="border-b">
-                    <th className="text-left px-4 py-2 font-medium">Tiêu đề trang</th>
-                    <th className="text-left px-4 py-2 font-medium">Trạng thái</th>
-                    <th className="text-right px-4 py-2 font-medium">Thao tác</th>
+                    <th className="text-left px-4 py-2 font-medium">Page Title</th>
+                    <th className="text-left px-4 py-2 font-medium">Status</th>
+                    <th className="text-right px-4 py-2 font-medium">Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -687,7 +687,7 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
                           className="inline-flex items-center gap-1 text-xs text-foreground/80 hover:text-foreground font-medium underline-offset-4 hover:underline"
                         >
                           <span className="material-symbols-outlined text-[14px]">visibility</span>
-                          Xem trang →
+                          View Page →
                         </a>
                       </td>
                     </tr>
@@ -702,15 +702,15 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
             <div className="rounded-xl border bg-card overflow-hidden">
               <div className="flex items-center gap-2 px-4 py-3 border-b bg-red-500/5">
                 <span className="material-symbols-outlined text-[18px] text-red-600">warning</span>
-                <div className="text-sm font-medium text-red-900">Mâu thuẫn tri thức (Contradiction Nodes)</div>
-                <span className="ml-auto text-xs font-mono px-2 py-0.5 rounded-full bg-red-500/10 text-red-800 font-semibold">{contradictions.length} điểm</span>
+                <div className="text-sm font-medium text-red-900">Knowledge Contradictions</div>
+                <span className="ml-auto text-xs font-mono px-2 py-0.5 rounded-full bg-red-500/10 text-red-800 font-semibold">{contradictions.length} issues</span>
               </div>
               <table className="w-full text-sm">
                 <thead className="text-[11px] uppercase tracking-wide text-muted-foreground bg-black/[0.02]">
                   <tr className="border-b">
-                    <th className="text-left px-4 py-2 font-medium">Tên trang bị mâu thuẫn</th>
-                    <th className="text-left px-4 py-2 font-medium">Chi tiết lỗi</th>
-                    <th className="text-right px-4 py-2 font-medium">Thao tác</th>
+                    <th className="text-left px-4 py-2 font-medium">Conflicted Page</th>
+                    <th className="text-left px-4 py-2 font-medium">Error Details</th>
+                    <th className="text-right px-4 py-2 font-medium">Action</th>
                   </tr>
                 </thead>
                 <tbody>
@@ -726,7 +726,7 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
                         <div className="text-[10px] text-muted-foreground font-mono">slug: {node.slug}</div>
                       </td>
                       <td className="px-4 py-3 text-xs text-red-700/80">
-                        Phát hiện thẻ cảnh báo <code className="bg-red-50 px-1.5 py-0.5 border border-red-200/50 rounded font-mono text-[10px] text-red-600">[!contradiction]</code> do AI ghim trên trang.
+                        Detected a <code className="bg-red-50 px-1.5 py-0.5 border border-red-200/50 rounded font-mono text-[10px] text-red-600">[!contradiction]</code> alert badge pinned on this page by the AI Verifier.
                       </td>
                       <td className="px-4 py-3 text-right">
                         <a
@@ -734,7 +734,7 @@ function DiagnosticsTab({ data, loading }: { data: LintResponse | null; loading?
                           className="inline-flex items-center gap-1 text-xs text-foreground/80 hover:text-foreground font-medium underline-offset-4 hover:underline"
                         >
                           <span className="material-symbols-outlined text-[14px]">rule</span>
-                          Kiểm tra mâu thuẫn →
+                          Review Contradiction →
                         </a>
                       </td>
                     </tr>

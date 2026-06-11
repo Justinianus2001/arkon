@@ -697,8 +697,16 @@ export default function WikiPageViewer() {
                         {sourceData.source_type === "url" ? "language" : "description"}
                       </span>
                       <div className="min-w-0">
-                        <h3 className="font-semibold text-foreground text-sm line-clamp-1 truncate max-w-[400px]">
+                        <h3 className="font-semibold text-foreground text-sm line-clamp-1 truncate max-w-[400px] flex items-center gap-2">
                           {sourceData.title || sourceData.file_name}
+                          {sourceData.preserve_verbatim && (
+                            <span
+                              className="inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-medium bg-secondary text-secondary-foreground shrink-0"
+                              title="Verbatim — searches the exact original document, skipping the wiki pipeline"
+                            >
+                              Verbatim
+                            </span>
+                          )}
                         </h3>
                         <p className="text-xs text-muted-foreground mt-0.5">
                           {sourceData.source_type === "url" ? (

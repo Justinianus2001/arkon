@@ -18,6 +18,7 @@ from app.ai.embedding_catalog import EmbeddingModelSpec, get_spec
 from app.database.models import (
     EmbeddingJob,
     get_embedding_model_for_dim,
+    get_source_chunk_embedding_model_for_dim,
 )
 
 
@@ -104,3 +105,108 @@ async def cleanup_stale_embeddings(
 
 def get_spec_for_job(job: EmbeddingJob) -> EmbeddingModelSpec:
     return get_spec(job.model_spec_id)
+
+
+async def cleanup_stale_source_chunk_embeddings(
+    session: AsyncSession, keep_spec_id: str
+) -> int:
+    """Delete source chunk embedding rows whose model_spec_id != keep_spec_id,
+    across every dimension table. Mirrors cleanup_stale_embeddings for the
+    verbatim source pool; called after the atomic embedding-model flip."""
+    from app.database.models import (
+        SourceChunkEmbedding768,
+        SourceChunkEmbedding1024,
+        SourceChunkEmbedding1536,
+        SourceChunkEmbedding3072,
+    )
+    total = 0
+    for Model in (
+        SourceChunkEmbedding768,
+        SourceChunkEmbedding1024,
+        SourceChunkEmbedding1536,
+        SourceChunkEmbedding3072,
+    ):
+        result = await session.execute(
+            delete(Model).where(Model.model_spec_id != keep_spec_id)
+        )
+        total += result.rowcount or 0  # type: ignore[union-attr]
+    return total
+
+
+# ---------------------------------------------------------------------------
+# Verbatim source chunk embeddings
+# ---------------------------------------------------------------------------
+
+def chunk_content_hash(text: str) -> str:
+    """Stable hash of the raw chunk text fed into the embedding model."""
+    return hashlib.sha256((text or "").encode("utf-8")).hexdigest()
+
+
+async def upsert_chunk_embedding(
+    session: AsyncSession,
+    source_id: uuid.UUID,
+    chunk_index: int,
+    spec: EmbeddingModelSpec,
+    vector: list[float],
+    *,
+    text: str,
+    start_char: int,
+    end_char: int,
+    page_number: int,
+    content_hash: str,
+) -> None:
+    """Upsert one (source, chunk_index, model_spec_id) row into
+    source_chunk_embeddings_<dim>."""
+    Model = get_source_chunk_embedding_model_for_dim(spec.dimension)
+    stmt = pg_insert(Model).values(
+        source_id=source_id,
+        chunk_index=chunk_index,
+        model_spec_id=spec.id,
+        start_char=start_char,
+        end_char=end_char,
+        page_number=page_number,
+        text=text,
+        content_hash=content_hash,
+        embedding=vector,
+    )
+    stmt = stmt.on_conflict_do_update(
+        index_elements=["source_id", "chunk_index", "model_spec_id"],
+        set_={
+            "embedding": stmt.excluded.embedding,
+            "content_hash": stmt.excluded.content_hash,
+            "text": stmt.excluded.text,
+            "start_char": stmt.excluded.start_char,
+            "end_char": stmt.excluded.end_char,
+            "page_number": stmt.excluded.page_number,
+            "embedded_at": stmt.excluded.embedded_at,
+        },
+    )
+    await session.execute(stmt)
+
+
+async def delete_source_chunk_embeddings(
+    session: AsyncSession, source_id: uuid.UUID
+) -> int:
+    """Delete every chunk embedding row for a source across all dimension tables.
+
+    Called before re-indexing a verbatim source (re-ingest) so stale chunks from
+    a previous run don't linger.
+    """
+    from app.database.models import (
+        SourceChunkEmbedding768,
+        SourceChunkEmbedding1024,
+        SourceChunkEmbedding1536,
+        SourceChunkEmbedding3072,
+    )
+    total = 0
+    for Model in (
+        SourceChunkEmbedding768,
+        SourceChunkEmbedding1024,
+        SourceChunkEmbedding1536,
+        SourceChunkEmbedding3072,
+    ):
+        result = await session.execute(
+            delete(Model).where(Model.source_id == source_id)
+        )
+        total += result.rowcount or 0  # type: ignore[union-attr]
+    return total

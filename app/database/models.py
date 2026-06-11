@@ -127,6 +127,13 @@ class Source(Base):
         String(30), nullable=True,
         comment="Current MRP phase: map | reduce | plan_review | refine | verify | commit",
     )
+    preserve_verbatim: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+        comment="If True, skip the LLM wiki pipeline (MRP). The raw full_text is "
+                "chunked + embedded as-is into source_chunk_embeddings_<dim> so it is "
+                "searchable in the same semantic pool as wiki pages, but never rewritten. "
+                "For high-fidelity docs (decrees, official gazettes).",
+    )
     # Heading-based TOC tree (PageIndex-style) built at ingest time from extracted markdown.
     # Schema: [{"title": str, "level": int, "page": int, "char_start": int, "char_end": int, "children": [...]}]
     outline_json: Mapped[Optional[list]] = mapped_column(JSONB)
@@ -1037,6 +1044,76 @@ def get_embedding_model_for_dim(dimension: int) -> type:
         raise ValueError(
             f"Unsupported embedding dimension: {dimension}. "
             f"Supported: {sorted(_EMBEDDING_MODEL_BY_DIM)}"
+        ) from e
+
+
+# ---------------------------------------------------------------------------
+# Multi-dimension source chunk embeddings (verbatim sources)
+# ---------------------------------------------------------------------------
+# Raw, verbatim slices of a preserve_verbatim Source.full_text, embedded as-is
+# (no LLM rewriting). Searched in the same semantic pool as wiki pages so that
+# high-fidelity docs (decrees, gazettes) are discoverable without being
+# "wiki-ified". Mirrors the per-dimension wiki_page_embeddings_<dim> tables.
+
+class _SourceChunkEmbeddingBase:
+    """Mixin: shared columns for all source_chunk_embeddings_<dim> tables."""
+
+    source_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("sources.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    chunk_index: Mapped[int] = mapped_column(Integer, primary_key=True)
+    model_spec_id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    # Char offsets in Source.full_text (slice full_text[start_char:end_char] for
+    # a clean preview without the chunker's overlap prefix).
+    start_char: Mapped[int] = mapped_column(Integer, nullable=False)
+    end_char: Mapped[int] = mapped_column(Integer, nullable=False)
+    page_number: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    content_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    embedded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+class SourceChunkEmbedding768(_SourceChunkEmbeddingBase, Base):
+    __tablename__ = "source_chunk_embeddings_768"
+    embedding = mapped_column(Vector(768), nullable=False)
+
+
+class SourceChunkEmbedding1024(_SourceChunkEmbeddingBase, Base):
+    __tablename__ = "source_chunk_embeddings_1024"
+    embedding = mapped_column(Vector(1024), nullable=False)
+
+
+class SourceChunkEmbedding1536(_SourceChunkEmbeddingBase, Base):
+    __tablename__ = "source_chunk_embeddings_1536"
+    embedding = mapped_column(Vector(1536), nullable=False)
+
+
+class SourceChunkEmbedding3072(_SourceChunkEmbeddingBase, Base):
+    # 3072d uses halfvec — pgvector's HNSW index caps `vector` at 2000 dims.
+    __tablename__ = "source_chunk_embeddings_3072"
+    embedding = mapped_column(HALFVEC(3072), nullable=False)
+
+
+_SOURCE_CHUNK_EMBEDDING_MODEL_BY_DIM: dict[int, type] = {
+    768: SourceChunkEmbedding768,
+    1024: SourceChunkEmbedding1024,
+    1536: SourceChunkEmbedding1536,
+    3072: SourceChunkEmbedding3072,
+}
+
+
+def get_source_chunk_embedding_model_for_dim(dimension: int) -> type:
+    """Return the SourceChunkEmbedding<dim> ORM class for a supported dimension."""
+    try:
+        return _SOURCE_CHUNK_EMBEDDING_MODEL_BY_DIM[dimension]
+    except KeyError as e:
+        raise ValueError(
+            f"Unsupported embedding dimension: {dimension}. "
+            f"Supported: {sorted(_SOURCE_CHUNK_EMBEDDING_MODEL_BY_DIM)}"
         ) from e
 
 

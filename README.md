@@ -16,7 +16,7 @@
 
 In most organizations, AI adoption is fragmented. Employees copy-paste documents into chatbots, producing inconsistent context, security risks, and duplicated work.
 
-**Arkon treats AI as a managed organizational resource.** Every employee gets the right context, automatically and securely - filtered by their department, project membership, and role.
+**Arkon treats AI as a managed organizational resource.** Every employee gets the right context, automatically and securely - filtered by their department and role.
 
 <p align="center">
   <img src="docs/assets/how-arkon-works.png" alt="How Arkon Works" width="720">
@@ -46,17 +46,17 @@ Unlike a vector database that just chunks and indexes, Arkon's **MRP pipeline** 
   <img src="docs/assets/arkon-wiki-ui.png" alt="Arkon Wiki Browser UI — three-panel knowledge base with page tree, content viewer, and knowledge graph" width="720">
 </p>
 
-### 🏢 Workspaces (Department & Project Scopes)
-Cross-functional contexts with their own scoped wiki, document set, and member roster.
+### 🏢 Department & Global Scopes
+Precise context boundaries with their own scoped wiki, document set, and department rosters.
 - **Department-level isolation** for HR, Legal, Engineering, etc.
-- **Project workspaces** for cross-functional initiatives or clients.
-- **Hard scope enforcement:** members only see knowledge from their assigned scopes - at the API, MCP, and search layers.
+- **Global scope** for company-wide SOPs, policies, and general knowledge.
+- **Hard scope enforcement:** members only see knowledge from their assigned departments or the global realm - at the API, MCP, and search layers.
 
 ### 🛂 Fine-Grained RBAC
-Role-based access control at department + workspace level.
-- Built-in roles: **Viewer · Contributor · Editor · Admin** (and admin-defined custom roles).
+Role-based access control at the department and global levels.
+- Built-in roles: **Viewer · Contributor · Editor · Admin** to control draft, edit, and setting access.
 - Granular permissions (`doc:read:own_dept`, `wiki:edit:all`, `org:settings:manage`, ...).
-- **Audit log** for every privileged action - settings changes, plan approvals, role updates.
+- **Audit log** for every privileged action - settings changes, plan approvals, and role updates.
 
 ### 🔌 MCP Server for Claude & Other AI Clients
 Employees connect Claude Desktop or Claude.ai to Arkon via **OAuth 2.1 + PKCE** — just add the server URL and sign in through the browser. No manual token copying required. The MCP server exposes:
@@ -183,7 +183,7 @@ For stronger enforcement, create a **Project** in Claude Desktop, attach Arkon a
 
 - [x] **MRP Pipeline** - deterministic compilation with plan review, page merge, and resume-on-crash.
 - [x] **MCP Server** - scoped wiki + source + draft tools.
-- [x] **Workspaces** - department isolation + project scopes with RBAC.
+- [x] **Department & Global Scopes** - department isolation with RBAC.
 - [x] **Wiki draft & revision workflow** - propose, review, approve, rollback.
 - [x] **AI Skills** - versioned, department-scoped agent packages.
 - [x] **Catalog-driven model selection** - LLM, embedding, and vision picked from a curated list with cost/context-window metadata.

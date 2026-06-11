@@ -1,7 +1,7 @@
 """simplify_auth_fixed_roles
 
-Revision ID: dbf99a2f2ad9
-Revises: e06a34a42582
+Revision ID: 034_simplify_auth_fixed_roles
+Revises: 033_add_wiki_branches
 Create Date: 2026-06-01 14:57:59.581465
 
 """
@@ -12,8 +12,8 @@ from alembic import op
 
 
 # revision identifiers
-revision: str = 'dbf99a2f2ad9'
-down_revision: Union[str, None] = 'e06a34a42582'
+revision: str = '034_simplify_auth_fixed_roles'
+down_revision: Union[str, None] = '033_add_wiki_branches'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

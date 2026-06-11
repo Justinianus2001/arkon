@@ -1,6 +1,6 @@
 """pivot_general_wiki_pages
 
-Revision ID: 120ffbbffa7c
+Revision ID: 031_pivot_general_wiki_pages
 Revises: 030
 Create Date: 2026-05-31 19:37:31.005749
 """
@@ -12,7 +12,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 # revision identifiers
-revision: str = '120ffbbffa7c'
+revision: str = '031_pivot_general_wiki_pages'
 down_revision: Union[str, None] = '030'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None

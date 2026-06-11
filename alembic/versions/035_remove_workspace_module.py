@@ -1,7 +1,7 @@
 """remove_workspace_module
 
-Revision ID: 53ddb764523d
-Revises: dbf99a2f2ad9
+Revision ID: 035_remove_workspace_module
+Revises: 034_simplify_auth_fixed_roles
 Create Date: 2026-06-01 16:02:35.309875
 
 """
@@ -12,8 +12,8 @@ from alembic import op
 
 
 # revision identifiers
-revision: str = '53ddb764523d'
-down_revision: Union[str, None] = 'dbf99a2f2ad9'
+revision: str = '035_remove_workspace_module'
+down_revision: Union[str, None] = '034_simplify_auth_fixed_roles'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
